@@ -7,6 +7,7 @@ import matplotlib.animation as animation
 from sdtoolbox.thermo import soundspeed_fr
 from sipbuild.generator.parser.annotations import string
 from sklearn.neighbors import NearestNeighbors
+from scipy.ndimage import gaussian_filter1d
 
 
 class MyClass():
@@ -155,15 +156,23 @@ def waveTrackingFunction(raw_data, ray_sort, tracking_str, tracking_var, wave_ty
     if wave_type == "Flame Processing":
         wave_index = np.argwhere(temp_data >= tracking_var)[-1][0]
     elif wave_type == "Leading Shock Processing" or wave_type == "Pre-Shock Processing" or wave_type == "Post-Shock Processing":
-        # Compute the gradient of pressure with respect to space
-        dp_dx = np.gradient(temp_data, temp_x_pos)
-        # Find the indices where the gradient changes sign (indicating a shock)
-        shock_indices = np.where(dp_dx == np.min(dp_dx))[0]
-        # Classify shocks as left or right running
-        wave_index = np.max(shock_indices)
+        # From the farthest right point in the domain, determine the leading pressure wave location by 1% increase from this value
+        pressure_baseline = temp_data[-1]
+        wave_index = np.argwhere(temp_data >= 1.01 * pressure_baseline)[-1][0]
     elif wave_type == "Maximum Pressure Processing":
         temp_index = temp_data
         wave_index = np.argwhere(temp_index == np.max(temp_index))[-1][0]
+    # Step 3:
+    plt_check = False
+    if plt_check:
+        plt.figure(figsize=(8, 6))
+        plt.plot(temp_x_pos, temp_data, linestyle='-', color='k')
+        plt.plot(temp_x_pos[wave_index], temp_data[wave_index], marker='.', linestyle='-', color='r')
+        plt.xlabel('x')
+        plt.ylabel('y')
+        plt.title(f"{tracking_str}")
+        plt.show()
+
     return wave_index, temp_x_pos[wave_index] / 100
 
 
@@ -1297,17 +1306,17 @@ def main():
 
     check_flag_dict = {
         'Flame Processing': {
-            'Position': True,
-            'Velocity': True,
+            'Position': False,
+            'Velocity': False,
             'Relative Velocity': False,
-            'Thermodynamic State': True,
-            'Surface Length': True,
-            'Smoothing': True
+            'Thermodynamic State': False,
+            'Surface Length': False,
+            'Smoothing': False
         },
         'Leading Shock Processing': {
-            'Position': True,
-            'Velocity': True,
-            'Smoothing': True
+            'Position': False,
+            'Velocity': False,
+            'Smoothing': False
         },
         'Maximum Pressure Processing': {
             'Position': False,
@@ -1316,11 +1325,11 @@ def main():
         },
         'Pre-Shock Processing': {
             'Thermodynamic State': True,
-            'Smoothing': True
+            'Smoothing': False
         },
         'Post-Shock Processing': {
             'Thermodynamic State': True,
-            'Smoothing': True
+            'Smoothing': False
         },
         'Domain State Animations': {
             'Temperature': False,
@@ -1331,7 +1340,7 @@ def main():
         }
     }
 
-    skip_load = 0  # 0 for no skip
+    skip_load = 10  # 0 for no skip
     # row_index = "Middle"  # Desired row location for data collection
     row_index = "Middle"  # Desired y_location for data collection in cm
     mass_fraction_variables = np.array(["H", "H2", "H2O", "H2O2", "HO2", "N2", "O", "O2", "OH"])
