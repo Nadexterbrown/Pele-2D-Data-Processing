@@ -1,15 +1,32 @@
-import os, yt, itertools, multiprocessing
+import os, yt, itertools, multiprocessing, textwrap
 import numpy as np
 import cantera as ct
 import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
 import matplotlib.animation as animation
 from sdtoolbox.thermo import soundspeed_fr
+from sipbuild.generator.parser.annotations import string
 from sklearn.neighbors import NearestNeighbors
 
 
 class MyClass():
     pass
+
+
+def ensure_long_path_prefix(path):
+    """
+    Ensure that the path uses the long path prefix if necessary.
+
+    Parameters:
+    - path: str, the original file path.
+
+    Returns:
+    - str, the path with the long path prefix.
+    """
+    if path.startswith(r"\\"):
+        return r"\\?\UNC" + path[1:]  # UNC path prefix
+    else:
+        return r"\\?\\" + path  # Regular path prefix
 
 
 def reload_prior_processed_data(raw_file_list, restart_file, check=False):
@@ -443,25 +460,49 @@ def createVariablePltFrame(args):
             - title: str, title of the plot (default is 'Plot').
             - format: str, the format to save the plot in (default is 'png').
             """
-        plt.figure(figsize=(10, 6))
-        plt.plot(slice["boxlib", str('x')][ray_sort], slice["boxlib", str(tracking_obj)][ray_sort], linestyle='-',
-                 color='k')
-        plt.xlabel('Position [cm]')
-        plt.ylabel(tracking_obj)
-        plt.title(f"{tracking_obj} Variation at y = {domain_size[1]} and t = {time}")
-        plt.grid(True)
-        plt.xlim(0, domain_size[0])
-        if tracking_obj == "Temp":
-            plt.ylim(input_params.T, y_limit_max)
-        elif tracking_obj == "pressure":
-            plt.ylim(input_params.P, y_limit_max)
-        elif tracking_obj == "x_velocity":
-            plt.ylim(0, y_limit_max)
-        else:
-            plt.ylim(0, y_limit_max)
+        line_styles = ['-', '--', '-.', ':']
+        style_cycle = itertools.cycle(line_styles)
 
+        fig, ax1 = plt.subplots()
+        if isinstance(tracking_obj, (np.ndarray, list)):
+            ax1.plot(slice["boxlib", str('x')][ray_sort], slice["boxlib", str(tracking_obj[0])][ray_sort],
+                     label=tracking_obj[0], linestyle='-', color='k')
+            ax1.set_xlabel('Position [cm]')
+            ax1.set_ylabel(str(tracking_obj[0]))
+            ax1.grid(True, axis='x')  # Only x-axis grid lines
+            ax1.set_ylim(0, y_limit_max[0])
+
+            # Create a second Y-axis
+            ax2 = ax1.twinx()
+            ax2.plot(slice["boxlib", str('x')][ray_sort], slice["boxlib", str(tracking_obj[1])][ray_sort],
+                     label=tracking_obj[1], linestyle='--', color='r')
+            ax2.set_ylabel(str(tracking_obj[1]))
+            ax2.set_ylim(0, y_limit_max[1])
+
+            wrapped_title = "\n".join(textwrap.wrap(
+                f"{tracking_obj[0]} and {tracking_obj[1]} Variation at y = {domain_size[1]} and t = {time}", width=55))
+        else:
+            ax1.plot(slice["boxlib", str('x')][ray_sort], slice["boxlib", str(tracking_obj)][ray_sort],
+                     label=tracking_obj, linestyle='-', color='k')
+
+            ax1.set_ylabel(str(tracking_obj))
+            ax1.set_ylim(0, y_limit_max)
+
+            wrapped_title = "\n".join(
+                textwrap.wrap(f"{tracking_obj} Variation at y = {domain_size[1]} and t = {time}", width=55))
+
+        plt.suptitle(wrapped_title, ha="center")
+        plt.xlim(0, domain_size[0])
+        plt.legend()
+
+        # Convert the float to a string without scientific notation
+        formatted_time = '{:.16f}'.format(time).rstrip('0').rstrip('.')
         # Save the plot to a file
-        filename = os.path.join(output_dir_path, f"{tracking_obj}-Animation-Time-{time}.png")
+        if isinstance(tracking_obj, (np.ndarray, list)):
+            filename = os.path.join(output_dir_path,
+                                    f"{tracking_obj[0]}-{tracking_obj[1]}-Animation-Time-{formatted_time}.png")
+        else:
+            filename = os.path.join(output_dir_path, f"{tracking_obj}-Animation-Time-{formatted_time}.png")
         plt.savefig(filename, format='png')
         plt.close()  # Close the figure to avoid displaying it inline if using in a Jupyter notebook
         return
@@ -474,13 +515,24 @@ def createVariablePltFrame(args):
     domain_sizing = args[1][0]
     input_params = args[1][1]
     tracking_obj = args[1][2]
-    y_limit_max = args[1][3] + (0.1 * args[1][3])
+    if isinstance(tracking_obj, (np.ndarray, list)):
+        y_limit_max = np.zeros(len(tracking_obj))
+        for i in range(len(tracking_obj)):
+            y_limit_max[i] = args[1][3][i] + (0.1 * args[1][3][i])
+    else:
+        y_limit_max = args[1][3] + (0.1 * args[1][3])
     # Step 2:
     domain_size = domain_sizing[0][1]
     # Step 3: Check/Create directory to store animation frmaes
-    output_dir_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
-                                   f"Animation-Frames",
-                                   f"{tracking_obj}-Plt-Files")
+    if isinstance(tracking_obj, (np.ndarray, list)):
+        output_dir_path = ensure_long_path_prefix(os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                                                               f"Processed-Global-Results", f"Animation-Frames",
+                                                               f"{tracking_obj[0]}-{tracking_obj[1]}-Plt-Files"))
+    else:
+        output_dir_path = ensure_long_path_prefix(os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                                                               f"Processed-Global-Results", f"Animation-Frames",
+                                                               f"{tracking_obj}-Plt-Files"))
+
     # Step 4:
     raw_data = yt.load(current_file)
     slice = raw_data.ray(np.array([0.0, domain_size[1], 0.0]), np.array([domain_size[0], domain_size[1], 0.0]))
@@ -554,7 +606,7 @@ def createVariableAnimation(folder_path, output_filename, fps=15):
         - output_filename: str, the name of the output video file (e.g., 'animation.mp4').
         - fps: int, frames per second for the animation (default is 2).
         - file_extension: str, the file extension of the plot files (default is 'png').
-        """
+    """
     # Collect all plot files from the folder
     image_files = collect_plot_files(folder_path, 'png')
 
@@ -1039,10 +1091,11 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
         if check_flags['Post-Shock Processing'].get('Smoothing', False):
             # Thermodynamic State
             if check_flags['Post-Shock Processing'].get('Thermodynamic State', False):
-                smooth_post_shock_thermo_arr = np.zeros((len(smooth_time_arr), 4))
+                smooth_post_shock_thermo_arr = np.zeros((len(smooth_time_arr), 3))
                 for i in range(0, 3):
-                    [_, temp_arr, _] = polynomial_fit_over_array(time_arr, post_shock_thermo_arr)
+                    [_, temp_arr, _] = polynomial_fit_over_array(time_arr, post_shock_thermo_arr[:, i + 1])
                     smooth_post_shock_thermo_arr[:, i] = temp_arr
+
     # Step 3.5: State Variation Animation
     if 'Domain State Animations' in check_flags:
         # Step 3.5.1: Get last time step maximum parameters
@@ -1050,25 +1103,33 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
         slice = raw_data.ray(np.array([0.0, domain_info[0][1][1], 0.0]),
                              np.array([domain_info[0][1][0], domain_info[0][1][1], 0.0]))
 
+        max_val_marker = np.empty(3 + len(input_params.result_species), dtype=object)
         max_val_arr = np.zeros(3 + len(input_params.result_species))
         for i in range(len(max_val_arr)):
             if i == 0:
+                max_val_marker[i] = str('Temp')
                 max_val_arr[i] = np.max(slice["boxlib", str('Temp')])
             elif i == 1:
+                max_val_marker[i] = 'pressure'
                 max_val_arr[i] = np.max(slice["boxlib", str('pressure')])
             elif i == 2:
+                max_val_marker[i] = 'x_velocity'
                 max_val_arr[i] = np.max(slice["boxlib", str('x_velocity')])
             else:
+                max_val_marker[i] = str("Y(" + input_params.result_species[i - 3] + ")")
                 max_val_arr[i] = np.max(slice["boxlib", str("Y(" + input_params.result_species[i - 3] + ")")])
 
         # Step 3.5.2: Create plot and animation files
         if check_flags['Domain State Animations'].get('Temperature', False):
             # Create directory for plt files
-            temp_plt_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
-                                        f"Animation-Frames", f"Temp-Plt-Files")
-            temp_animation_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results")
+            temp_plt_dir = ensure_long_path_prefix(
+                os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
+                             f"Animation-Frames", f"Temp-Plt-Files"))
+            temp_animation_dir = ensure_long_path_prefix(
+                os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results"))
+
             if os.path.exists(temp_plt_dir) is False:
-                os.makedirs(temp_plt_dir)
+                os.makedirs(temp_plt_dir, exist_ok=True)
             # Create all the plt files in parallel
             parallelProcessingFunction(data_dir, (domain_info, input_params, 'Temp', max_val_arr[0],),
                                        createVariablePltFrame, 16)
@@ -1078,11 +1139,14 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
 
         if check_flags['Domain State Animations'].get('Pressure', False):
             # Create directory for plt files
-            temp_plt_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
-                                        f"Animation-Frames", f"pressure-Plt-Files")
-            temp_animation_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results")
+            temp_plt_dir = ensure_long_path_prefix(
+                os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
+                             f"Animation-Frames", f"pressure-Plt-Files"))
+            temp_animation_dir = ensure_long_path_prefix(
+                os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results"))
+
             if os.path.exists(temp_plt_dir) is False:
-                os.makedirs(temp_plt_dir)
+                os.makedirs(temp_plt_dir, exist_ok=True)
             # Create all the plt files in parallel
             parallelProcessingFunction(data_dir, (domain_info, input_params, 'pressure', max_val_arr[1],),
                                        createVariablePltFrame, 16)
@@ -1092,11 +1156,14 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
 
         if check_flags['Domain State Animations'].get('Velocity', False):
             # Create directory for plt files
-            temp_plt_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
-                                        f"Animation-Frames", f"x_velocity-Plt-Files")
-            temp_animation_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results")
+            temp_plt_dir = ensure_long_path_prefix(
+                os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
+                             f"Animation-Frames", f"x_velocity-Plt-Files"))
+            temp_animation_dir = ensure_long_path_prefix(
+                os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results"))
+
             if os.path.exists(temp_plt_dir) is False:
-                os.makedirs(temp_plt_dir)
+                os.makedirs(temp_plt_dir, exist_ok=True)
             # Create all the plt files in parallel
             parallelProcessingFunction(data_dir, (domain_info, input_params, 'x_velocity', max_val_arr[2],),
                                        createVariablePltFrame, 16)
@@ -1107,13 +1174,14 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
         if check_flags['Domain State Animations'].get('Species', False):
             for i in range(len(input_params.result_species)):
                 # Create directory for plt files
-                temp_plt_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
-                                            f"Animation-Frames",
-                                            f"{str("Y(" + input_params.result_species[i] + ")")}-Plt-Files")
-                temp_animation_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)),
-                                                  f"Processed-Global-Results")
+                temp_plt_dir = ensure_long_path_prefix(
+                    os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
+                                 f"Animation-Frames", f"{str("Y(" + input_params.result_species[i] + ")")}-Plt-Files"))
+                temp_animation_dir = ensure_long_path_prefix(
+                    os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results"))
+
                 if os.path.exists(temp_plt_dir) is False:
-                    os.makedirs(temp_plt_dir)
+                    os.makedirs(temp_plt_dir, exist_ok=True)
                 # Create all the plt files in parallel
                 parallelProcessingFunction(data_dir, (domain_info, input_params,
                                                       str("Y(" + input_params.result_species[i] + ")"),
@@ -1123,6 +1191,38 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
                 createVariableAnimation(temp_plt_dir, os.path.join(temp_animation_dir,
                                                                    f"{str("Y(" + input_params.result_species[i] + ")")}-Evolution-Animation.mp4"),
                                         fps=15)
+
+        if check_flags['Domain State Animations'].get('Combined', False):
+            # This functionality only exists for 2 sets of data
+            # Create directory for plt files
+            temp_plt_dir = ensure_long_path_prefix(
+                os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
+                             f"Animation-Frames", f"{check_flags['Domain State Animations']['Combined'][0]}-"
+                                                  f"{check_flags['Domain State Animations']['Combined'][1]}-Plt-Files"))
+            temp_animation_dir = ensure_long_path_prefix(
+                os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results"))
+
+            if os.path.exists(temp_plt_dir) is False:
+                os.makedirs(temp_plt_dir, exist_ok=True)
+            # Create all the plt files in parallel
+            parallelProcessingFunction(data_dir, (domain_info, input_params,
+                                                  [check_flags['Domain State Animations']['Combined'][0],
+                                                   check_flags['Domain State Animations']['Combined'][1]],
+                                                  [max_val_arr[np.argwhere(max_val_marker ==
+                                                                           check_flags['Domain State Animations'][
+                                                                               'Combined'][0])][0][0],
+                                                   max_val_arr[np.argwhere(max_val_marker ==
+                                                                           check_flags['Domain State Animations'][
+                                                                               'Combined'][1])][0][0]],),
+                                       createVariablePltFrame, 16)
+            # Create the animation file
+            createVariableAnimation(temp_plt_dir, os.path.join(temp_animation_dir,
+                                                               f"{check_flags['Domain State Animations']['Combined'][0]}"
+                                                               f"-{check_flags['Domain State Animations']['Combined'][1]}-Evolution-Animation.mp4"),
+                                    fps=15)
+
+            f"{check_flags['Domain State Animations']['Combined'][0]}-"
+            f"{check_flags['Domain State Animations']['Combined'][1]}-Plt-Files"
 
     # Step 4:
     # Step 4.1:
@@ -1146,36 +1246,37 @@ def main():
 
     check_flag_dict = {
         'Flame Processing': {
-            'Position': False,
-            'Velocity': False,
+            'Position': True,
+            'Velocity': True,
             'Relative Velocity': False,
-            'Thermodynamic State': False,
-            'Surface Length': False,
-            'Smoothing': False
+            'Thermodynamic State': True,
+            'Surface Length': True,
+            'Smoothing': True
         },
         'Leading Shock Processing': {
-            'Position': False,
-            'Velocity': False,
-            'Smoothing': False
+            'Position': True,
+            'Velocity': True,
+            'Smoothing': True
         },
         'Maximum Pressure Processing': {
-            'Position': False,
+            'Position': True,
             'Thermodynamic State': False,
-            'Smoothing': False
+            'Smoothing': True
         },
         'Pre-Shock Processing': {
-            'Thermodynamic State': False,
-            'Smoothing': False
+            'Thermodynamic State': True,
+            'Smoothing': True
         },
         'Post-Shock Processing': {
-            'Thermodynamic State': False,
-            'Smoothing': False
+            'Thermodynamic State': True,
+            'Smoothing': True
         },
         'Domain State Animations': {
-            'Temperature': True,
-            'Pressure': True,
-            'Velocity': True,
-            'Species': True
+            'Temperature': False,
+            'Pressure': False,
+            'Velocity': False,
+            'Species': False,
+            'Combined': ('Temp', 'pressure')
         }
     }
 
@@ -1186,8 +1287,8 @@ def main():
 
     # Step 1: Initialize the code with the desired processed variables and mixture composition
     input_params = MyClass()
-    input_params.T = 785.4
-    input_params.P = 10.43 * ct.one_atm
+    input_params.T = 503.15
+    input_params.P = 10.0 * 100000
     input_params.Phi = 1.0
     input_params.Fuel = 'H2'
     input_params.result_species = mass_fraction_variables
