@@ -649,7 +649,7 @@ def flame_length_contour_function(raw_data, plt_data, sort_arr, plt_check=False)
     return surface_length / 100
 
 
-def cantera_ignition_function(plt_data, sort_arr, ddt_window, processing_flags, input_params, reactor_type='Pressure'):
+def cantera_ignition_function(plt_data, ddt_window, processing_flags, input_params, reactor_type='Pressure'):
     ####################################################################################################################
     # This function uses cantera to compute the ignition delay for a given mixture at a given initial state
     ####################################################################################################################
@@ -661,13 +661,13 @@ def cantera_ignition_function(plt_data, sort_arr, ddt_window, processing_flags, 
         species_comp = {}
         for j in range(len(input_params.species)):
             species_comp.update({str(input_params.species[j]):
-                                     plt_data["boxlib", str("Y(" + input_params.species[j] + ")")][sort_arr][
+                                     plt_data["boxlib", str("Y(" + input_params.species[j] + ")")][
                                          value, ddt_window[0][1]].to_value().flatten()})
 
         # Step 2: Define the gas object and the initial state
         gas = ct.Solution(input_params.mech)
-        gas.TPY = (plt_data["boxlib", "Temp"][sort_arr][value, ddt_window[0][1]].to_value().flatten(),
-                   10 * plt_data["boxlib", 'pressure'][sort_arr][value, ddt_window[0][1]].to_value().flatten(),
+        gas.TPY = (plt_data["boxlib", "Temp"][value, ddt_window[0][1]].to_value().flatten(),
+                   10 * plt_data["boxlib", 'pressure'][value, ddt_window[0][1]].to_value().flatten(),
                    species_comp)
 
         # Step 3:
@@ -728,7 +728,7 @@ def cantera_ignition_function(plt_data, sort_arr, ddt_window, processing_flags, 
     return reactor_arr
 
 
-def cantera_flame_function(plt_data, sort_arr, ddt_window, processing_flags, input_params):
+def cantera_flame_function(plt_data, ddt_window, processing_flags, input_params):
     flame_arr = np.empty(processing_flags['Processing Parameters']['Spatial Window'], dtype=object)
 
     spatial_idx = np.arange(ddt_window[0][0], ddt_window[1][0] + 1)
@@ -737,13 +737,13 @@ def cantera_flame_function(plt_data, sort_arr, ddt_window, processing_flags, inp
         species_comp = {}
         for j in range(len(input_params.species)):
             species_comp.update({str(input_params.species[j]):
-                                     plt_data["boxlib", str("Y(" + input_params.species[j] + ")")][sort_arr][
+                                     plt_data["boxlib", str("Y(" + input_params.species[j] + ")")][
                                          value, ddt_window[0][1]].to_value().flatten()})
 
         # Step 2: Define the gas object and the initial state
         gas = ct.Solution(input_params.mech)
-        gas.TPY = (plt_data["boxlib", 'Temp'][sort_arr][value, ddt_window[0][1]].to_value().flatten(),
-                   10 * plt_data["boxlib", 'pressure'][sort_arr][value, ddt_window[0][1]].to_value().flatten(),
+        gas.TPY = (plt_data["boxlib", 'Temp'][value, ddt_window[0][1]].to_value().flatten(),
+                   10 * plt_data["boxlib", 'pressure'][value, ddt_window[0][1]].to_value().flatten(),
                    species_comp)
         # Step 3: Simulation parameters
         width = 0.0001  # m
@@ -1223,19 +1223,18 @@ def single_ddt_pltfile_processing(args):
                                                # fields=desired_varables
                                                )
 
-        sort_arr = np.argsort(temp_ddt_data["boxlib", "x"][:, 0].to_value().flatten())
         time = raw_data.current_time.to_value()
 
         plt_check = False
         if plt_check:
             plt.figure(figsize=(8, 6))
-            plt.plot(temp_ddt_data["boxlib", "x"][sort_arr][:, 0].to_value().flatten(),
-                     temp_ddt_data["boxlib", "Temp"][sort_arr][:, 0].to_value().flatten(), linestyle='-', color='k')
+            plt.plot(temp_ddt_data["boxlib", "x"][:, 0].to_value().flatten(),
+                     temp_ddt_data["boxlib", "Temp"][:, 0].to_value().flatten(), linestyle='-', color='k')
             plt.xlabel('x')
             plt.ylabel('y')
             plt.show()
 
-        return time, raw_data, temp_ddt_data, sort_arr
+        return time, raw_data, temp_ddt_data
 
     """
 
@@ -1250,7 +1249,7 @@ def single_ddt_pltfile_processing(args):
     spatial_idx = np.arange(ddt_window[0][0], ddt_window[1][0] + 1)
 
     # Step 3: Load the pltFile for individual processing
-    time, raw_data, plt_data, sort_arr = load_data()
+    time, raw_data, plt_data = load_data()
 
     # Step 4:
     result_dict = {}
@@ -1266,22 +1265,19 @@ def single_ddt_pltfile_processing(args):
 
     for i, value in enumerate(spatial_idx):
         if processing_flags['PeleC Processing'].get('Temperature', False):
-            result_dict['PeleC']['Temperature'][i] = plt_data["boxlib", 'Temp'][sort_arr][value, ddt_window[0][1]][
-                0].to_value()
+            result_dict['PeleC']['Temperature'][i] = plt_data["boxlib", 'Temp'][value, ddt_window[0][1]][0].to_value()
         if processing_flags['PeleC Processing'].get('Pressure', False):
-            result_dict['PeleC']['Pressure'][i] = 10 * \
-                                                  plt_data["boxlib", 'pressure'][sort_arr][value, ddt_window[0][1]][
-                                                      0].to_value()
+            result_dict['PeleC']['Pressure'][i] = 10 * plt_data["boxlib", 'pressure'][value, ddt_window[0][1]][
+                0].to_value()
         if processing_flags['PeleC Processing'].get('Density', False):
-            result_dict['PeleC']['Density'][i] = 1000 * \
-                                                 plt_data["boxlib", 'density'][sort_arr][value, ddt_window[0][1]][
-                                                     0].to_value()
+            result_dict['PeleC']['Density'][i] = 1000 * plt_data["boxlib", 'density'][value, ddt_window[0][1]][
+                0].to_value()
 
         if processing_flags['PeleC Processing'].get('Species', False):
             species_comp = {}
             for j in range(len(input_params.species)):
                 species_comp.update({str(input_params.species[j]):
-                                         plt_data["boxlib", str("Y(" + input_params.species[j] + ")")][sort_arr][
+                                         plt_data["boxlib", str("Y(" + input_params.species[j] + ")")][
                                              value, ddt_window[0][1]][0].to_value()})
             result_dict['PeleC']['Species'][i] = species_comp
 
@@ -1292,20 +1288,19 @@ def single_ddt_pltfile_processing(args):
         # Step 4.2: Constant Pressure Ignition Delay Processing
     if processing_flags['Comparison Type'].get('Ignition Delay Pressure', False):
         # Step 4.2.1: Calculate the ignition behavior for a given initial state
-        result_dict['Ignition Delay Pressure'] = cantera_ignition_function(plt_data, sort_arr, ddt_window,
-                                                                           processing_flags, input_params)
+        result_dict['Ignition Delay Pressure'] = cantera_ignition_function(plt_data, ddt_window, processing_flags,
+                                                                           input_params)
 
     # Step 4.3: Constant Volume Ignition Delay Processing
     if processing_flags['Comparison Type'].get('Ignition Delay Volume', False):
         # Step 4.3.1: Calculate the ignition behavior for a given initial state
-        result_dict['Ignition Delay Volume'] = cantera_ignition_function(plt_data, sort_arr, ddt_window,
-                                                                         processing_flags, input_params,
-                                                                         reactor_type='Volume')
+        result_dict['Ignition Delay Volume'] = cantera_ignition_function(plt_data, ddt_window, processing_flags,
+                                                                         input_params, reactor_type='Volume')
 
     # Step 4.4: Flame Processing
     if processing_flags['Comparison Type'].get('Flame', False):
         # Step 4.4.1: Calculate the flame behavior for a given initial state
-        result_dict['Flame'] = cantera_flame_function(plt_data, sort_arr, ddt_window, processing_flags, input_params)
+        result_dict['Flame'] = cantera_flame_function(plt_data, ddt_window, processing_flags, input_params)
 
     return result_dict
 
@@ -1913,13 +1908,9 @@ def pelec_ddt_processing_function(ddt_pltFile, plt_dir, domain_info, input_param
                                                 # fields=desired_varables
                                                 )
 
-    domain_size = domain_info[0][1]
-    slice = temp_plt_data.ray(np.array([0.0, domain_size[1], 0.0]), np.array([domain_size[0], domain_size[1], 0.0]))
-    ray_sort = np.argsort(slice["x"])
-
     # Find max pressure location
-    ddt_idx = np.unravel_index(np.argmax(temp_ddt_data["boxlib", 'pressure'][ray_sort].to_value(), axis=None),
-                               temp_ddt_data["boxlib", 'pressure'][ray_sort].to_value().shape)
+    ddt_idx = np.unravel_index(np.argmax(temp_ddt_data["boxlib", 'Temp'].to_value(), axis=None),
+                               temp_ddt_data["boxlib", 'Temp'].to_value().shape)
 
     ddt_window = np.empty(2, dtype=object)
     """
@@ -2030,7 +2021,7 @@ def main():
     detonation_check_flag = {
         'Processing Parameters': {
             'Time Window': (11, 4),
-            'Spatial Window': 11,
+            'Spatial Window': 15,
         },
         'Comparison Type': {
             'PeleC': True,
@@ -2109,7 +2100,8 @@ def main():
     pelec_processing_function(updated_data_list, domain_info, input_params, check_flag_dict, output_dir=output_dir_path)
 
     # Step 7:
-    # pelec_ddt_processing_function(ddt_plt_dir, updated_data_list, domain_info, input_params, detonation_check_flag, output_dir=output_dir_path)
+    pelec_ddt_processing_function(ddt_plt_dir, updated_data_list, domain_info, input_params, detonation_check_flag,
+                                  output_dir=output_dir_path)
 
     return
 
