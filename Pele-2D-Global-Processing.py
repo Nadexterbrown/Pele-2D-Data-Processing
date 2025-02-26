@@ -7,10 +7,8 @@ import matplotlib.pyplot as plt
 from sdtoolbox.thermo import soundspeed_fr
 from sdtoolbox.postshock import PostShock_fr
 
-
 class MyClass():
     pass
-
 
 def reload_prior_processed_data(raw_file_list, restart_file, check=False):
     def importGlobalData(fileName):
@@ -29,7 +27,6 @@ def reload_prior_processed_data(raw_file_list, restart_file, check=False):
         return updated_file_list
     else:
         return raw_file_list
-
 
 def processing_height(directory_path, desired_y_location):
     # Step 1:
@@ -55,7 +52,6 @@ def processing_height(directory_path, desired_y_location):
         temp_array = np.argwhere(data["boxlib", str('y')][0][:].to_value() <= desired_y_location)
         y_index = temp_array[-1][0]
     return np.array([data["boxlib", str('x')][-1][0].to_value()[0], data["boxlib", str('y')][0][y_index].to_value()[0]])
-
 
 def polynomial_fit_over_array(x, y, bin_size, degree):
     """
@@ -180,11 +176,22 @@ def gasVelocityProcessingFunction(args):
     gas_vel = preheatZoneFunction(slice, ray_sort)
     return gas_vel
 
-
 def thermodynamicProcessingFunction(args):
-    def thermodynamicParameters(data, ray_sort, input_params):
-        # Step 0:
-        [shock_index, _] = waveTrackingFunction(data, ray_sort, "pressure", None, "Shock")
+    def thermodynamicParameters(data, ray_sort, input_params, thermo_type):
+        # Step 0: Determine the location of the desired wave provided by the thermo_type
+        if thermo_type == "flame":
+            [wave_index, _] = waveTrackingFunction(data, ray_sort, "Temp", 2000, "Flame")
+            temp_array = data["boxlib", str('x')][ray_sort].to_value()
+            temp_position = temp_array[wave_index]
+            probe_index = np.argwhere(temp_array >= temp_position + (0.25/10))[0][0]
+        elif thermo_type == "pre_shock" or thermo_type == "post_shock":
+            [wave_index, _] = waveTrackingFunction(data, ray_sort, "pressure", None, "Shock")
+            temp_array = data["boxlib", str('x')][ray_sort].to_value()
+            temp_position = temp_array[wave_index]
+            if thermo_type == "pre_shock":
+                probe_index = np.argwhere(temp_array >= temp_position + (5/10))
+            elif thermo_type == "post_shock":
+                probe_index = np.argwhere(temp_array >= temp_position - (5/10))
         # Step 1:
         temp_temp = data["boxlib", "Temp"][ray_sort].to_value()
         temp_pres = data["boxlib", "pressure"][ray_sort].to_value()
@@ -195,18 +202,20 @@ def thermodynamicProcessingFunction(args):
 
         mixture_comp = {}
         for i in range(len(input_params.result_species)):
-            mixture_comp.update({str(input_params.result_species[i]): temp_comp[i][shock_index - 10]})
+            mixture_comp.update({str(input_params.result_species[i]): temp_comp[i][probe_index]})
 
         # Step 0: Allocate the space for all thermodynamic parameters (reactant temperature, pressure, density, soundspeed
         # and the coresponding product values)
-        result_array = np.empty(2, dtype=float)
+        result_array = np.empty(4, dtype=float)
         # Step 1: Using the input parameter class, create a cantera gas object
         gas_temp = ct.Solution(input_params.mech)
-        gas_temp.TPY = (temp_temp[shock_index - 10],
-                        temp_pres[shock_index - 10] * 10,
+        gas_temp.TPY = (temp_temp[probe_index],
+                        temp_pres[probe_index] / 10,
                         mixture_comp)
-        result_array[0] = gas_temp.density_mass
-        result_array[1] = soundspeed_fr(gas_temp)
+        result_array[0] = gas_temp.T
+        result_array[1] = gas_temp.P
+        result_array[2] = gas_temp.density_mass
+        result_array[3] = soundspeed_fr(gas_temp)
         del gas_temp
         return result_array
 
@@ -217,6 +226,7 @@ def thermodynamicProcessingFunction(args):
     current_file = args[0]
     domain_size = args[1]
     input_params = args[2]
+    thermo_type = args[3]
     # Step 2: Determine the file path for the highest level
     level_var = -1
     for level in os.listdir(current_file):
@@ -225,19 +235,19 @@ def thermodynamicProcessingFunction(args):
                 level_var = int(level.split('_')[-1])
 
     raw_data = yt.load(current_file)
-    slice = raw_data.ray(np.array([0.0, domain_size[1], 0.0]), np.array([domain_size[0], domain_size[1],
-                                                                         0.0]))  # 1 corresponds to the y-axis, y_location is the physical position (in meters)
+    slice = raw_data.ray(np.array([0.0, domain_size[1], 0.0]), np.array([domain_size[0], domain_size[1], 0.0]))  # 1 corresponds to the y-axis, y_location is the physical position (in meters)
     ray_sort = np.argsort(slice["x"])
     time = raw_data.current_time.to_value()
     # Step 4:
-    thermo_results = thermodynamicParameters(slice, ray_sort, input_params)
+    thermo_results = thermodynamicParameters(slice, ray_sort, input_params, thermo_type)
     return thermo_results
-
 
 def waveProcessingFunction(data_dir, row_index, input_params, position_check=True,
                            lab_vel_check=False,
                            rel_vel_check=False,
-                           thermo_check=None,
+                           flame_thermo_check=False,
+                           pre_shock_thermo_check=False,
+                           post_shock_thermo_check=False,
                            output_dir=None):
     def parallelWaveProcessingFunction(paralellizationList, y_location, predicate, nProcs):
         """
@@ -267,7 +277,8 @@ def waveProcessingFunction(data_dir, row_index, input_params, position_check=Tru
                              itertools.repeat(y_location)))
         return y
 
-    def parallelThermodynamicProcessingFunction(paralellizationList, y_location, input_parameters, predicate, nProcs):
+    def parallelThermodynamicProcessingFunction(paralellizationList, y_location, input_parameters, thermo_type,
+                                                predicate, nProcs):
         """
                     Call the function ``predicate`` on ``nProcs`` processors for ``nTemps``
                     different temperatures.
@@ -279,11 +290,13 @@ def waveProcessingFunction(data_dir, row_index, input_params, position_check=Tru
             y = pool.map(predicate,
                          zip(paralellizationList,
                              itertools.repeat(y_location),
-                             itertools.repeat(input_parameters)))
+                             itertools.repeat(input_parameters),
+                             itertools.repeat(thermo_type)))
         return y
 
-    def writeWaveResults(file_path, position_data, lab_ref_vel, rel_ref_vel, thermo_data, smooth_check, position_check,
-                         lab_vel_check, rel_vel_check, thermo_check):
+    def writeWaveResults(file_path, position_data, lab_ref_vel, rel_ref_vel, flame_thermo_data, pre_shock_thermo_data,
+                         post_shock_thermo_data, smooth_check, position_check, lab_vel_check, rel_vel_check,
+                         flame_thermo_check, pre_shock_thermo_check, post_shock_thermo_check):
         # Step 0:
         header_data = ["Time [s]"]
         if position_check:
@@ -292,8 +305,15 @@ def waveProcessingFunction(data_dir, row_index, input_params, position_check=Tru
             header_data.extend(["Flame Lab Velocity [m]", "Shock Lab Velocity [m]"])
         if rel_vel_check:
             header_data.extend(["Gas Velocity [m/s]", "Flame Ref Velocity [m]", "Shock Ref Velocity [m]"])
-        if thermo_check:
-            header_data.extend(["Flame Density [kg/m^3]", "Flame Soundspeed [m/s]"])
+        if flame_thermo_check:
+            header_data.extend(["Flame Temperature [K]", "Flame Pressure [Pa]", "Flame Density [kg/m^3]",
+                                "Flame Soundspeed [m/s]"])
+        if pre_shock_thermo_check:
+            header_data.extend(["Pre-Shock Temperature [K]", "Pre-Shock Pressure [Pa]", "Pre-Shock Density [kg/m^3]",
+                                "Pre-Shock Soundspeed [m/s]"])
+        if post_shock_thermo_check:
+            header_data.extend(["Post-Shock Temperature [K]", "Post-Shock Pressure [Pa]", "Post-Shock Density [kg/m^3]",
+                                "Post-Shock Soundspeed [m/s]"])
         # Step 1: Write the header portion of the results file
         if smooth_check:
             file_name = "Wave-Tracking-Smooth-Results.txt"
@@ -319,9 +339,21 @@ def waveProcessingFunction(data_dir, row_index, input_params, position_check=Tru
                     outfile.write(" {0:<55e} {1:<55e} {1:<55e}".format(rel_ref_vel[i],
                                                                        lab_ref_vel[0][i] - rel_ref_vel[i],
                                                                        lab_ref_vel[1][i] - rel_ref_vel[i]))
-                if thermo_check:
-                    outfile.write(" {0:<55e} {1:<55e}".format(thermo_data[i][0],
-                                                              thermo_data[i][1]))
+                if flame_thermo_check:
+                    outfile.write(" {0:<55e} {1:<55e}".format(flame_thermo_data[i][0],
+                                                              flame_thermo_data[i][1],
+                                                              flame_thermo_data[i][2],
+                                                              flame_thermo_data[i][3]))
+                if pre_shock_thermo_check:
+                    outfile.write(" {0:<55e} {1:<55e}".format(pre_shock_thermo_data[i][0],
+                                                              pre_shock_thermo_data[i][1],
+                                                              pre_shock_thermo_data[i][2],
+                                                              pre_shock_thermo_data[i][3]))
+                if post_shock_thermo_check:
+                    outfile.write(" {0:<55e} {1:<55e}".format(post_shock_thermo_data[i][0],
+                                                              post_shock_thermo_data[i][1],
+                                                              post_shock_thermo_data[i][2],
+                                                              post_shock_thermo_data[i][3]))
                 outfile.write("\n")
             outfile.close()
         return
@@ -338,7 +370,9 @@ def waveProcessingFunction(data_dir, row_index, input_params, position_check=Tru
     smooth_wave_velocity = []
     raw_gas_velocity_evolution = []
     smooth_gas_velocity_evolution = []
-    raw_thermodynamic_data = []
+    raw_flame_thermo_data = []
+    raw_pre_shock_thermo_data = []
+    raw_post_shock_thermo_data = []
     smooth_thermodynamic_data = []
     # Step 1: Determine the wave positions and velocities in the laboratory frame of reference
     if position_check:
@@ -392,21 +426,35 @@ def waveProcessingFunction(data_dir, row_index, input_params, position_check=Tru
                                                                        raw_gas_velocity_evolution,
                                                                        poly_fit_bin_size, poly_fit_order)
     # Step 3:
-    if thermo_check:
-        raw_thermodynamic_data = parallelThermodynamicProcessingFunction(data_dir,
-                                                                         row_index,
-                                                                         input_params,
-                                                                         thermodynamicProcessingFunction, 6)
-        [_, smooth_thermodynamic_data, _] = polynomial_fit_over_array(sorted_raw_temp_array[:, 0], raw_thermodynamic_data,
-                                                                   poly_fit_bin_size, poly_fit_order)
+    if flame_thermo_check:
+        raw_flame_thermo_data = parallelThermodynamicProcessingFunction(data_dir,
+                                                                        row_index,
+                                                                        input_params,
+                                                                        "flame",
+                                                                        thermodynamicProcessingFunction, 6)
+    if pre_shock_thermo_check:
+        raw_pre_shock_thermo_data = parallelThermodynamicProcessingFunction(data_dir,
+                                                                        row_index,
+                                                                        input_params,
+                                                                        "pre-shock",
+                                                                        thermodynamicProcessingFunction, 6)
+
+    if post_shock_thermo_check:
+        raw_post_shock_thermo_data = parallelThermodynamicProcessingFunction(data_dir,
+                                                                        row_index,
+                                                                        input_params,
+                                                                        "post-shock",
+                                                                        thermodynamicProcessingFunction, 6)
+
     # Step 4:
     writeWaveResults(output_dir, sorted_raw_temp_array, raw_wave_velocity, raw_gas_velocity_evolution,
-                     raw_thermodynamic_data, False, position_check, lab_vel_check, rel_vel_check,
-                     thermo_check)
+                     raw_flame_thermo_data, raw_pre_shock_thermo_data, raw_post_shock_thermo_data, False,
+                     position_check, lab_vel_check, rel_vel_check,
+                     flame_thermo_check, pre_shock_thermo_check, post_shock_thermo_check)
 
     writeWaveResults(output_dir, smooth_temp_array, smooth_wave_velocity, smooth_gas_velocity_evolution,
                      smooth_thermodynamic_data, True, position_check, lab_vel_check, rel_vel_check,
-                     thermo_check)
+                     flame_thermo_check, pre_shock_thermo_check, post_shock_thermo_check)
     return
 
 
@@ -423,18 +471,22 @@ def main():
     wave_position = True
     wave_lab_velocity = True
     wave_rel_velocity = False
+    flame_state_check = True
+    pre_shock_state_check = False
+    post_shock_state_check = False
+
     thermodynamic_state_check = False
 
     skip_load = 0  # 0 for no skip
     # row_index = "Middle"  # Desired row location for data collection
-    row_index = 0.1 # Desired y_location for data collection in cm
+    row_index = 0.045 # Desired y_location for data collection in cm
     mass_fraction_variables = np.array(["H", "H2", "H2O", "H2O2", "HO2", "N2", "O", "O2", "OH"])
 
     # Step 1: Initialize the code with the desired processed variables and mixture composition
     input_params = MyClass()
-    input_params.T = 298.15
-    input_params.P = 1.0 * ct.one_atm
-    input_params.Phi = 1.5
+    input_params.T = 503.15
+    input_params.P = 10.0 * ct.one_atm
+    input_params.Phi = 1.0
     input_params.Fuel = 'H2'
     input_params.result_species = mass_fraction_variables
 
@@ -474,7 +526,9 @@ def main():
     waveProcessingFunction(updated_data_list, domain_size, input_params, position_check=wave_position,
                            lab_vel_check=wave_lab_velocity,
                            rel_vel_check=wave_rel_velocity,
-                           thermo_check=thermodynamic_state_check,
+                           flame_thermo_check=flame_state_check,
+                           pre_shock_thermo_check=pre_shock_state_check,
+                           post_shock_thermo_check=post_shock_state_check,
                            output_dir=output_dir_path)
 
     return
