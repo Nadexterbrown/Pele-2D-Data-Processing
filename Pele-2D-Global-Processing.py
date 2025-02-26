@@ -416,16 +416,6 @@ def flameAreaContourFunction(args):
         contour_segments.append(np.array(current_contour))
         contour_lines.append(np.array(current_line))
 
-    """
-    contour_line = []
-    for i in range(1, len(contour_arr)):
-        temp_var = np.sqrt((contour_arr[i, 0] - contour_arr[i - 1, 0]) ** 2 +
-                           (contour_arr[i, 1] - contour_arr[i - 1, 1]) ** 2)
-        if temp_var > 0.1 * raw_data.domain_right_edge[1]:
-            continue
-        else:
-            contour_line.append(temp_var)
-    """
     # Calculate the total line length, by summing the lines between points
     surface_length = sum(np.sum(distances) for distances in contour_lines)
     print('Flame Surface Length: ', surface_length, 'cm')
@@ -439,6 +429,29 @@ def flameAreaContourFunction(args):
     plt.show()
 
     return surface_length
+
+
+def domainVariableEvolution(args):
+    # Step 1:
+    current_file = args[0]
+    domain_sizing = args[1][0]
+    input_params = args[1][1]
+    # Step 2:
+    domain_size = domain_sizing[0][1]
+    # Step 3:
+    raw_data = yt.load(current_file)
+    slice = raw_data.ray(np.array([0.0, domain_size[1], 0.0]), np.array([domain_size[0], domain_size[1], 0.0]))
+    ray_sort = np.argsort(slice["x"])
+    time = raw_data.current_time.to_value()
+    # Step 4:
+    temp_temp = slice["boxlib", "Temp"][ray_sort].to_value()
+    temp_pres = slice["boxlib", "pressure"][ray_sort].to_value()
+
+    temp_comp = []
+    for i in range(len(input_params.result_species)):
+        temp_comp.append(slice["boxlib", str("Y(" + input_params.result_species[i] + ")")][ray_sort].to_value())
+
+    return
 
 
 def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, output_dir=None):
@@ -740,7 +753,7 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
 
         # Surface Length
         if check_flags['Flame Processing'].get('Surface Length', False):
-            temp_arr = parallelProcessingFunction(data_dir, (domain_info,), flameAreaContourFunction, 1)
+            temp_arr = parallelProcessingFunction(data_dir, (domain_info,), flameAreaContourFunction, 12)
             flame_surf_len_arr = np.array(temp_arr)
             del temp_arr
 
@@ -951,9 +964,9 @@ def main():
     check_flag_dict = {
         'Flame Processing': {
             'Position': True,
-            'Velocity': False,
+            'Velocity': True,
             'Relative Velocity': False,
-            'Thermodynamic State': False,
+            'Thermodynamic State': True,
             'Surface Length': True,
             'Smoothing': True
         },
@@ -968,7 +981,7 @@ def main():
             'Smoothing': False
         },
         'Pre-Shock Processing': {
-            'Thermodynamic State': True,
+            'Thermodynamic State': False,
             'Smoothing': False
         },
         'Post-Shock Processing': {
@@ -977,7 +990,7 @@ def main():
         }
     }
 
-    skip_load = 10  # 0 for no skip
+    skip_load = 0  # 0 for no skip
     # row_index = "Middle"  # Desired row location for data collection
     row_index = "Middle"  # Desired y_location for data collection in cm
     mass_fraction_variables = np.array(["H", "H2", "H2O", "H2O2", "HO2", "N2", "O", "O2", "OH"])
