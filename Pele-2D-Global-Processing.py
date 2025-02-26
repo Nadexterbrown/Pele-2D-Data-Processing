@@ -1,21 +1,18 @@
 import os, yt, itertools, multiprocessing, textwrap, re
-
-from numpy.fft.helper import fftfreq
 from sklearn.neighbors import NearestNeighbors
 from sdtoolbox.thermo import soundspeed_fr
 import matplotlib.animation as animation
 import matplotlib.image as mpimg
 import matplotlib.pyplot as plt
-from scipy.optimize import curve_fit, minimize
 import cantera as ct
 import numpy as np
-import pywt
 
 yt.set_log_level(0)
 
-n_proc = 16
-bin_size = 51
-flame_thickness_bin = 11
+n_proc = 24
+polyfit_bin_size = 51
+flame_thickness_bin_size = 11
+ddt_bin_size = 5
 
 
 class MyClass():
@@ -128,12 +125,13 @@ def smoothing_function(collective_results, master_key, slave_key):
         collective_results[master_key]["Smooth"][slave_key] = np.empty(4, dtype=object)
         for i in range(len(collective_results[master_key]["Smooth"][slave_key])):
             [temp_time, temp_vec, _] = polynomial_fit_over_array(np.array(collective_results['Time']['Value']),
-                                                                 np.array(temp_var_arr[:, i]), bin_size=bin_size)
+                                                                 np.array(temp_var_arr[:, i]),
+                                                                 bin_size=polyfit_bin_size)
             collective_results[master_key]["Smooth"][slave_key][i] = temp_vec
     else:
         [temp_time, temp_vec, _] = polynomial_fit_over_array(np.array(collective_results['Time']['Value']),
                                                              np.array(collective_results[master_key][slave_key]),
-                                                             bin_size=bin_size)
+                                                             bin_size=polyfit_bin_size)
 
         collective_results[master_key]["Smooth"][slave_key] = temp_vec
 
@@ -428,10 +426,10 @@ def flame_geometry_function(raw_data, center_loc, grid, output_dir_path, contour
         flame_y_idx = np.argmin(abs(grid[1] - contour_arr[flame_idx, 1]))
 
         # Create a sudo-grid region around the center flame point
-        region = raw_data.box(np.array([grid[0][flame_x_idx - (flame_thickness_bin // 2) - 1][0],
-                                        grid[1][flame_y_idx - (flame_thickness_bin // 2) - 1][0], 0.0]),
-                              np.array([grid[0][flame_x_idx + (flame_thickness_bin // 2)][0],
-                                        grid[1][flame_y_idx + (flame_thickness_bin // 2)][0], 1.0]))
+        region = raw_data.box(np.array([grid[0][flame_x_idx - (flame_thickness_bin_size // 2) - 1][0],
+                                        grid[1][flame_y_idx - (flame_thickness_bin_size // 2) - 1][0], 0.0]),
+                              np.array([grid[0][flame_x_idx + (flame_thickness_bin_size // 2)][0],
+                                        grid[1][flame_y_idx + (flame_thickness_bin_size // 2)][0], 1.0]))
 
         region_mesh_x, region_mesh_y = np.meshgrid(np.unique(region["x"].to_value()), np.unique(region["y"].to_value()))
 
@@ -578,143 +576,128 @@ def flame_geometry_function(raw_data, center_loc, grid, output_dir_path, contour
         return flame_thickness_val
 
 
-def cantera_ignition_function(plt_data, ddt_window, processing_flags, input_params, reactor_type='Pressure'):
+def cantera_ignition_function(plt_data, cell_idx, processing_flags, input_params, reactor_type='Pressure'):
     ####################################################################################################################
     # This function uses cantera to compute the ignition delay for a given mixture at a given initial state
     ####################################################################################################################
-    reactor_arr = np.empty(processing_flags['Processing Parameters']['Spatial Window'], dtype=object)
+    # Step 1: Collect the initial conditions over the physical window
+    species_comp = {}
+    for j in range(len(input_params.species)):
+        species_comp.update({str(input_params.species[j]):
+                                 np.reshape(plt_data["boxlib", str("Y(" + input_params.species[j] + ")")].to_value(),
+                                            (ddt_bin_size, ddt_bin_size)).T[cell_idx]})
 
-    spatial_idx = np.arange(ddt_window[0][0], ddt_window[1][0] + 1)
-    for i, value in enumerate(spatial_idx):
-        # Step 1: Collect the initial conditions over the physical window
-        species_comp = {}
-        for j in range(len(input_params.species)):
-            species_comp.update({str(input_params.species[j]):
-                                     plt_data["boxlib", str("Y(" + input_params.species[j] + ")")][
-                                         value, ddt_window[0][1]].to_value().flatten()})
+    # Step 2: Define the gas object and the initial state
+    gas = ct.Solution(input_params.mech)
+    gas.TPY = (np.reshape(plt_data["boxlib", 'Temp'].to_value(), (ddt_bin_size, ddt_bin_size)).T[cell_idx],
+               10 * np.reshape(plt_data["boxlib", 'pressure'].to_value(), (ddt_bin_size, ddt_bin_size)).T[cell_idx],
+               species_comp)
 
-        # Step 2: Define the gas object and the initial state
-        gas = ct.Solution(input_params.mech)
-        gas.TPY = (plt_data["boxlib", "Temp"][value, ddt_window[0][1]].to_value().flatten(),
-                   10 * plt_data["boxlib", 'pressure'][value, ddt_window[0][1]].to_value().flatten(),
-                   species_comp)
+    print(np.reshape(plt_data["boxlib", 'Temp'].to_value(), (ddt_bin_size, ddt_bin_size)).T[cell_idx])
+    # Step 3:
+    if reactor_type == 'Volume':
+        r = ct.Reactor(contents=gas)
 
-        # Step 3:
-        if reactor_type == 'Volume':
-            r = ct.Reactor(contents=gas)
+        gas_air = ct.Solution('air.yaml')
+        gas_air.TPX = 300, 1.0 * ct.one_atm, {'N2': 0.79, 'O2': 0.21}
+        env = ct.Reservoir(gas_air)
+        w = ct.Wall(r, env)
 
-            gas_air = ct.Solution('air.yaml')
-            gas_air.TPX = 300, 1.0 * ct.one_atm, {'N2': 0.79, 'O2': 0.21}
-            env = ct.Reservoir(gas_air)
-            w = ct.Wall(r, env)
+        reactorNetwork = ct.ReactorNet([r])
 
-            reactorNetwork = ct.ReactorNet([r])
+    else:
+        r = ct.IdealGasConstPressureReactor(contents=gas)
+        reactorNetwork = ct.ReactorNet([r])
 
-        else:
-            r = ct.IdealGasConstPressureReactor(contents=gas)
-            reactorNetwork = ct.ReactorNet([r])
+    # Step 4:
+    timeHistory = ct.SolutionArray(gas, extra=['t'])
 
-        # Step 4:
-        timeHistory = ct.SolutionArray(gas, extra=['t'])
+    # Step 4: Run the reactor and determine the time history of the reaction occuring
+    t = 0
+    tFinal = 600
+    while t < tFinal:
+        # Step 4.1: Take a time step and determine the new state of the reactor
+        t = reactorNetwork.step()
+        # Step 4.2: Save the new state of the reactor to the timeHistory object
+        timeHistory.append(r.thermo.state, t=t)
 
-        # Step 4: Run the reactor and determine the time history of the reaction occuring
-        t = 0
-        tFinal = 600
-        while t < tFinal:
-            # Step 4.1: Take a time step and determine the new state of the reactor
-            t = reactorNetwork.step()
-            # Step 4.2: Save the new state of the reactor to the timeHistory object
-            timeHistory.append(r.thermo.state, t=t)
+    # Step 4:
+    result_dict = {}
+    result_dict['Time'] = timeHistory.t
+    if processing_flags['Ignition Delay Processing'].get('Temperature', False):
+        result_dict['Temperature'] = timeHistory.T
+    if processing_flags['Ignition Delay Processing'].get('Pressure', False):
+        result_dict['Pressure'] = timeHistory.P
+    if processing_flags['Ignition Delay Processing'].get('Density', False):
+        result_dict['Density'] = timeHistory.density_mass
+    if processing_flags['Ignition Delay Processing'].get('Species', False):
+        result_dict['Species'] = timeHistory.Y
+    if processing_flags['Ignition Delay Processing'].get('Heat Release Rate', False):
+        result_dict['Heat Release Rate'] = timeHistory.heat_release_rate
 
-        # Step 4:
-        result_dict = {}
-        result_dict['Time'] = timeHistory.t
-        if processing_flags['Ignition Delay Processing'].get('Temperature', False):
-            result_dict['Temperature'] = timeHistory.T
-        if processing_flags['Ignition Delay Processing'].get('Pressure', False):
-            result_dict['Pressure'] = timeHistory.P
-        if processing_flags['Ignition Delay Processing'].get('Density', False):
-            result_dict['Density'] = timeHistory.density_mass
-        if processing_flags['Ignition Delay Processing'].get('Species', False):
-            result_dict['Species'] = timeHistory.Y
-        if processing_flags['Ignition Delay Processing'].get('Heat Release Rate', False):
-            result_dict['Heat Release Rate'] = timeHistory.heat_release_rate
+    # Step 6:
+    plt_check = False
+    if plt_check:
+        plt.figure(figsize=(8, 6))
+        plt.plot(timeHistory.t, timeHistory.T, linestyle='-', color='k')
+        plt.xlabel('x')
+        plt.ylabel('y')
+        plt.show()
 
-        # Step 5: Create a dictionary containing the results
-        reactor_arr[i] = result_dict
-
-        del r, reactorNetwork
-
-        # Step 6:
-        plt_check = False
-        if plt_check:
-            plt.figure(figsize=(8, 6))
-            plt.plot(timeHistory.t, timeHistory.T, linestyle='-', color='k')
-            plt.xlabel('x')
-            plt.ylabel('y')
-            plt.show()
-
-    return reactor_arr
+    del r, reactorNetwork
+    return result_dict
 
 
-def cantera_flame_function(plt_data, ddt_window, processing_flags, input_params):
-    flame_arr = np.empty(processing_flags['Processing Parameters']['Spatial Window'], dtype=object)
+def cantera_flame_function(plt_data, cell_idx, processing_flags, input_params):
+    # Step 1: Collect the initial conditions over the physical window
+    species_comp = {}
+    for j in range(len(input_params.species)):
+        species_comp.update({str(input_params.species[j]):
+                                 np.reshape(plt_data["boxlib", str("Y(" + input_params.species[j] + ")")].to_value(),
+                                            (ddt_bin_size, ddt_bin_size)).T[cell_idx]})
 
-    spatial_idx = np.arange(ddt_window[0][0], ddt_window[1][0] + 1)
-    for i, value in enumerate(spatial_idx):
-        # Step 1: Collect the initial conditions over the physical window
-        species_comp = {}
-        for j in range(len(input_params.species)):
-            species_comp.update({str(input_params.species[j]):
-                                     plt_data["boxlib", str("Y(" + input_params.species[j] + ")")][
-                                         value, ddt_window[0][1]].to_value().flatten()})
+    # Step 2: Define the gas object and the initial state
+    gas = ct.Solution(input_params.mech)
+    gas.TPY = (np.reshape(plt_data["boxlib", 'Temp'].to_value(), (ddt_bin_size, ddt_bin_size)).T[cell_idx],
+               10 * np.reshape(plt_data["boxlib", 'pressure'].to_value(), (ddt_bin_size, ddt_bin_size)).T[cell_idx],
+               species_comp)
+    # Step 3: Simulation parameters
+    width = 1e-4  # m
+    loglevel = 0  # amount of diagnostic output (0 to 8)
+    # Step 4: Set up flame object
+    f = ct.FreeFlame(gas, width=width)
+    f.set_refine_criteria(ratio=3, slope=0.001, curve=0.001)
+    f.show()
+    # Step 5: Solve with mixture-averaged transport model
+    f.transport_model = 'mixture-averaged'
+    f.solve(loglevel=loglevel, auto=True)
+    # Step 6:
+    result_dict = {}
+    result_dict['Grid'] = f.grid
+    if processing_flags['Flame Processing'].get('Temperature', False):
+        result_dict['Temperature'] = f.T
+    if processing_flags['Flame Processing'].get('Pressure', False):
+        result_dict['Pressure'] = f.P
+    if processing_flags['Flame Processing'].get('Density', False):
+        result_dict['Density'] = f.density_mass
+    if processing_flags['Flame Processing'].get('Species', False):
+        result_dict['Species'] = f.Y
+    if processing_flags['Flame Processing'].get('Velocity', False):
+        result_dict['Velocity'] = f.velocity
+    if processing_flags['Flame Processing'].get('Heat Release Rate', False):
+        result_dict['Heat Release Rate'] = f.heat_release_rate
 
-        # Step 2: Define the gas object and the initial state
-        gas = ct.Solution(input_params.mech)
-        gas.TPY = (plt_data["boxlib", 'Temp'][value, ddt_window[0][1]].to_value().flatten(),
-                   10 * plt_data["boxlib", 'pressure'][value, ddt_window[0][1]].to_value().flatten(),
-                   species_comp)
-        # Step 3: Simulation parameters
-        width = 0.0001  # m
-        loglevel = 0  # amount of diagnostic output (0 to 8)
-        # Step 4: Set up flame object
-        f = ct.FreeFlame(gas, width=width)
-        f.set_refine_criteria(ratio=3, slope=0.01, curve=0.01)
-        f.show()
-        # Step 5: Solve with mixture-averaged transport model
-        f.transport_model = 'mixture-averaged'
-        f.solve(loglevel=loglevel, auto=True)
-        # Step 6:
-        result_dict = {}
-        result_dict['Grid'] = f.grid
-        if processing_flags['Flame Processing'].get('Temperature', False):
-            result_dict['Temperature'] = f.T
-        if processing_flags['Flame Processing'].get('Pressure', False):
-            result_dict['Pressure'] = f.P
-        if processing_flags['Flame Processing'].get('Density', False):
-            result_dict['Density'] = f.density_mass
-        if processing_flags['Flame Processing'].get('Species', False):
-            result_dict['Species'] = f.Y
-        if processing_flags['Flame Processing'].get('Velocity', False):
-            result_dict['Velocity'] = f.velocity
-        if processing_flags['Flame Processing'].get('Heat Release Rate', False):
-            result_dict['Heat Release Rate'] = f.heat_release_rate
+    # Step 6:
+    plt_check = False
+    if plt_check:
+        plt.figure(figsize=(8, 6))
+        plt.plot(f.grid, f.T, linestyle='-', color='k')
+        plt.xlabel('x')
+        plt.ylabel('y')
+        plt.show()
 
-        # Step 5: Create a dictionary containing the results
-        flame_arr[i] = result_dict
-
-        # Step 6:
-        plt_check = False
-        if plt_check:
-            plt.figure(figsize=(8, 6))
-            plt.plot(f.grid, f.T, linestyle='-', color='k')
-            plt.xlabel('x')
-            plt.ylabel('y')
-            plt.show()
-
-        del gas, f
-
-    return flame_arr
+    del gas, f
+    return result_dict
 
 
 def createVariablePltFrame(raw_data, sort_arr, time, min_bounds, max_bounds, tracking_obj, domain_info, hrr_arr=None):
@@ -817,6 +800,265 @@ def createVariablePltFrame(raw_data, sort_arr, time, min_bounds, max_bounds, tra
 
     # Step 3:
     pltAnimationFrame()
+
+    return
+
+
+def createAnchoredPlotFrame(pelec_data, input_params, comp_var='Ignition Delay Pressure', fixed_var='Temperature',
+                            fixed_val=2000, output_path=None):
+    # Step 1:
+
+    if comp_var == 'Ignition Delay Pressure':
+        pelec_shift_arr = np.empty(ddt_bin_size * ddt_bin_size)
+        temporal_dict = {}
+        cell_counter = 0
+        for i in range(len(pelec_data[0]['PeleC']['Position'][:, 0])):
+            for j in range(len(pelec_data[0]['PeleC']['Position'][:, 1])):
+                temporal_dict[f'Cell-{cell_counter}'] = {'Time': [], 'Position': []}
+                for k in range(len(pelec_data)):
+                    temporal_dict[f'Cell-{cell_counter}']['Time'].append(pelec_data[k]['Time'])
+                    temporal_dict[f'Cell-{cell_counter}']['Position'].append(pelec_data[k]['PeleC']['Position'][i][j])
+
+                    pelec_fields = ['Temperature', 'Pressure', 'Density']
+                    for field in pelec_fields:
+                        if field in pelec_data[k]['PeleC']:
+                            if field not in temporal_dict[f'Cell-{cell_counter}']:
+                                temporal_dict[f'Cell-{cell_counter}'][field] = []
+                            temporal_dict[f'Cell-{cell_counter}'][field].append(pelec_data[k]['PeleC'][field][i, j])
+
+                    if 'Species' in pelec_data[k]['PeleC']:
+                        if 'Species' not in temporal_dict[f'Cell-{cell_counter}']:
+                            temporal_dict[f'Cell-{cell_counter}']['Species'] = {}
+                        for species_name in input_params.species:
+                            species_key = f"Y({species_name})"
+                            if species_key in pelec_data[k]['PeleC']['Species']:
+                                if species_key not in temporal_dict[f'Cell-{cell_counter}']['Species']:
+                                    temporal_dict[f'Cell-{cell_counter}']['Species'][species_key] = []
+                                temporal_dict[f'Cell-{cell_counter}']['Species'][species_key].extend(
+                                    pelec_data[k]['PeleC']['Species'][species_key][i, j])
+
+                # Shifting factor for the pelec data
+                dT_dt = np.gradient(
+                    temporal_dict[f'Cell-{cell_counter}']['Temperature']) / np.gradient(
+                    temporal_dict[f'Cell-{cell_counter}']['Time'])
+                indices = np.argwhere(dT_dt == np.max(dT_dt))
+
+                if indices.size > 0:
+                    pelec_shift_arr[cell_counter] = indices[0][0]
+                else:
+                    pelec_shift_arr[cell_counter] = 0  # Or another default value if needed
+
+                cell_counter += 1
+
+        ignition_dict = {}
+        comp_shift_arr = np.empty(ddt_bin_size * ddt_bin_size)
+        cell_counter = 0
+        for i in range(len(pelec_data[0]['PeleC']['Position'][:, 0])):
+            for j in range(len(pelec_data[0]['PeleC']['Position'][:, 1])):
+                ignition_dict[f'Cell-{cell_counter}'] = {}
+                ignition_dict[f'Cell-{cell_counter}']['Ignition Delay Pressure'] = {'Time': [], 'Temperature': []}
+                for k in range(len(pelec_data)):
+                    ignition_dict[f'Cell-{cell_counter}']['Ignition Delay Pressure']['Time'].extend(
+                        pelec_data[k]['Ignition Delay Pressure'][i][j]['Time'])
+                    ignition_dict[f'Cell-{cell_counter}']['Ignition Delay Pressure']['Temperature'].extend(
+                        pelec_data[k]['Ignition Delay Pressure'][i][j]['Temperature'])
+
+                # Shifting factor for the comp data
+                dT_dt = np.gradient(
+                    ignition_dict[f'Cell-{cell_counter}']['Ignition Delay Pressure']['Temperature']) / np.gradient(
+                    ignition_dict[f'Cell-{cell_counter}']['Ignition Delay Pressure']['Time'])
+                indices = np.argwhere(dT_dt == np.max(dT_dt))
+
+                if indices.size > 0:
+                    comp_shift_arr[cell_counter] = indices[0][0]
+                else:
+                    comp_shift_arr[cell_counter] = 0  # Or another default value if needed
+
+                cell_counter += 1
+
+        # Step 2:
+        for i in range(len(temporal_dict)):
+            temp_vec = []
+            for j in range(len(temporal_dict[f'Cell-{i}']['Time'])):
+                temp_vec.append(
+                    temporal_dict[f'Cell-{i}']['Time'][j] - temporal_dict[f'Cell-{i}']['Time'][int(pelec_shift_arr[i])])
+            temporal_dict[f'Cell-{i}']['Shifted Time'] = []
+            temporal_dict[f'Cell-{i}']['Shifted Time'] = temp_vec
+
+        for i in range(len(ignition_dict)):
+            temp_vec = []
+            for j in range(len(ignition_dict[f'Cell-{i}']['Ignition Delay Pressure']['Time'])):
+                temp_vec.append(ignition_dict[f'Cell-{i}']['Ignition Delay Pressure']['Time'][j] -
+                                ignition_dict[f'Cell-{i}']['Ignition Delay Pressure']['Time'][int(comp_shift_arr[i])])
+            ignition_dict[f'Cell-{i}']['Ignition Delay Pressure']['Shifted Time'] = []
+            ignition_dict[f'Cell-{i}']['Ignition Delay Pressure']['Shifted Time'] = temp_vec
+
+        colors = ['red', 'green', 'blue', 'orange', 'purple']
+        color_cycle = itertools.cycle(colors)
+        for i in range(len(temporal_dict)):
+            fig, ax = plt.subplots()
+            ax.plot(temporal_dict[f'Cell-{i}']['Shifted Time'], temporal_dict[f'Cell-{i}']['Temperature'],
+                    label='Temperature', linestyle='-', marker='o', color='k')
+            for j in range(len(ignition_dict[f'Cell-{i}'])):
+                ax.plot(ignition_dict[f'Cell-{j}']['Ignition Delay Pressure']['Shifted Time'],
+                        ignition_dict[f'Cell-{j}']['Ignition Delay Pressure']['Temperature'],
+                        label=f'Cell-{j}', linestyle='-', color=next(color_cycle))
+            plt.xlabel('Time [s]')
+            plt.ylabel('Temperature [K]')
+            plt.title(f'Cell {i}')
+            ax.legend()
+            ax.set_xlim(-max(temporal_dict[f'Cell-{i}']['Shifted Time']),
+                        max(temporal_dict[f'Cell-{i}']['Shifted Time']))
+            # Save the plot to a file
+            filename = os.path.join(output_path, f"Ignition-Delay-Pressure-Animation-Cell-{i}.png")
+            plt.savefig(filename, format='png')
+            plt.show()
+
+    if comp_var == 'Flame':
+        pelec_shift_arr = np.empty((len(pelec_data), len(pelec_data[0]['PeleC']['Position'][:, 0])))
+        spatial_dict = {}
+        cell_counter = 0
+        for i in range(len(pelec_data)):
+            spatial_dict[f'Time Step {i}'] = {'Time': [], 'Position': {}}
+            spatial_dict[f'Time Step {i}']['Time'].append(pelec_data[i]['Time'])
+            for j in range(len(pelec_data[0]['PeleC']['Position'][:, 0])):
+                spatial_dict[f'Time Step {i}']['Position'][f'Row {j}'] = []
+                spatial_dict[f'Time Step {i}']['Position'][f'Row {j}'].extend(
+                    np.array([list(row) for row in pelec_data[i]['PeleC']['Position'][j]], dtype=float)[:, 0])
+
+                pelec_fields = ['Temperature', 'Pressure', 'Density']
+                for field in pelec_fields:
+                    if field in pelec_data[i]['PeleC']:
+                        if field not in spatial_dict[f'Time Step {i}']:
+                            spatial_dict[f'Time Step {i}'][field] = {}
+                        if f'Row {j}' not in spatial_dict[f'Time Step {i}'][field]:
+                            spatial_dict[f'Time Step {i}'][field][f'Row {j}'] = []
+                        spatial_dict[f'Time Step {i}'][field][f'Row {j}'].extend(pelec_data[i]['PeleC'][field][j])
+
+                if 'Species' in pelec_data[i]['PeleC']:
+                    if 'Species' not in spatial_dict[f'Time Step {i}']:
+                        spatial_dict[f'Time Step {i}']['Species'] = {}
+                    for species_name in input_params.species:
+                        species_key = f"Y({species_name})"
+                        if species_key in pelec_data[i]['PeleC']['Species']:
+                            if species_key not in spatial_dict[f'Time Step {i}']['Species']:
+                                spatial_dict[f'Time Step {i}']['Species'][species_key] = {f'Row {j}': []}
+                            spatial_dict[f'Time Step {i}']['Species'][species_key][f'Row {j}'].extend(
+                                pelec_data[i]['PeleC']['Species'][species_key][j])
+
+                cell_counter += 1
+
+                # Shifting factor for the pelec data
+                dT_dx = np.gradient(
+                    spatial_dict[f'Time Step {i}']['Temperature'][f'Row {j}']) / np.gradient(
+                    spatial_dict[f'Time Step {i}']['Position'][f'Row {j}'])
+                # indices = np.argwhere(abs(dT_dx) == np.max(abs(dT_dx)))
+                indices = np.argwhere(np.array(spatial_dict[f'Time Step {i}']['Temperature'][f'Row {j}']) > fixed_val)
+
+                if indices.size > 0:
+                    pelec_shift_arr[i, j] = indices[0][0]
+                else:
+                    pelec_shift_arr[i, j] = 0  # Or another default value if needed
+
+        flame_dict = {}
+        comp_shift_arr = {}
+        for i in range(len(pelec_data)):
+            cell_counter = 0
+            flame_dict[f'Time Step {i}'] = {}
+            flame_fields = ['Position', 'Temperature']
+            for j in range(len(pelec_data[0]['Flame'])):
+                for k in range(len(pelec_data[0]['Flame'][0])):
+                    if pelec_data[i]['Flame'][j][k] is not None:
+                        for field in flame_fields:
+                            if field in pelec_data[i]['PeleC']:
+                                if field not in flame_dict[f'Time Step {i}']:
+                                    flame_dict[f'Time Step {i}'][field] = {}
+                                if f'Cell {cell_counter}' not in flame_dict[f'Time Step {i}'][field]:
+                                    flame_dict[f'Time Step {i}'][field][f'Cell {cell_counter}'] = []
+
+                        flame_dict[f'Time Step {i}']['Position'][f'Cell {cell_counter}'].extend(
+                            pelec_data[i]['Flame'][j][k]['Grid'][::-1])
+                        flame_dict[f'Time Step {i}']['Temperature'][f'Cell {cell_counter}'].extend(
+                            pelec_data[i]['Flame'][j][k]['Temperature'])
+
+                        # Shifting factor for the comp data
+                        dT_dx = np.gradient(
+                            flame_dict[f'Time Step {i}']['Temperature'][f'Cell {cell_counter}']) / np.gradient(
+                            flame_dict[f'Time Step {i}']['Position'][f'Cell {cell_counter}'])
+                        # indices = np.argwhere(abs(dT_dx) == np.max(abs(dT_dx)))
+                        indices = np.argwhere(
+                            np.array(flame_dict[f'Time Step {i}']['Temperature'][f'Cell {cell_counter}']) > fixed_val)
+
+                        if f'Time Step {i}' not in comp_shift_arr:
+                            comp_shift_arr[f'Time Step {i}'] = {}
+                        if indices.size > 0:
+                            comp_shift_arr[f'Time Step {i}'][f'Cell {cell_counter}'] = indices[0][0]
+                        else:
+                            comp_shift_arr[f'Time Step {i}'][
+                                f'Cell {cell_counter}'] = 0  # Or another default value if needed
+
+                    cell_counter += 1
+
+        # Step 2:
+        for i in range(len(spatial_dict)):
+            for j in range(len(spatial_dict[f'Time Step {i}']['Position'])):
+                temp_vec = []
+                for k in range(len(spatial_dict[f'Time Step {i}']['Position'][f'Row {j}'])):
+                    if 'Shifted Position' not in spatial_dict[f'Time Step {i}']:
+                        spatial_dict[f'Time Step {i}']['Shifted Position'] = {}
+
+                    temp_vec.append(spatial_dict[f'Time Step {i}']['Position'][f'Row {j}'][k] -
+                                    spatial_dict[f'Time Step {i}']['Position'][f'Row {j}'][int(pelec_shift_arr[i][j])])
+                if 'Shifted Position' in spatial_dict[f'Time Step {i}']:
+                    if f'Row {j}' not in spatial_dict[f'Time Step {i}']['Shifted Position']:
+                        spatial_dict[f'Time Step {i}']['Shifted Position'][f'Row {j}'] = []
+                    spatial_dict[f'Time Step {i}']['Shifted Position'][f'Row {j}'] = temp_vec
+
+        for i in range(len(flame_dict)):
+            if 'Shifted Position' not in flame_dict[f'Time Step {i}'] and 'Position' in flame_dict[
+                f'Time Step {i}'].keys():
+                flame_dict[f'Time Step {i}']['Shifted Position'] = {}
+
+            if 'Position' in flame_dict[f'Time Step {i}'].keys():
+                for cell_key in flame_dict[f'Time Step {i}']['Position'].keys():
+                    temp_vec = []
+                    for k in range(len(flame_dict[f'Time Step {i}']['Position'][cell_key])):
+                        temp_vec.append(flame_dict[f'Time Step {i}']['Position'][cell_key][k] -
+                                        flame_dict[f'Time Step {i}']['Position'][cell_key][
+                                            int(comp_shift_arr[f'Time Step {i}'][cell_key])])
+                        if cell_key not in flame_dict[f'Time Step {i}']['Shifted Position']:
+                            flame_dict[f'Time Step {i}']['Shifted Position'][cell_key] = []
+                    flame_dict[f'Time Step {i}']['Shifted Position'][cell_key] = temp_vec
+
+        # Plot Results
+        colors = ['red', 'green', 'blue', 'orange', 'purple']
+        color_cycle = itertools.cycle(colors)
+        for time_step in range(len(spatial_dict)):
+            for row_idx in range(len(spatial_dict[f'Time Step {time_step}']['Shifted Position'])):
+                if f'Row {j}' in spatial_dict[f'Time Step {time_step}']['Shifted Position']:
+                    fig, ax = plt.subplots()
+                    ax.plot(spatial_dict[f'Time Step {time_step}']['Shifted Position'][f'Row {j}'],
+                            spatial_dict[f'Time Step {time_step}']['Temperature'][f'Row {j}'], label='Temperature',
+                            marker='.', linestyle='-', color='k')
+
+                for cell_idx in range((row_idx * ddt_bin_size), ((row_idx + 1) * ddt_bin_size) - 1):
+                    if flame_dict[f'Time Step {time_step}']:
+                        if f'Cell {cell_idx}' in flame_dict[f'Time Step {time_step}']['Shifted Position'].keys():
+                            ax.plot(flame_dict[f'Time Step {time_step}']['Shifted Position'][f'Cell {cell_idx}'],
+                                    flame_dict[f'Time Step {time_step}']['Temperature'][f'Cell {cell_idx}'],
+                                    label=f'Cell {cell_idx}',
+                                    linestyle='-', color=next(color_cycle))
+
+                plt.xlabel('Position [s]')
+                plt.ylabel('Temperature [K]')
+                plt.title(f'Time Step {time_step}, Row {row_idx}')
+                ax.legend()
+                ax.set_xlim(-max(spatial_dict[f'Time Step {time_step}']['Shifted Position'][f'Row {row_idx}']),
+                            max(spatial_dict[f'Time Step {time_step}']['Shifted Position'][f'Row {row_idx}']))
+                # Save the plot to a file
+                filename = os.path.join(output_path, f"Flame-Animation-Time-Step-{time_step}-Row-{row_idx}.png")
+                plt.savefig(filename, format='png')
+                plt.show()
 
     return
 
@@ -1194,43 +1436,48 @@ def single_pltfile_processing(args):
 def single_ddt_pltfile_processing(args):
     def load_data():
         raw_data = yt.load(pltFile_dir)
-        max_level = raw_data.index.max_level
-
-        # Create sudo-grid at the maximum level present
-        temp_ddt_data = raw_data.covering_grid(level=max_level,
-                                               left_edge=[0.0, 0.0, 0.0],
-                                               dims=raw_data.domain_dimensions * [2 ** max_level, 2 ** max_level, 1],
-                                               # And any fields to preload (this is optional!)
-                                               # fields=desired_varables
-                                               )
+        region = raw_data.box(np.array([domain_grid[0][ddt_idx[0] - (ddt_bin_size // 2) - 1][0],
+                                        domain_grid[1][ddt_idx[1] - (ddt_bin_size // 2) - 1][0], 0.0]),
+                              np.array([domain_grid[0][ddt_idx[0] + (ddt_bin_size // 2)][0],
+                                        domain_grid[1][ddt_idx[1] + (ddt_bin_size // 2)][0], 1.0]))
 
         time = raw_data.current_time.to_value()
 
         plt_check = False
         if plt_check:
             plt.figure(figsize=(8, 6))
-            plt.plot(temp_ddt_data["boxlib", "x"][:, 0].to_value().flatten(),
-                     temp_ddt_data["boxlib", "Temp"][:, 0].to_value().flatten(), linestyle='-', color='k')
+            plt.plot(region["boxlib", "x"][:, 0].to_value().flatten(),
+                     region["boxlib", "Temp"][:, 0].to_value().flatten(), linestyle='-', color='k')
             plt.xlabel('x')
             plt.ylabel('y')
             plt.show()
 
-        return time, raw_data, temp_ddt_data
+        return time, raw_data, region
 
     """
 
     """
     # Step 1: Unpack the argumnents provided
     pltFile_dir = args[0]
-    ddt_window = args[1][0]
-    processing_flags = args[1][1]
-    animation_pltfiles = args[1][2]
-    input_params = args[1][3]
-
-    spatial_idx = np.arange(ddt_window[0][0], ddt_window[1][0] + 1)
+    ddt_idx = args[1][0]
+    domain_grid = args[1][1]
+    processing_flags = args[1][2]
+    animation_pltfiles = args[1][3]
+    input_params = args[1][4]
 
     # Step 3: Load the pltFile for individual processing
     time, raw_data, plt_data = load_data()
+
+    temp_x = np.arange(ddt_idx[0] - (ddt_bin_size // 2) - 1, ddt_idx[0] + (ddt_bin_size // 2) + 1)
+    temp_y = np.arange(ddt_idx[1] - (ddt_bin_size // 2) - 1, ddt_idx[1] + (ddt_bin_size // 2) + 1)
+    temp_xx, temp_yy = np.meshgrid(temp_x, temp_y)
+    plt.figure(figsize=(8, 6))
+    plt.pcolormesh(temp_xx, temp_yy, np.reshape(plt_data["boxlib", 'Temp'].to_value(), (ddt_bin_size, ddt_bin_size)),
+                   cmap='gist_heat', shading='auto')
+    plt.colorbar(label='Temperature')
+    plt.xlabel('x')
+    plt.ylabel('y')
+    plt.show()
 
     # Step 4:
     result_dict = {}
@@ -1238,52 +1485,87 @@ def single_ddt_pltfile_processing(args):
 
     # Step 4.1: Collect the PeleC Domain Information
     result_dict['PeleC'] = {}
-    result_dict['PeleC']['Temperature'] = np.empty(len(spatial_idx))
-    result_dict['PeleC']['Pressure'] = np.empty(len(spatial_idx))
-    result_dict['PeleC']['Density'] = np.empty(len(spatial_idx))
-    result_dict['PeleC']['Species'] = np.empty(len(spatial_idx), dtype=object)
-    result_dict['PeleC']['Heat Release Rate'] = np.empty(len(spatial_idx))
-    result_dict['PeleC']['Max Heat Release Rate'] = np.empty(len(spatial_idx))
+    result_dict['PeleC']['Position'] = np.empty((ddt_bin_size, ddt_bin_size), dtype=object)
+    if processing_flags['PeleC Processing'].get('Temperature', False):
+        result_dict['PeleC']['Temperature'] = np.empty((ddt_bin_size, ddt_bin_size))
+    if processing_flags['PeleC Processing'].get('Pressure', False):
+        result_dict['PeleC']['Pressure'] = np.empty((ddt_bin_size, ddt_bin_size))
+    if processing_flags['PeleC Processing'].get('Density', False):
+        result_dict['PeleC']['Density'] = np.empty((ddt_bin_size, ddt_bin_size))
+    if processing_flags['PeleC Processing'].get('Species', False):
+        result_dict['PeleC']['Species'] = np.empty((ddt_bin_size, ddt_bin_size), dtype=object)
+    if processing_flags['PeleC Processing'].get('Heat Release Rate', False):
+        result_dict['PeleC']['Heat Release Rate'] = np.empty((ddt_bin_size, ddt_bin_size))
+    if processing_flags['PeleC Processing'].get('Max Heat Release Rate', False):
+        result_dict['PeleC']['Max Heat Release Rate'] = np.empty((ddt_bin_size, ddt_bin_size))
 
-    for i, value in enumerate(spatial_idx):
-        if processing_flags['PeleC Processing'].get('Temperature', False):
-            result_dict['PeleC']['Temperature'][i] = plt_data["boxlib", 'Temp'][value, ddt_window[0][1]][0].to_value()
-        if processing_flags['PeleC Processing'].get('Pressure', False):
-            result_dict['PeleC']['Pressure'][i] = 10 * plt_data["boxlib", 'pressure'][value, ddt_window[0][1]][
-                0].to_value()
-        if processing_flags['PeleC Processing'].get('Density', False):
-            result_dict['PeleC']['Density'][i] = 1000 * plt_data["boxlib", 'density'][value, ddt_window[0][1]][
-                0].to_value()
-
-        if processing_flags['PeleC Processing'].get('Species', False):
-            species_comp = {}
-            for j in range(len(input_params.species)):
-                species_comp.update({str(input_params.species[j]):
-                                         plt_data["boxlib", str("Y(" + input_params.species[j] + ")")][
-                                             value, ddt_window[0][1]][0].to_value()})
-            result_dict['PeleC']['Species'][i] = species_comp
-
-        if processing_flags['PeleC Processing'].get('Heat Release Rate', False):
-            [result_dict['PeleC']['Heat Release Rate'][i],
-             result_dict['PeleC']['Max Heat Release Rate'][i]] = heat_release_rate_function(plt_data, spatial_idx,
-                                                                                            input_params)
-
-        # Step 4.2: Constant Pressure Ignition Delay Processing
     if processing_flags['Comparison Type'].get('Ignition Delay Pressure', False):
-        # Step 4.2.1: Calculate the ignition behavior for a given initial state
-        result_dict['Ignition Delay Pressure'] = cantera_ignition_function(plt_data, ddt_window, processing_flags,
-                                                                           input_params)
+        result_dict['Ignition Delay Pressure'] = np.empty((ddt_bin_size, ddt_bin_size), dtype=object)
 
-    # Step 4.3: Constant Volume Ignition Delay Processing
     if processing_flags['Comparison Type'].get('Ignition Delay Volume', False):
-        # Step 4.3.1: Calculate the ignition behavior for a given initial state
-        result_dict['Ignition Delay Volume'] = cantera_ignition_function(plt_data, ddt_window, processing_flags,
-                                                                         input_params, reactor_type='Volume')
+        result_dict['Ignition Delay Volume'] = np.empty((ddt_bin_size, ddt_bin_size), dtype=object)
 
-    # Step 4.4: Flame Processing
     if processing_flags['Comparison Type'].get('Flame', False):
-        # Step 4.4.1: Calculate the flame behavior for a given initial state
-        result_dict['Flame'] = cantera_flame_function(plt_data, ddt_window, processing_flags, input_params)
+        result_dict['Flame'] = np.empty((ddt_bin_size, ddt_bin_size), dtype=object)
+
+    for i, x_value in enumerate(np.arange(ddt_idx[0] - (ddt_bin_size // 2) - 1, ddt_idx[0] + (ddt_bin_size // 2))):
+        for j, y_value in enumerate(np.arange(ddt_idx[1] - (ddt_bin_size // 2) - 1, ddt_idx[1] + (ddt_bin_size // 2))):
+            result_dict['PeleC']['Position'][i, j] = [
+                np.rot90(np.reshape(plt_data["boxlib", 'x'].to_value(), (ddt_bin_size, ddt_bin_size)))[i, j],
+                np.rot90(np.reshape(plt_data["boxlib", 'y'].to_value(), (ddt_bin_size, ddt_bin_size)))[i, j]]
+
+            if processing_flags['PeleC Processing'].get('Temperature', False):
+                result_dict['PeleC']['Temperature'][i, j] = \
+                np.rot90(np.reshape(plt_data["boxlib", 'Temp'].to_value(), (ddt_bin_size, ddt_bin_size)))[i, j]
+
+            if processing_flags['PeleC Processing'].get('Pressure', False):
+                result_dict['PeleC']['Pressure'][i][j] = 10 * np.rot90(
+                    np.reshape(plt_data["boxlib", 'pressure'].to_value(), (ddt_bin_size, ddt_bin_size)))[i, j]
+
+            if processing_flags['PeleC Processing'].get('Density', False):
+                result_dict['PeleC']['Density'][i][j] = 1000 * np.rot90(
+                    np.reshape(plt_data["boxlib", 'density'].to_value(), (ddt_bin_size, ddt_bin_size)))[i, j]
+
+            if processing_flags['PeleC Processing'].get('Species', False):
+                species_comp = {}
+                for k in range(len(input_params.species)):
+                    species_comp.update({str(input_params.species[k]): np.rot90(
+                        np.reshape(plt_data["boxlib", str("Y(" + input_params.species[k] + ")")].to_value(),
+                                   (ddt_bin_size, ddt_bin_size)))[i, j]})
+                result_dict['PeleC']['Species'][i][j] = species_comp
+            """
+            if processing_flags['PeleC Processing'].get('Heat Release Rate', False):
+                [result_dict['PeleC']['Heat Release Rate'][i], result_dict['PeleC']['Max Heat Release Rate'][i]] = heat_release_rate_function(plt_data, (x_value, y_value), input_params)
+            """
+            # Step 4.2: Constant Pressure Ignition Delay Processing
+            if processing_flags['Comparison Type'].get('Ignition Delay Pressure', False):
+                # Step 4.2.1: Calculate the ignition behavior for a given initial state
+                try:
+                    result_dict['Ignition Delay Pressure'][i, j] = cantera_ignition_function(plt_data, (i, j),
+                                                                                             processing_flags,
+                                                                                             input_params)
+                except:
+                    result_dict['Ignition Delay Pressure'][i, j] = None
+
+            # Step 4.3: Constant Volume Ignition Delay Processing
+            if processing_flags['Comparison Type'].get('Ignition Delay Volume', False):
+                # Step 4.3.1: Calculate the ignition behavior for a given initial state
+                try:
+                    result_dict['Ignition Delay Volume'][i, j] = cantera_ignition_function(plt_data, (i, j),
+                                                                                           processing_flags,
+                                                                                           input_params,
+                                                                                           reactor_type='Volume')
+                except:
+                    result_dict['Ignition Delay Volume'][i, j] = None
+
+            # Step 4.4: Flame Processing
+            if processing_flags['Comparison Type'].get('Flame', False):
+                # Step 4.4.1: Calculate the flame behavior for a given initial state
+                try:
+                    result_dict['Flame'][i, j] = cantera_flame_function(plt_data, (i, j), processing_flags,
+                                                                        input_params)
+                except:
+                    result_dict['Flame'][i, j] = None
 
     return result_dict
 
@@ -1907,29 +2189,43 @@ def pelec_ddt_processing_function(ddt_pltFile, plt_dir, domain_info, input_param
     # Find max pressure location
     ddt_idx = np.unravel_index(np.argmax(temp_ddt_data["boxlib", 'Temp'].to_value(), axis=None),
                                temp_ddt_data["boxlib", 'Temp'].to_value().shape)
-
-    ddt_window = np.empty(2, dtype=object)
-    """
-    ddt_window[0] = np.array([temp_ddt_data["boxlib", 'x'][ray_sort][ddt_idx[0] - check_flags['Processing Parameters']['Spatial Window'] // 2][0][0],
-                              temp_ddt_data["boxlib", 'y'][ray_sort][0][ddt_idx[1]][0], 0.0])
-    ddt_window[1] = np.array([temp_ddt_data["boxlib", 'x'][ray_sort][ddt_idx[0] + check_flags['Processing Parameters']['Spatial Window'] // 2][0][0],
-                              temp_ddt_data["boxlib", 'y'][ray_sort][0][ddt_idx[1]][0], 0.0])
-    """
-    ddt_window[0] = [ddt_idx[0] - check_flags['Processing Parameters']['Spatial Window'] // 2, ddt_idx[1], 0]
-    ddt_window[1] = [ddt_idx[0] + check_flags['Processing Parameters']['Spatial Window'] // 2, ddt_idx[1], 0]
-
     del temp_plt_data, temp_ddt_data
     # Step 1:
     print('Starting Raw Data Loading and Processing')
     plt_time_dir = plt_dir[
                    plt_dir.index(ddt_pltFile) - check_flags['Processing Parameters']['Time Window'][0]:plt_dir.index(
                        ddt_pltFile) + check_flags['Processing Parameters']['Time Window'][1]]
-    plt_result = parallel_processing_function(plt_time_dir,
-                                              (ddt_window, check_flags, [plt_dir[0], plt_dir[-1]], input_params,),
-                                              single_ddt_pltfile_processing, n_proc)
+    plt_result = parallel_processing_function(plt_time_dir, (
+    ddt_idx, domain_info[-1], check_flags, [plt_dir[0], plt_dir[-1]], input_params,), single_ddt_pltfile_processing,
+                                              n_proc)
     print('Completed Raw Data Loading and Processing')
 
     # Step 2:
+    if check_flags['Comparison Type'].get('Ignition Delay Pressure', False):
+        file_path = os.path.join(output_dir, f"Processed-DDT-Results", f"Ignition-Delay-Pressure-Plots")
+        if os.path.exists(file_path) is False:
+            os.mkdir(file_path)
+
+        createAnchoredPlotFrame(plt_result, input_params, comp_var='Ignition Delay Pressure', fixed_var='Temperature',
+                                fixed_val=2000, output_path=file_path)
+
+    if check_flags['Comparison Type'].get('Ignition Delay Volume', False):
+        file_path = os.path.join(output_dir, f"Processed-DDT-Results", f"Ignition-Delay-Volume-Plots")
+        if os.path.exists(file_path) is False:
+            os.mkdir(file_path)
+
+        createAnchoredPlotFrame(plt_result, input_params, comp_var='Ignition Delay Volume', fixed_var='Temperature',
+                                fixed_val=2000, output_path=file_path)
+
+    if check_flags['Comparison Type'].get('Flame', False):
+        file_path = os.path.join(output_dir, f"Processed-DDT-Results", f"Flame-Plots")
+        if os.path.exists(file_path) is False:
+            os.mkdir(file_path)
+
+        createAnchoredPlotFrame(plt_result, input_params, comp_var='Flame', fixed_var='Temperature', fixed_val=2000,
+                                output_path=file_path)
+
+    # Step 3:
     if os.path.exists(os.path.join(output_dir, f"Processed-DDT-Results")) is False:
         os.mkdir(os.path.join(output_dir, f"Processed-DDT-Results"))
 
@@ -1973,7 +2269,7 @@ def main():
     # Step 0: Set all the desired tasks to be performed bny the python script
     skip_load = 0
     row_index = "Middle"  # Desired row location for data collection
-    ddt_plt_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'Raw-PeleC-Data', 'plt426200')
+    ddt_plt_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'Raw-PeleC-Data', 'plt53827')
 
     check_flag_dict = {
         'Flame Processing': {
@@ -2017,13 +2313,12 @@ def main():
 
     detonation_check_flag = {
         'Processing Parameters': {
-            'Time Window': (10, 10),
-            'Spatial Window': 5,
+            'Time Window': (5, 2),
         },
         'Comparison Type': {
             'PeleC': True,
-            'Ignition Delay Pressure': True,
-            'Ignition Delay Volume': True,
+            'Ignition Delay Pressure': False,
+            'Ignition Delay Volume': False,
             'Flame': True
         },
         'PeleC Processing': {
@@ -2094,10 +2389,11 @@ def main():
     domain_info = domain_size_parameters(updated_data_list[0], row_index)
 
     # Step 6: Individual PltFile Processing
-    pelec_processing_function(updated_data_list, domain_info, input_params, check_flag_dict, output_dir=output_dir_path)
+    # pelec_processing_function(updated_data_list, domain_info, input_params, check_flag_dict, output_dir=output_dir_path)
 
     # Step 7:
-    # pelec_ddt_processing_function(ddt_plt_dir, updated_data_list, domain_info, input_params, detonation_check_flag, output_dir=output_dir_path)
+    pelec_ddt_processing_function(ddt_plt_dir, updated_data_list, domain_info, input_params, detonation_check_flag,
+                                  output_dir=output_dir_path)
 
     return
 
