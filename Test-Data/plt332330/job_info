@@ -1,0 +1,230 @@
+===============================================================================
+ PeleC Job Information
+===============================================================================
+job name: 
+
+inputs file: example-simple-double-domain-expansion.inp
+
+number of MPI processes: 480
+
+CPU time used since start of simulation (CPU-hours): 94821.9
+
+===============================================================================
+ Plotfile Information
+===============================================================================
+output data / time: Jan 16 2025 15:54:59
+output dir:         /scratch/10232/nadexterbrown/PeleC/2D-Channel-FA-DDT/H2-O2-Phi-1.0-P-10.0-Bar-T-503.15-K/Domain-Length-284cm/0.09cm-Complete-Domain/Planar-Kernel-Level-6-ICX-6-Nodes
+
+
+===============================================================================
+ Build Information
+===============================================================================
+build date:    2024-11-14 22:49:18.062906
+build machine: Linux login3.stampede3.tacc.utexas.edu 5.14.0-362.24.1.el9_3.0.1.x86_64 #1 SMP PREEMPT_DYNAMIC Thu Apr 4 22:31:43 UTC 2024 x86_64 x86_64 x86_64 GNU/Linux
+build dir:     /work2/10232/nadexterbrown/stampede3/PeleC/Domain-Expansion-PeleC/PeleC_Domain_Expansion/Exec/RegTests/2D-Channel-FA-DDT/H2-O2-Phi-1.0-P-10.0-Bar-T-503.15-K/Domain-Length-72cm/0.09cm-Complete-Domain/Planar-Kernel-Level-6
+AMReX dir:     /work2/10232/nadexterbrown/stampede3/PeleC/Domain-Expansion-PeleC/PeleC_Domain_Expansion/Submodules/PelePhysics/Submodules/amrex
+
+COMP:          gnu
+COMP version:  17.0.0
+FCOMP:         
+FCOMP version: 
+
+CHEMISTRY: LiDryer
+
+PeleC       git hash: 5572cce-dirty
+AMReX       git hash: 24.02-31-g97512176d
+PelePhysics git hash: v23.03-98-g50b990b8-dirty
+AMReX-Hydro git hash: v6.6.2
+
+
+===============================================================================
+ Grid Information
+===============================================================================
+ level: 0
+   number of boxes = 800
+   maximum zones   = 51200 16 
+
+ level: 1
+   number of boxes = 887
+   maximum zones   = 102400 32 
+
+ level: 2
+   number of boxes = 702
+   maximum zones   = 204800 64 
+
+ level: 3
+   number of boxes = 492
+   maximum zones   = 409600 128 
+
+ level: 4
+   number of boxes = 505
+   maximum zones   = 819200 256 
+
+ level: 5
+   number of boxes = 528
+   maximum zones   = 1638400 512 
+
+ level: 6
+   number of boxes = 543
+   maximum zones   = 3276800 1024 
+
+ Boundary conditions
+   -x: NoSlipWall
+   +x: FOExtrap
+   -y: NoSlipWall
+   +y: NoSlipWall
+
+
+===============================================================================
+ Species Information
+===============================================================================
+ index                         name              A              Z
+--------------------------------------------------------------------------------
+
+
+===============================================================================
+ Inputs File Parameters
+===============================================================================
+stop_time = 1e-3
+geometry.coord_sys = 0
+geometry.is_periodic = 0 0 1
+geometry.prob_lo = 0.0 0.0 0.0
+geometry.prob_hi = 284.48e-0 8.89e-2 8.89e-2
+amr.n_cell = 51200 16 16
+pelec.lo_bc = NoSlipWall NoSlipWall
+pelec.hi_bc = FOExtrap NoSlipWall
+pelec.cfl = 0.1
+pelec.init_shrink = 0.1
+pelec.change_max = 1.1
+pelec.dt_cutoff = 5e-20
+pelec.do_react = 1
+pelec.do_mol = 0
+pelec.do_hydro = 1
+pelec.diffuse_vel = 1
+pelec.diffuse_temp = 1
+pelec.diffuse_spec = 1
+pelec.diffuse_enth = 1
+pelec.sum_interval = 1
+pelec.v = 1
+amr.v = 1
+amr.max_level = 6
+amr.ref_ratio = 2 2 2 2 2 2 2
+amr.regrid_int = 2 2 2 2 2 2 2
+amr.blocking_factor = 8
+amr.max_grid_size = 256 512 512 512 512 512
+amr.n_error_buf = 2 2 2 2 2 2 2
+amr.restart = chk332300
+amr.checkpoint_files_output = 1
+amr.check_file = chk
+amr.check_int = 100
+amr.plot_files_output = 1
+amr.plot_file = plt
+amr.plot_int = 1
+amr.plot_vars = ALL
+amr.derive_plot_vars = ALL
+pelec.plot_rhoy = 1
+pelec.plot_massfrac = 1
+pelec.plot_reaction(nvals = 1)  :: [1]
+prob.pmf_datafile = pmf-LiDryer-H2_PHI1.0_T503.15_P1000000.0-X-Inverted.dat
+tagging.max_tempgrad_lev = 6
+tagging.tempgrad = 1.0e1
+pelec.chem_integrator = ReactorCvode
+cvode.solve_type = GMRES
+eb2.geom_type = all_regular
+amrex.v = 1
+amrex.verbose = 1
+amrex.regtest_reduction = 0
+amrex.signal_handling = 1
+amrex.throw_exception = 0
+amrex.call_addr2line = 1
+amrex.abort_on_unused_inputs = 0
+amrex.handle_sigsegv = 1
+amrex.handle_sigterm = 0
+amrex.handle_sigint = 1
+amrex.handle_sigabrt = 1
+amrex.handle_sigfpe = 1
+amrex.handle_sigill = 1
+amrex.fpe_trap_invalid = 0
+amrex.fpe_trap_zero = 0
+amrex.fpe_trap_overflow = 0
+amrex.use_gpu_aware_mpi = 0
+amrex.the_arena_init_size = 0
+amrex.the_device_arena_init_size = 8388608
+amrex.the_managed_arena_init_size = 8388608
+amrex.the_pinned_arena_init_size = 8388608
+amrex.the_comms_arena_init_size = 8388608
+amrex.the_arena_release_threshold = 9223372036854775807
+amrex.the_device_arena_release_threshold = 9223372036854775807
+amrex.the_managed_arena_release_threshold = 9223372036854775807
+amrex.the_pinned_arena_release_threshold = 9223372036854775807
+amrex.the_comms_arena_release_threshold = 9223372036854775807
+amrex.the_async_arena_release_threshold = 9223372036854775807
+amrex.the_arena_is_managed = 0
+amrex.abort_on_out_of_gpu_memory = 0
+fab.init_snan = 0
+DistributionMapping.v = 0
+DistributionMapping.verbose = 0
+DistributionMapping.efficiency = 0.90000000000000002
+DistributionMapping.sfc_threshold = 0
+DistributionMapping.node_size = 0
+DistributionMapping.verbose_mapper = 0
+fab.initval = nan
+fab.do_initval = 0
+fabarray.maxcomp = 25
+vismf.v = 0
+vismf.headerversion = 1
+vismf.groupsets = 0
+vismf.setbuf = 1
+vismf.usesingleread = 0
+vismf.usesinglewrite = 0
+vismf.checkfilepositions = 0
+vismf.usepersistentifstreams = 0
+vismf.usesynchronousreads = 0
+vismf.usedynamicsetselection = 1
+vismf.iobuffersize = 2097152
+vismf.allowsparsewrites = 1
+amrex.async_out = 0
+amrex.async_out_nfiles = 64
+amrex.vector_growth_factor = 1.5
+eb2.max_grid_size = 64
+eb2.extend_domain_face = 1
+eb2.num_coarsen_opt = 0
+machine.verbose = 0
+machine.very_verbose = 0
+amr.n_proper = 1
+amr.grid_eff = 0.69999999999999996
+amr.refine_grid_layout = 1
+amr.refine_grid_layout_x = 1
+amr.refine_grid_layout_y = 1
+amr.check_input = 1
+amr.regrid_on_restart = 0
+amr.force_regrid_level_zero = 0
+amr.use_efficient_regrid = 0
+amr.plotfile_on_restart = 0
+amr.insitu_on_restart = 0
+amr.checkpoint_on_restart = 0
+amr.compute_new_dt_on_regrid = 0
+amr.mffile_nstreams = 1
+amr.probinit_natonce = 512
+amr.file_name_digits = 5
+amr.message_int = 10
+amr.plot_nfiles = 64
+amr.checkpoint_nfiles = 64
+amr.check_per = -1
+amr.plot_per = -1
+amr.plot_log_per = -1
+amr.small_plot_file = smallplt
+amr.small_plot_int = -1
+amr.small_plot_per = -1
+amr.small_plot_log_per = -1
+amr.write_plotfile_with_checkpoint = 1
+amr.stream_max_tries = 4
+amr.abort_on_stream_retry_failure = 0
+amr.precreateDirectories = 1
+amr.prereadFAHeaders = 1
+amr.plot_headerversion = 1
+amr.checkpoint_headerversion = 1
+amr.subcycling_mode = Auto
+amr.loadbalance_with_workestimates = 0
+amr.loadbalance_level0_int = 2
+amr.loadbalance_max_fac = 1.5
