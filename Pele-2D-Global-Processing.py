@@ -1,16 +1,19 @@
 import os, yt, itertools, multiprocessing, textwrap, re
-from doctest import master
 
-from ply.yacc import restart
+from numpy.fft.helper import fftfreq
 from sklearn.neighbors import NearestNeighbors
 from sdtoolbox.thermo import soundspeed_fr
 import matplotlib.animation as animation
 import matplotlib.image as mpimg
 import matplotlib.pyplot as plt
+from scipy.optimize import curve_fit, minimize
 import cantera as ct
 import numpy as np
+import pywt
 
 yt.set_log_level(0)
+
+n_proc = 1
 
 
 class MyClass():
@@ -291,8 +294,12 @@ def thermodynamic_state_function(raw_data, sort_arr, wave_idx, wave_type, input_
 
 def flame_thickness_function(raw_data, sort_arr, wave_idx):
     # Step 1: Load the desired marker and x positions
-    temp_data = raw_data["boxlib", str('Temp')][sort_arr].to_value()[wave_idx - 100:wave_idx + 100]
-    temp_x_pos = raw_data["boxlib", str('x')][sort_arr].to_value()[wave_idx - 100:wave_idx + 100] / 100
+    if wave_idx < 100:
+        temp_data = raw_data["boxlib", str('Temp')][sort_arr].to_value()[0:2 * wave_idx]
+        temp_x_pos = raw_data["boxlib", str('x')][sort_arr].to_value()[0:2 * wave_idx] / 100
+    else:
+        temp_data = raw_data["boxlib", str('Temp')][sort_arr].to_value()[wave_idx - 100:wave_idx + 100]
+        temp_x_pos = raw_data["boxlib", str('x')][sort_arr].to_value()[wave_idx - 100:wave_idx + 100] / 100
 
     # Step 2: Compute the gradient of temperature with respect to position
     temperature_gradient = abs(np.gradient(temp_data) / np.gradient(temp_x_pos))
@@ -320,7 +327,7 @@ def flame_thickness_function(raw_data, sort_arr, wave_idx):
     return flame_thickness
 
 
-def flame_length_contour_function(raw_data, plt_check=False):
+def flame_length_contour_function(raw_data, plt_data, sort_arr, plt_check=False):
     def sort_by_nearest_neighbors(points, plt_check=False):
         # Convert points to numpy array if it's a list of lists
         points = np.array(points)
@@ -353,16 +360,224 @@ def flame_length_contour_function(raw_data, plt_check=False):
         # Check surface length from distances for comparison
         surface_approx = np.sum(distance_arr)
         # print('Approximate Surface Length =', surface_approx, 'cm')
-        # Check point order
-        if plt_check:
-            plt.figure(figsize=(8, 6))
-            plt.plot(range(len(points)), order, marker='.', linestyle='-')
-            plt.xlabel('x')
-            plt.ylabel('y')
-            plt.title('2D Isocontours')
-            plt.show()
-
         return points[order]
+
+    def flame_front_wavelength_spectrum(raw_data, flame_contours):
+        def segment_flame_contour(x, y, plt_check=False):
+            # Step 1: Compute the difference in x-values
+            dx = np.diff(x)
+            # Step 2: Identify points where x-values turn back (i.e., sign change in dx)
+            turning_points = np.where(np.diff(np.sign(dx)))[0] + 1  # +1 to correct index after np.diff
+            # Step 3: Split the data into segments at turning points
+            segments = []
+            start = 0
+            for tp in turning_points:
+                segments.append((x[start:tp], y[start:tp]))
+                start = tp
+            # Append the last segment
+            segments.append((x[start:], y[start:]))
+
+            if plt_check:
+                plt.figure(figsize=(8, 6))
+                for i in range(len(segments)):
+                    plt.plot(segments[i][0], segments[i][1])
+                plt.xlabel('Wavelength (m)')
+                plt.ylabel('Amplitude')
+                plt.title('FFT Amplitude vs Wavelength')
+                plt.grid(True)
+                plt.show()
+
+            return segments
+
+        def contour_poly_fit_and_distance(x_data, y_data, degree=2, plt_check=False):
+            # Step 1: Create a polynomial fit of the provided data
+            coefficients = np.polyfit(x_data, y_data, degree)
+            poly_func = np.poly1d(coefficients)
+
+            def distance_to_curve(x0, y0):
+                # Step 1: Minimize the distance function to find the closest point on the polynomial
+                def distance(x):
+                    y = poly_func(x)
+                    return np.sqrt((x - x0) ** 2 + (y - y0) ** 2)
+
+                # Step 2: Optimize to find the x that minimizes the distance
+                result = minimize(distance, x0)  # Initial guess is x0
+
+                # Step 3: Closest point on the curve
+                x_closest = result.x[0]
+                y_closest = poly_func(x_closest)
+
+                # Step 4: Calculate the distance
+                distance_val = np.sqrt((x_closest - x0) ** 2 + (y_closest - y0) ** 2)
+                return distance_val, (x_closest, y_closest)
+
+            # Step 2: Calculate distances for each data point
+            distances = []
+            closest_points = []
+
+            for x0, y0 in zip(x_data, y_data):
+                dist, point = distance_to_curve(x0, y0)
+                distances.append(dist)
+                closest_points.append(point)
+
+            if plt_check:
+                # Step : Create the resulting figure
+                plt.figure(figsize=(12, 10))
+                # Plot the original data and wavelet reconstruction
+                plt.subplot(2, 1, 1)
+                plt.plot(x_data, y_data, label='Original')
+                plt.plot(np.linspace(0, data.RightEdge.to_value()[1], len(x_data)),
+                         poly_func(np.linspace(0, data.RightEdge.to_value()[1], len(x_data))),
+                         label='Polynomial Fit', linestyle='dashed')
+                plt.legend()
+                plt.grid()
+                # Plot the distance
+                plt.subplot(2, 1, 2)
+                plt.plot(np.arange(len(x_data)), distances, label='Original')
+                plt.legend()
+                plt.grid()
+                plt.show()
+
+            return distances, closest_points, poly_func
+
+        """
+
+        """
+        # Step 1: Only process the main flame front, ignore any small detatched flame kernels
+        if len(flame_contours) > 1:
+            flame_contour = max(flame_contours, key=len)
+        else:
+            flame_contour = flame_contours[0]
+
+        # Step 1:
+        data = raw_data.covering_grid(raw_data.max_level,
+                                      left_edge=[0.0, 0.0, 0.0],
+                                      dims=raw_data.domain_dimensions * [2 ** raw_data.max_level,
+                                                                         2 ** raw_data.max_level, 1],
+                                      # And any fields to preload (this is optional!)
+                                      # fields=desired_varables
+                                      )
+
+        # Step 1: Separate the x and y components from the flame position array
+        try:
+            x_arr = np.array(flame_contour[:, 0], dtype=float)
+            y_arr = np.array(flame_contour[:, 1], dtype=float)
+        except:
+            print('Error in Size Matching')
+
+        # Step 2: Segment the flame contour based on multivaluedness (change in sign of dx)
+        flame_x_segments = segment_flame_contour(x_arr, y_arr, plt_check=True)
+        flame_y_segments = segment_flame_contour(y_arr, x_arr, plt_check=True)
+
+        # Step 3:
+        amplitudes, _, poly_fit = contour_poly_fit_and_distance(y_arr, x_arr, degree=9, plt_check=True)
+        # Step 4:
+        x_poly_fit_data = poly_fit(np.linspace(0, data.RightEdge.to_value()[1], len(y_arr)))
+        poly_fit_power_spectrum = np.abs(np.fft.fft(x_poly_fit_data)) ** 2
+        poly_fit_frequencies = np.fft.fftfreq(len(x_poly_fit_data),
+                                              d=x_poly_fit_data[1] - x_poly_fit_data[0])  # Frequency bins
+
+        # Step 5:
+        amplitude_power_spectrum = np.abs(np.fft.fft(amplitudes)) ** 2
+        amplitude_frequencies = np.fft.fftfreq(len(y_arr), d=data.dds.to_value()[1])  # Frequency bins
+
+        plt.figure(figsize=(12, 10))
+        # Plot the original data and wavelet reconstruction
+        plt.subplot(2, 1, 1)
+        plt.plot(y_arr, x_arr, label='Original')
+        plt.plot(np.linspace(0, data.RightEdge.to_value()[1], len(y_arr)),
+                 poly_fit(np.linspace(0, data.RightEdge.to_value()[1], len(y_arr)))
+                 , label='Reconstruction', linestyle='dashed')
+        plt.legend()
+        plt.grid()
+        #
+        plt.subplot(2, 2, 3)
+        plt.plot(amplitude_frequencies[:len(amplitude_frequencies) // 2],
+                 amplitude_power_spectrum[:len(amplitude_frequencies) // 2],
+                 label='Amplitude Spectrum')
+        plt.xscale('log')
+        plt.legend()
+        plt.grid()
+        #
+        plt.subplot(2, 2, 4)
+        plt.plot(poly_fit_frequencies[:len(poly_fit_frequencies) // 2],
+                 poly_fit_power_spectrum[:len(poly_fit_frequencies) // 2],
+                 label='Poly-Fit Spectrum')
+        plt.xscale('log')
+        plt.legend()
+        plt.grid()
+
+        plt.tight_layout()
+
+        """
+        # Step 3:
+        wavelet = 'db5'
+        wl = pywt.Wavelet(wavelet)
+        coeffs_x = pywt.wavedec(x_arr, wl, level=1)
+        coeffs_y = pywt.wavedec(y_arr, wl, level=1)
+
+        recon_x = pywt.waverec(coeffs_x, wavelet=wl)
+        recon_y = pywt.waverec(coeffs_y, wavelet=wl)
+
+        approx_x, *details_x = coeffs_x
+        approx_y, *details_y = coeffs_y
+        magnitude_details = [np.sqrt(dx ** 2 + dy ** 2) for dx, dy in zip(details_x, details_y)]
+
+        x_power_spectrum = [np.abs(np.fft.fft(detail)) ** 2 for detail in details_x]
+        x_frequencies = np.fft.fftfreq(len(x_arr), d=data.dds.to_value()[0])  # Frequency bins
+
+        # Step : Create the resulting figure
+        plt.figure(figsize=(12, 10))
+        # Plot the original data and wavelet reconstruction
+        plt.subplot(4, 1, 1)
+        plt.plot(x_arr, y_arr, label='Original')
+        plt.plot(recon_x, recon_y, label='Reconstruction', linestyle='dashed')
+        plt.legend()
+        plt.grid()
+        # Plot the x and y wavelet frequency results
+        plt.subplot(4, 2, 3)
+        for i in range(len(magnitude_details)):
+            plt.plot(details_x[i], label=f"Detail Level = {i}")
+        plt.legend()
+        plt.title('X Wavelet Frequency ')
+
+        plt.subplot(4, 2, 4)
+        for i in range(len(magnitude_details)):
+            plt.plot(details_y[i], label=f"Detail Level = {i}")
+        plt.legend()
+        plt.title('Y Wavelet Frequency ')
+
+        # Plot the various frequency results from the discrete wavelet transformation
+        plt.subplot(4, 1, 3)
+        for i in range(len(magnitude_details)):
+            plt.semilogy(magnitude_details[i], label=f"Detail Level = {i}")
+        plt.legend()
+        plt.title('Wavelet Frequency Magnitude')
+
+        # Plot the power spectrum of the detailed wavelet coefficients
+        plt.subplot(4, 1, 4)
+        for i, power in enumerate(x_power_spectrum):
+            plt.semilogy(np.abs(x_frequencies[:len(power)]), power, label=f'Power Spectrum (Level {i + 1})')
+        plt.title('Power Spectrum of Detail Coefficients')
+        plt.xlabel('Frequency (Hz)')
+        plt.ylabel('Power')
+
+        plt.tight_layout()
+        """
+
+        output_dir_path = ensure_long_path_prefix(os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                                                               f"Processed-Global-Results",
+                                                               f"Flame-Contour-FFT-Plt-Files"))
+        if os.path.exists(output_dir_path) is False:
+            os.mkdir(output_dir_path)
+
+        formatted_time = '{:.16f}'.format(raw_data.current_time.to_value()).rstrip('0').rstrip('.')
+        filename = os.path.join(output_dir_path, f"Flame-Countour-FFT-Time-{formatted_time}.png")
+        plt.savefig(filename, format='png')
+        plt.show()
+        plt.close()
+
+        return
 
     """
 
@@ -427,18 +642,12 @@ def flame_length_contour_function(raw_data, plt_check=False):
         contour_segments.append(np.array(current_contour))
         contour_lines.append(np.array(current_line))
 
+    # Determine the wavelength spectrum for a given flame contour using FFT
+    flame_front_wavelength_spectrum(raw_data, contour_segments)
+
     # Calculate the total line length, by summing the lines between points
     surface_length = sum(np.sum(distances) for distances in contour_lines)
     # print('Flame Surface Length: ', surface_length, 'cm')
-    # Plot the 2D contours
-    if plt_check:
-        plt.figure(figsize=(8, 6))
-        for contour in contour_segments:
-            plt.plot(contour[:, 0], contour[:, 1], linestyle='-')
-        plt.xlabel('x')
-        plt.ylabel('y')
-        plt.title('2D Iso-contours, Surface Length = {0:<10f} cm'.format(surface_length))
-        plt.show()
 
     return surface_length / 100
 
@@ -669,7 +878,8 @@ def single_pltfile_processing(args):
 
         # Surface Length
         if processing_flags['Flame Processing'].get('Surface Length', False):
-            result_dict['Flame']['Surface Length'] = flame_length_contour_function(raw_data)
+            result_dict['Flame']['Surface Length'] = flame_length_contour_function(raw_data, plt_data, sort_arr,
+                                                                                   plt_check=True)
 
     # Step 3.2: Maximum Pressure Processing
     if 'Maximum Pressure Processing' in processing_flags:
@@ -1044,7 +1254,7 @@ def pelec_rocessing_unction(plt_dir, domain_info, input_params, check_flags, out
     print('Starting Raw Data Loading and Processing')
     plt_result = parallel_processing_function(plt_dir,
                                               (check_flags, [plt_dir[0], plt_dir[-1]], domain_info, input_params,),
-                                              single_pltfile_processing, 24)
+                                              single_pltfile_processing, n_proc)
     print('Completed Raw Data Loading and Processing')
 
     # Step 2:
@@ -1150,6 +1360,16 @@ def pelec_rocessing_unction(plt_dir, domain_info, input_params, check_flags, out
         # Step :
         animation_dir = ensure_long_path_prefix(os.path.join(os.path.dirname(os.path.realpath(__file__)),
                                                              f"Processed-Global-Results"))
+
+        if check_flags['Domain State Animations'].get('Flame Spectrum', False):
+            # Create directory for plt files
+            temp_plt_dir = ensure_long_path_prefix(
+                os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
+                             f"Flame-Contour-FFT-Plt-Files"))
+
+            # Create the animation file
+            createVariableAnimation(temp_plt_dir,
+                                    os.path.join(animation_dir, 'Flame-Frequency-Evolution-Animation.mp4'), fps=15)
 
         if check_flags['Domain State Animations'].get('Temperature', False):
             # Create directory for plt files
@@ -1267,6 +1487,7 @@ def main():
             'Smoothing': True
         },
         'Domain State Animations': {
+            'Flame Spectrum': True,
             'Temperature': False,
             'Pressure': False,
             'Velocity': False,
