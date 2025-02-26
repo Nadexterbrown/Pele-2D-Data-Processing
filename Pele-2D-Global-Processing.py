@@ -12,14 +12,89 @@ import numpy as np
 yt.set_log_level(0)
 
 n_proc = 24
-function_timeout = 60
 polyfit_bin_size = 51
+plotting_bnds_bin = 3
 flame_thickness_bin_size = 11
-ddt_bin_size = 5
 
 
 class MyClass():
-    pass
+    def __init__(self):
+        # Initialize default parameters
+        self.T = None  # Temperature (Kelvin)
+        self.P = None  # Pressure (Pa)
+        self.Phi = None  # Equivalence ratio
+        self.Fuel = None  # Fuel type
+        self.mech = None  # Mechanism file
+        self.species = None  # Species list
+        self.oxygenAmount = None  # Oxygen amount
+        self.nitrogenAmount = None  # Nitrogen amount
+        self.X = {}  # Composition dictionary
+
+    def update_composition(self):
+        """Update the oxygen and nitrogen amounts based on the fuel type."""
+        if self.Fuel == "H2":
+            self.oxygenAmount = 0.5
+        elif self.Fuel == "C2H6":
+            self.oxygenAmount = 3.5
+        elif self.Fuel == "C4H10":
+            self.oxygenAmount = 6.5
+        else:
+            raise ValueError(f"Unknown fuel type: {self.Fuel}")
+
+        # Update the composition dictionary
+        self.X = {
+            self.Fuel: self.Phi,
+            'O2': self.oxygenAmount,
+            'N2': self.nitrogenAmount
+        }
+
+    def load_mechanism_species(self):
+        """Load species from the mechanism file and store them in the species attribute."""
+        if not self.mech:
+            raise ValueError("Mechanism file not specified.")
+        try:
+            gas = ct.Solution(self.mech)
+            self.species = gas.species_names
+            del gas  # Release Cantera object
+        except Exception as e:
+            raise RuntimeError(f"Failed to load mechanism file: {e}")
+
+
+# Global instance of MyClass
+input_params = MyClass()
+
+
+def initialize_parameters(T, P, Phi, Fuel, mech, nitrogenAmount=0):
+    """Initialize the parameters with provided values."""
+    input_params.T = T
+    input_params.P = P
+    input_params.Phi = Phi
+    input_params.Fuel = Fuel
+    input_params.mech = mech
+    input_params.nitrogenAmount = nitrogenAmount
+    input_params.update_composition()  # Update oxygen amount and composition
+    input_params.load_mechanism_species()  # Load species from the mechanism file
+
+
+# Script Functions
+def parallel_processing_function(iter_arr, const_list, predicate, nProcs):
+    """
+
+    :param iter_arr:
+    :param const_list:
+    :param predicate:
+    :param nProcs:
+    :return:
+    """
+    # Perform the multiprocessing
+    with multiprocessing.Pool(
+            processes=nProcs, initargs=()
+    ) as pool:
+        y = pool.map(predicate,
+                     zip(iter_arr,
+                         itertools.repeat(const_list),
+                         itertools.repeat(input_params)))
+    return y
 
 
 def ensure_long_path_prefix(path):
@@ -36,34 +111,6 @@ def ensure_long_path_prefix(path):
         return r"\\?\UNC" + path[1:]  # UNC path prefix
     else:
         return r"\\?\\" + path  # Regular path prefix
-
-
-def run_with_timeout(timeout, func, *args, **kwargs):
-    """
-    Run a function with a timeout using threading.Timer.
-    """
-    result = []
-    exception = []
-
-    def timeout_handler():
-        exception.append(TimeoutError("Function execution exceeded time limit."))
-
-    # Start the timer
-    timer = Timer(timeout, timeout_handler)
-    timer.start()
-
-    try:
-        result.append(func(*args, **kwargs))
-    except Exception as e:
-        exception.append(e)
-    finally:
-        timer.cancel()  # Cancel the timer if the function completes in time
-
-    # Return result or raise timeout exception
-    if exception:
-        print(exception[0])
-        return None
-    return result[0]
 
 
 def sort_files(file_list):
@@ -220,6 +267,10 @@ def domain_size_parameters(directory_path, desired_y_location):
         elif desired_y_location == "Top":
             y_slice_index = data.ActiveDimensions[1] - 1
             y_slice_loc = data.RightEdge[1].to_value()
+        elif desired_y_location == "DDT":
+            y_slice_index = np.unravel_index(np.argmax(data["boxlib", 'density'].to_value(), axis=None),
+                                             data["boxlib", 'density'].to_value().shape)
+            y_slice_loc = data["boxlib", str('y')][0][y_slice_index].to_value()[0]
         else:
             y_slice_index = int((data.ActiveDimensions[1] / 2) - 1)
             y_slice_loc = data["boxlib", str('y')][0][y_slice_index].to_value()[0]
@@ -227,11 +278,9 @@ def domain_size_parameters(directory_path, desired_y_location):
         y_slice_index = np.argwhere(data["boxlib", str('y')][0][:].to_value() <= desired_y_location)[-1][0]
         y_slice_loc = data["boxlib", str('y')][0][y_slice_index].to_value()[0]
 
-    return (
-    np.array([[int(data.ActiveDimensions[0]), int(y_slice_index)], [data.RightEdge[0].to_value(), y_slice_loc]]),
-    np.array([[int(data.ActiveDimensions[0]), int(data.ActiveDimensions[1])],
-              [data.RightEdge[0].to_value(), data.RightEdge[1].to_value()]]),
-    grid_arr)
+    return (np.array([[0, int(y_slice_index)], [int(data.ActiveDimensions[0]), int(y_slice_index)]]),
+            np.array([[data.LeftEdge[0].to_value(), y_slice_loc], [data.RightEdge[0].to_value(), y_slice_loc]]),
+            grid_arr)
 
 
 def wave_tracking_function(raw_data, sort_arr, tracking_str, wave_type):
@@ -362,7 +411,8 @@ def heat_release_rate_function(raw_data, sort_arr, input_params):
     return heat_release_rate, np.max(heat_release_rate)
 
 
-def flame_geometry_function(raw_data, center_loc, grid, output_dir_path, contour_check=False, thickness_check=False):
+def flame_geometry_function(raw_data, center_loc, grid, output_dir_path=None, contour_check=False,
+                            thickness_check=False):
     def sort_by_nearest_neighbors(points, plt_check=False):
         # Convert points to numpy array if it's a list of lists
         points = np.array(points)
@@ -607,143 +657,250 @@ def flame_geometry_function(raw_data, center_loc, grid, output_dir_path, contour
         return flame_thickness_val
 
 
-def cantera_ignition_function(plt_data, cell_idx, processing_flags, input_params, reactor_type='Pressure'):
-    ####################################################################################################################
-    # This function uses cantera to compute the ignition delay for a given mixture at a given initial state
-    ####################################################################################################################
-    # Step 1: Collect the initial conditions over the physical window
-    species_comp = {}
-    for j in range(len(input_params.species)):
-        species_comp.update({str(input_params.species[j]):
-                                 np.reshape(plt_data["boxlib", str("Y(" + input_params.species[j] + ")")].to_value(),
-                                            (ddt_bin_size, ddt_bin_size)).T[cell_idx]})
+def state_animation(method, **kwargs):
+    def plot_frame(reference_loc=None):
+        def plot_axis(ax, x_data, y_data, label, linestyle, color, ylabel, ylim, log_scale=False):
+            """Helper function to plot data on a single axis."""
+            ax.plot(x_data, y_data, label=label, linestyle=linestyle, color=color)
+            ax.set_ylabel(ylabel)
+            ax.set_ylim(*ylim)
+            if log_scale:
+                ax.set_yscale('log')
+            # Automatically choose the best location for the legend
+            ax.legend(loc='best')
 
-    # Step 2: Define the gas object and the initial state
-    gas = ct.Solution(input_params.mech)
-    gas.TPY = (np.reshape(plt_data["boxlib", 'Temp'].to_value(), (ddt_bin_size, ddt_bin_size)).T[cell_idx],
-               10 * np.reshape(plt_data["boxlib", 'pressure'].to_value(), (ddt_bin_size, ddt_bin_size)).T[cell_idx],
-               species_comp)
+        # Initialize plot
+        fig, ax1 = plt.subplots()
+        x_data_full = plt_data["boxlib", "x"][sort_arr].to_value()
 
-    print(np.reshape(plt_data["boxlib", 'Temp'].to_value(), (ddt_bin_size, ddt_bin_size)).T[cell_idx])
-    # Step 3:
-    if reactor_type == 'Volume':
-        r = ct.Reactor(contents=gas)
+        if isinstance(plt_type, (np.ndarray, list, tuple)):
+            axes = [ax1]
+            for i, obj in enumerate(pelec_key):
+                # Prepare x and y data
+                tmp_x_data = x_data_full
+                tmp_y_data = hrr_arr if plt_type[i] in ['HRR-Cantera', 'HRR-PeleC'] else plt_data["boxlib", obj][
+                    sort_arr].to_value()
 
-        gas_air = ct.Solution('air.yaml')
-        gas_air.TPX = 300, 1.0 * ct.one_atm, {'N2': 0.79, 'O2': 0.21}
-        env = ct.Reservoir(gas_air)
-        w = ct.Wall(r, env)
+                # Apply reference location filter if provided
+                if reference_loc is not None:
+                    indices = np.where(
+                        (tmp_x_data >= x_data_full[reference_loc] - reference_loc / 2) &
+                        (tmp_x_data <= x_data_full[reference_loc] + reference_loc / 2)
+                    )[0]
+                    tmp_x_data = tmp_x_data[indices]
+                    tmp_y_data = tmp_y_data[indices]
 
-        reactorNetwork = ct.ReactorNet([r])
+                # Plot primary axis or create secondary axes
+                if i == 0:
+                    plot_axis(
+                        ax=axes[0],
+                        x_data=tmp_x_data,
+                        y_data=tmp_y_data,
+                        label=obj,
+                        linestyle='-',
+                        color='k',
+                        ylabel=obj,
+                        ylim=(mim_bnd_val[i], max_bnd_val[i])
+                    )
+                    ax1.set_xlabel('Position [cm]')
+                    ax1.grid(True, axis='x')
+                else:
+                    ax = ax1.twinx()
+                    ax.spines["right"].set_position(("outward", 60 * i))  # Offset for clarity
+                    plot_axis(
+                        ax=ax,
+                        x_data=tmp_x_data,
+                        y_data=tmp_y_data,
+                        label=obj,
+                        linestyle='--',
+                        color=f"C{i}",  # Automatically cycle colors
+                        ylabel=obj,
+                        ylim=(mim_bnd_val[i], max_bnd_val[i]),
+                        log_scale=(obj == "pressure")
+                    )
+                    axes.append(ax)
 
+            # Title
+            title = " and ".join(plt_type) + f" Variation at y = {domain_size[1][1][1]} cm and t = {time} s"
+        else:
+            tmp_y_data = hrr_arr if plt_type in ['HRR-Cantera', 'HRR-PeleC'] else plt_data["boxlib", pelec_key][
+                sort_arr].to_value()
+
+            # Apply reference location filter if provided
+            if reference_loc is not None:
+                indices = np.where(
+                    (x_data_full >= x_data_full[reference_loc] - reference_loc / 2) &
+                    (x_data_full <= x_data_full[reference_loc] + reference_loc / 2)
+                )[0]
+                tmp_x_data = x_data_full[indices]
+                tmp_y_data = tmp_y_data[indices]
+            else:
+                tmp_x_data = x_data_full
+
+            plot_axis(
+                ax=ax1,
+                x_data=tmp_x_data,
+                y_data=tmp_y_data,
+                label=plt_type,
+                linestyle='-',
+                color='k',
+                ylabel=plt_type,
+                ylim=(mim_bnd_val, max_bnd_val),
+                log_scale=(plt_type == "pressure")
+            )
+
+            # Title
+            title = f"{plt_type} Variation at y = {domain_size[1][1][1]} cm and t = {time} s"
+
+            # Wrap and set title
+        wrapped_title = "\n".join(textwrap.wrap(title, width=55))
+        plt.suptitle(wrapped_title, ha="center")
+
+        # Set x-axis limits and legend
+        ax1.set_xlim(0, domain_size[1][1][0])
+
+        # Adjust layout to avoid overlapping with the legend
+        plt.tight_layout()
+
+        # Format time for filename
+        formatted_time = f"{time:.16f}".rstrip('0').rstrip('.')
+
+        # Create filename and save plot
+        if isinstance(plt_type, (np.ndarray, list, tuple)):
+            filename = os.path.join(output_dir_path, f"{'-'.join(plt_type)}-Animation-Time-{formatted_time}.png")
+        else:
+            filename = os.path.join(output_dir_path, f"{plt_type}-Animation-Time-{formatted_time}.png")
+
+        plt.savefig(filename, format='png')
+        plt.close()  # Avoid displaying inline in notebooks
+
+        return
+
+    def create_animation():
+
+        # Step 1:
+        image_files = [os.path.join(folder_path, f) for f in sorted(os.listdir(folder_path)) if
+                       f.endswith(f'.png')]
+
+        # Step 2: Load the first image to determine the size
+        first_image = mpimg.imread(image_files[0])
+
+        # Step 3: Create a figure with no axes
+        fig = plt.figure(figsize=(first_image.shape[1] / 100, first_image.shape[0] / 100), dpi=100)
+        plt.axis('off')
+
+        # Step 4: Placeholder for the image
+        img_display = plt.imshow(first_image)
+
+        # Step 5: Update function for animation
+        def update(frame):
+            img_display.set_array(mpimg.imread(image_files[frame]))
+            return img_display,
+
+        # Step 6: Create animation
+        ani = animation.FuncAnimation(fig, update, frames=len(image_files), blit=True)
+
+        # Step 7: Configure writer and save animation
+        writer = animation.FFMpegWriter(fps=15, metadata=dict(artist='Me'), bitrate=1800)
+        # writer = animation.writers['ffmpeg']
+        # writer = writer(fps=15, metadata=dict(artist='Me'), bitrate=1800)
+
+        ani.save(animation_filename, writer=writer)
+
+        plt.close(fig)  # Close the figure
+
+        return
+
+    """
+
+    """
+    # Step 0: Get values from **kwargs
+    plt_type = kwargs.get('plt_type', [])
+    mim_bnd_val = kwargs.get('mim_bnd_val', 0)
+    max_bnd_val = kwargs.get('max_bnd_val', 0)
+
+    reference_loc = kwargs.get('reference_loc', None)  # Get reference_loc from kwargs
+    time = kwargs.get('time', 0)
+    plt_data = kwargs.get('plt_data', [])
+    sort_arr = kwargs.get('sort_arr', [])
+    pelec_key = kwargs.get('pelec_key', '')
+    domain_size = kwargs.get('domain_size', [0, 0])
+    hrr_arr = kwargs.get('hrr_arr', [])
+
+    folder_path = kwargs.get('folder_path', "")
+    output_dir_path = kwargs.get('output_dir_path', "")
+    animation_filename = kwargs.get('animation_filename', "")
+
+    # Step 1: Set the plotting method (domain or local) or animation creation
+    if method == 'Plot':
+        if reference_loc is None:
+            plot_frame()
+        else:
+            plot_frame(reference_loc=reference_loc)
+
+    elif method == 'Animate':
+        create_animation()
     else:
-        r = ct.IdealGasConstPressureReactor(contents=gas)
-        reactorNetwork = ct.ReactorNet([r])
+        print('Error: Did not define viable method argument (Plot or Animate)')
 
-    # Step 4:
-    timeHistory = ct.SolutionArray(gas, extra=['t'])
-
-    # Step 4: Run the reactor and determine the time history of the reaction occuring
-    t = 0
-    tFinal = 600
-    while t < tFinal:
-        # Step 4.1: Take a time step and determine the new state of the reactor
-        t = reactorNetwork.step()
-        # Step 4.2: Save the new state of the reactor to the timeHistory object
-        timeHistory.append(r.thermo.state, t=t)
-
-    # Step 4:
-    result_dict = {}
-    result_dict['Time'] = timeHistory.t
-    if processing_flags['Ignition Delay Processing'].get('Temperature', False):
-        result_dict['Temperature'] = timeHistory.T
-    if processing_flags['Ignition Delay Processing'].get('Pressure', False):
-        result_dict['Pressure'] = timeHistory.P
-    if processing_flags['Ignition Delay Processing'].get('Density', False):
-        result_dict['Density'] = timeHistory.density_mass
-    if processing_flags['Ignition Delay Processing'].get('Species', False):
-        result_dict['Species'] = timeHistory.Y
-    if processing_flags['Ignition Delay Processing'].get('Heat Release Rate Cantera', False):
-        result_dict['Heat Release Rate Cantera'] = timeHistory.heat_release_rate
-
-    # Step 6:
-    plt_check = False
-    if plt_check:
-        plt.figure(figsize=(8, 6))
-        plt.plot(timeHistory.t, timeHistory.T, linestyle='-', color='k')
-        plt.xlabel('x')
-        plt.ylabel('y')
-        plt.show()
-
-    del r, reactorNetwork
-    return result_dict
+    return
 
 
-def cantera_flame_function(plt_data, cell_idx, processing_flags, input_params):
-    # Step 0: Check to make sure that the cell temperature is valid for flame speed calculations
-    temp_gas = ct.Solution(input_params.mech)
-    temp_gas.TPX = input_params.T, input_params.P, input_params.X
-    temp_gas.equilibrate('HP')
-    T_flag = 0.75 * temp_gas.T
-    del temp_gas
+def animation_bounds(args):
+    iter_val, const_list, input_params = args
 
-    if T_flag > np.reshape(plt_data["boxlib", 'Temp'].to_value(), (ddt_bin_size, ddt_bin_size)).T[cell_idx]:
-        return None
-    else:
-        # Step 1: Collect the initial conditions over the physical window
-        species_comp = {}
-        for j in range(len(input_params.species)):
-            species_comp.update({str(input_params.species[j]):
-                                     np.reshape(
-                                         plt_data["boxlib", str("Y(" + input_params.species[j] + ")")].to_value(),
-                                         (ddt_bin_size, ddt_bin_size)).T[cell_idx]})
+    temp_plt_files = iter_val
+    domain_info = const_list[0]
+    parameter_dict = const_list[1]
+    # Step 1: Create an array of the keys where the value is True
+    keys_with_true_values = [
+        key for key, value in parameter_dict['Domain State Animations'].items()
+        if isinstance(value, tuple) and value[0] is True
+    ]
 
-        # Step 2: Define the gas object and the initial state
-        gas = ct.Solution(input_params.mech)
-        gas.TPY = (np.reshape(plt_data["boxlib", 'Temp'].to_value(), (ddt_bin_size, ddt_bin_size)).T[cell_idx],
-                   10 * np.reshape(plt_data["boxlib", 'pressure'].to_value(), (ddt_bin_size, ddt_bin_size)).T[cell_idx],
-                   species_comp)
-        # Step 3: Simulation parameters
-        width = 1e-4  # m
-        loglevel = 0  # amount of diagnostic output (0 to 8)
-        # Step 4: Set up flame object
-        f = ct.FreeFlame(gas, width=width)
-        f.flame.max_time_step_count
-        f.set_refine_criteria(ratio=3, slope=0.01, curve=0.01)
-        f.show()
-        # Step 5: Solve with mixture-averaged transport model
-        f.transport_model = 'mixture-averaged'
-        f.solve(loglevel=loglevel, auto=True)
-        # Step 6:
-        result_dict = {}
-        result_dict['Grid'] = f.grid
-        if processing_flags['Flame Processing'].get('Temperature', False):
-            result_dict['Temperature'] = f.T
-        if processing_flags['Flame Processing'].get('Pressure', False):
-            result_dict['Pressure'] = f.P
-        if processing_flags['Flame Processing'].get('Density', False):
-            result_dict['Density'] = f.density_mass
-        if processing_flags['Flame Processing'].get('Species', False):
-            result_dict['Species'] = f.Y
-        if processing_flags['Flame Processing'].get('Velocity', False):
-            result_dict['Velocity'] = f.velocity
-        if processing_flags['Flame Processing'].get('Heat Release Rate Cantera', False):
-            result_dict['Heat Release Rate Cantera'] = f.heat_release_rate
+    # Step 2: Initialize the temp_max_val_arr with the same length as the number of True values in the dictionary
+    temp_bounds_arr = np.empty((len(keys_with_true_values), 3), dtype=object)
 
-        # Step 6:
-        plt_check = False
-        if plt_check:
-            plt.figure(figsize=(8, 6))
-            plt.plot(f.grid, f.T, linestyle='-', color='k')
-            plt.xlabel('x')
-            plt.ylabel('y')
-            plt.show()
+    # Step 3: Load data and collect the relevent parameters
+    raw_data = yt.load(temp_plt_files)
+    slice = raw_data.ray(np.array([domain_info[1][0][0], domain_info[1][0][1], 0.0]),
+                         np.array([domain_info[1][1][0], domain_info[1][1][1], 0.0]))
 
-        del gas, f
-        return result_dict
+    for i, key in enumerate(keys_with_true_values):
+        if key == 'Temperature':
+            temp_arr = slice["boxlib", "Temp"].to_value()
+
+        if key == 'Pressure':
+            temp_arr = slice["boxlib", "pressure"].to_value()
+
+        if key == 'Velocity':
+            temp_arr = slice["boxlib", "x_velocity"].to_value()
+
+        if key == 'Species':
+            print('Max Value Determination for Species is W.I.P.')
+
+        if key == 'Heat Release Rate Cantera':
+            temp_arr = heat_release_rate_function(slice, np.argsort(slice["boxlib", "x"]), input_params)[0]
+
+        if key == 'Heat Release Rate PeleC':
+            try:
+                temp_arr = slice["boxlib", "heatRelease"].to_value()
+            except:
+                temp_arr = heat_release_rate_function(slice, np.argsort(slice["boxlib", "x"]), input_params)[0]
+
+        if key == 'Flame Thickness':
+            temp_arr = flame_geometry_function(raw_data, domain_info[1][0][1], domain_info[-1], thickness_check=True)
+
+        # Step 3: Write bounds to value
+        temp_bounds_arr[i, 0] = key
+        temp_bounds_arr[i, 1] = np.min(temp_arr)
+        temp_bounds_arr[i, 2] = np.max(temp_arr)
+
+    return temp_bounds_arr
 
 
-def createVariablePltFrame(raw_data, sort_arr, time, min_bounds, max_bounds, tracking_obj, domain_info, hrr_arr=None):
+def createVariablePltFrame(raw_data, sort_arr, time, min_bounds, max_bounds, tracking_obj, domain_info, output_path,
+                           hrr_arr=None):
     def pltAnimationFrame():
         """
             Plots the data and saves the plot as an image file.
@@ -823,285 +980,24 @@ def createVariablePltFrame(raw_data, sort_arr, time, min_bounds, max_bounds, tra
         y_limit_min = np.zeros(len(tracking_obj))
         y_limit_max = np.zeros(len(tracking_obj))
         for i in range(len(tracking_obj)):
-            y_limit_min[i] = min_bounds[i]
+            y_limit_min[i] = min_bounds[i] - (0.1 * min_bounds[i])
             y_limit_max[i] = max_bounds[i] + (0.1 * max_bounds[i])
     else:
-        y_limit_min = min_bounds
+        y_limit_min = min_bounds - (0.1 * min_bounds)
         y_limit_max = max_bounds + (0.1 * max_bounds)
 
     # Step 2:
-    domain_size = domain_info[0][1]
+    domain_size = domain_info[1][1]
     # Step 3: Check/Create directory to store animation frmaes
     if isinstance(tracking_obj, (np.ndarray, list)):
-        output_dir_path = ensure_long_path_prefix(os.path.join(os.path.dirname(os.path.realpath(__file__)),
-                                                               f"Processed-Global-Results", f"Animation-Frames",
+        output_dir_path = ensure_long_path_prefix(os.path.join(output_path, f"Animation-Frames",
                                                                f"{tracking_obj[0]}-{tracking_obj[1]}-Plt-Files"))
     else:
-        output_dir_path = ensure_long_path_prefix(os.path.join(os.path.dirname(os.path.realpath(__file__)),
-                                                               f"Processed-Global-Results", f"Animation-Frames",
+        output_dir_path = ensure_long_path_prefix(os.path.join(output_path, f"Animation-Frames",
                                                                f"{tracking_obj}-Plt-Files"))
 
     # Step 3:
     pltAnimationFrame()
-
-    return
-
-
-def createAnchoredPlotFrame(pelec_data, input_params, comp_var='Ignition Delay Pressure', fixed_var='Temperature',
-                            fixed_val=2000, output_path=None):
-    # Step 1:
-
-    if comp_var == 'Ignition Delay Pressure':
-        pelec_shift_arr = np.empty(ddt_bin_size * ddt_bin_size)
-        temporal_dict = {}
-        cell_counter = 0
-        for i in range(len(pelec_data[0]['PeleC']['Position'][:, 0])):
-            for j in range(len(pelec_data[0]['PeleC']['Position'][:, 1])):
-                temporal_dict[f'Cell-{cell_counter}'] = {'Time': [], 'Position': []}
-                for k in range(len(pelec_data)):
-                    temporal_dict[f'Cell-{cell_counter}']['Time'].append(pelec_data[k]['Time'])
-                    temporal_dict[f'Cell-{cell_counter}']['Position'].append(pelec_data[k]['PeleC']['Position'][i][j])
-
-                    pelec_fields = ['Temperature', 'Pressure', 'Density']
-                    for field in pelec_fields:
-                        if field in pelec_data[k]['PeleC']:
-                            if field not in temporal_dict[f'Cell-{cell_counter}']:
-                                temporal_dict[f'Cell-{cell_counter}'][field] = []
-                            temporal_dict[f'Cell-{cell_counter}'][field].append(pelec_data[k]['PeleC'][field][i, j])
-
-                    if 'Species' in pelec_data[k]['PeleC']:
-                        if 'Species' not in temporal_dict[f'Cell-{cell_counter}']:
-                            temporal_dict[f'Cell-{cell_counter}']['Species'] = {}
-                        for species_name in input_params.species:
-                            species_key = f"Y({species_name})"
-                            if species_key in pelec_data[k]['PeleC']['Species']:
-                                if species_key not in temporal_dict[f'Cell-{cell_counter}']['Species']:
-                                    temporal_dict[f'Cell-{cell_counter}']['Species'][species_key] = []
-                                temporal_dict[f'Cell-{cell_counter}']['Species'][species_key].extend(
-                                    pelec_data[k]['PeleC']['Species'][species_key][i, j])
-
-                # Shifting factor for the pelec data
-                dT_dt = np.gradient(
-                    temporal_dict[f'Cell-{cell_counter}']['Temperature']) / np.gradient(
-                    temporal_dict[f'Cell-{cell_counter}']['Time'])
-                indices = np.argwhere(dT_dt == np.max(dT_dt))
-
-                if indices.size > 0:
-                    pelec_shift_arr[cell_counter] = indices[0][0]
-                else:
-                    pelec_shift_arr[cell_counter] = 0  # Or another default value if needed
-
-                cell_counter += 1
-
-        ignition_dict = {}
-        comp_shift_arr = np.empty(ddt_bin_size * ddt_bin_size)
-        cell_counter = 0
-        for i in range(len(pelec_data[0]['PeleC']['Position'][:, 0])):
-            for j in range(len(pelec_data[0]['PeleC']['Position'][:, 1])):
-                ignition_dict[f'Cell-{cell_counter}'] = {}
-                ignition_dict[f'Cell-{cell_counter}']['Ignition Delay Pressure'] = {'Time': [], 'Temperature': []}
-                for k in range(len(pelec_data)):
-                    ignition_dict[f'Cell-{cell_counter}']['Ignition Delay Pressure']['Time'].extend(
-                        pelec_data[k]['Ignition Delay Pressure'][i][j]['Time'])
-                    ignition_dict[f'Cell-{cell_counter}']['Ignition Delay Pressure']['Temperature'].extend(
-                        pelec_data[k]['Ignition Delay Pressure'][i][j]['Temperature'])
-
-                # Shifting factor for the comp data
-                dT_dt = np.gradient(
-                    ignition_dict[f'Cell-{cell_counter}']['Ignition Delay Pressure']['Temperature']) / np.gradient(
-                    ignition_dict[f'Cell-{cell_counter}']['Ignition Delay Pressure']['Time'])
-                indices = np.argwhere(dT_dt == np.max(dT_dt))
-
-                if indices.size > 0:
-                    comp_shift_arr[cell_counter] = indices[0][0]
-                else:
-                    comp_shift_arr[cell_counter] = 0  # Or another default value if needed
-
-                cell_counter += 1
-
-        # Step 2:
-        for i in range(len(temporal_dict)):
-            temp_vec = []
-            for j in range(len(temporal_dict[f'Cell-{i}']['Time'])):
-                temp_vec.append(
-                    temporal_dict[f'Cell-{i}']['Time'][j] - temporal_dict[f'Cell-{i}']['Time'][int(pelec_shift_arr[i])])
-            temporal_dict[f'Cell-{i}']['Shifted Time'] = []
-            temporal_dict[f'Cell-{i}']['Shifted Time'] = temp_vec
-
-        for i in range(len(ignition_dict)):
-            temp_vec = []
-            for j in range(len(ignition_dict[f'Cell-{i}']['Ignition Delay Pressure']['Time'])):
-                temp_vec.append(ignition_dict[f'Cell-{i}']['Ignition Delay Pressure']['Time'][j] -
-                                ignition_dict[f'Cell-{i}']['Ignition Delay Pressure']['Time'][int(comp_shift_arr[i])])
-            ignition_dict[f'Cell-{i}']['Ignition Delay Pressure']['Shifted Time'] = []
-            ignition_dict[f'Cell-{i}']['Ignition Delay Pressure']['Shifted Time'] = temp_vec
-
-        colors = ['red', 'green', 'blue', 'orange', 'purple']
-        color_cycle = itertools.cycle(colors)
-        for i in range(len(temporal_dict)):
-            fig, ax = plt.subplots()
-            ax.plot(temporal_dict[f'Cell-{i}']['Shifted Time'], temporal_dict[f'Cell-{i}']['Temperature'],
-                    label='Temperature', linestyle='-', marker='o', color='k')
-            for j in range(len(ignition_dict[f'Cell-{i}'])):
-                ax.plot(ignition_dict[f'Cell-{j}']['Ignition Delay Pressure']['Shifted Time'],
-                        ignition_dict[f'Cell-{j}']['Ignition Delay Pressure']['Temperature'],
-                        label=f'Cell-{j}', linestyle='-', color=next(color_cycle))
-            plt.xlabel('Time [s]')
-            plt.ylabel('Temperature [K]')
-            plt.title(f'Cell {i}')
-            ax.legend()
-            ax.set_xlim(-max(temporal_dict[f'Cell-{i}']['Shifted Time']),
-                        max(temporal_dict[f'Cell-{i}']['Shifted Time']))
-            # Save the plot to a file
-            filename = os.path.join(output_path, f"Ignition-Delay-Pressure-Animation-Cell-{i}.png")
-            plt.savefig(filename, format='png')
-            plt.show()
-
-    if comp_var == 'Flame':
-        pelec_shift_arr = np.empty((len(pelec_data), len(pelec_data[0]['PeleC']['Position'][:, 0])))
-        spatial_dict = {}
-        cell_counter = 0
-        for i in range(len(pelec_data)):
-            spatial_dict[f'Time Step {i}'] = {'Time': [], 'Position': {}}
-            spatial_dict[f'Time Step {i}']['Time'].append(pelec_data[i]['Time'])
-            for j in range(len(pelec_data[0]['PeleC']['Position'][:, 0])):
-                spatial_dict[f'Time Step {i}']['Position'][f'Row {j}'] = []
-                spatial_dict[f'Time Step {i}']['Position'][f'Row {j}'].extend(
-                    np.array([list(row) for row in pelec_data[i]['PeleC']['Position'][j]], dtype=float)[:, 0])
-
-                pelec_fields = ['Temperature', 'Pressure', 'Density']
-                for field in pelec_fields:
-                    if field in pelec_data[i]['PeleC']:
-                        if field not in spatial_dict[f'Time Step {i}']:
-                            spatial_dict[f'Time Step {i}'][field] = {}
-                        if f'Row {j}' not in spatial_dict[f'Time Step {i}'][field]:
-                            spatial_dict[f'Time Step {i}'][field][f'Row {j}'] = []
-                        spatial_dict[f'Time Step {i}'][field][f'Row {j}'].extend(pelec_data[i]['PeleC'][field][j])
-
-                if 'Species' in pelec_data[i]['PeleC']:
-                    if 'Species' not in spatial_dict[f'Time Step {i}']:
-                        spatial_dict[f'Time Step {i}']['Species'] = {}
-                    for species_name in input_params.species:
-                        species_key = f"Y({species_name})"
-                        if species_key in pelec_data[i]['PeleC']['Species']:
-                            if species_key not in spatial_dict[f'Time Step {i}']['Species']:
-                                spatial_dict[f'Time Step {i}']['Species'][species_key] = {f'Row {j}': []}
-                            spatial_dict[f'Time Step {i}']['Species'][species_key][f'Row {j}'].extend(
-                                pelec_data[i]['PeleC']['Species'][species_key][j])
-
-                cell_counter += 1
-
-                # Shifting factor for the pelec data
-                dT_dx = np.gradient(
-                    spatial_dict[f'Time Step {i}']['Temperature'][f'Row {j}']) / np.gradient(
-                    spatial_dict[f'Time Step {i}']['Position'][f'Row {j}'])
-                # indices = np.argwhere(abs(dT_dx) == np.max(abs(dT_dx)))
-                indices = np.argwhere(np.array(spatial_dict[f'Time Step {i}']['Temperature'][f'Row {j}']) > fixed_val)
-
-                if indices.size > 0:
-                    pelec_shift_arr[i, j] = indices[0][0]
-                else:
-                    pelec_shift_arr[i, j] = 0  # Or another default value if needed
-
-        flame_dict = {}
-        comp_shift_arr = {}
-        for i in range(len(pelec_data)):
-            cell_counter = 0
-            flame_dict[f'Time Step {i}'] = {}
-            flame_fields = ['Position', 'Temperature']
-            for j in range(len(pelec_data[0]['Flame'])):
-                for k in range(len(pelec_data[0]['Flame'][0])):
-                    if pelec_data[i]['Flame'][j][k] is not None:
-                        for field in flame_fields:
-                            if field in pelec_data[i]['PeleC']:
-                                if field not in flame_dict[f'Time Step {i}']:
-                                    flame_dict[f'Time Step {i}'][field] = {}
-                                if f'Cell {cell_counter}' not in flame_dict[f'Time Step {i}'][field]:
-                                    flame_dict[f'Time Step {i}'][field][f'Cell {cell_counter}'] = []
-
-                        flame_dict[f'Time Step {i}']['Position'][f'Cell {cell_counter}'].extend(
-                            pelec_data[i]['Flame'][j][k]['Grid'][::-1])
-                        flame_dict[f'Time Step {i}']['Temperature'][f'Cell {cell_counter}'].extend(
-                            pelec_data[i]['Flame'][j][k]['Temperature'])
-
-                        # Shifting factor for the comp data
-                        dT_dx = np.gradient(
-                            flame_dict[f'Time Step {i}']['Temperature'][f'Cell {cell_counter}']) / np.gradient(
-                            flame_dict[f'Time Step {i}']['Position'][f'Cell {cell_counter}'])
-                        # indices = np.argwhere(abs(dT_dx) == np.max(abs(dT_dx)))
-                        indices = np.argwhere(
-                            np.array(flame_dict[f'Time Step {i}']['Temperature'][f'Cell {cell_counter}']) > fixed_val)
-
-                        if f'Time Step {i}' not in comp_shift_arr:
-                            comp_shift_arr[f'Time Step {i}'] = {}
-                        if indices.size > 0:
-                            comp_shift_arr[f'Time Step {i}'][f'Cell {cell_counter}'] = indices[0][0]
-                        else:
-                            comp_shift_arr[f'Time Step {i}'][
-                                f'Cell {cell_counter}'] = 0  # Or another default value if needed
-
-                    cell_counter += 1
-
-        # Step 2:
-        for i in range(len(spatial_dict)):
-            for j in range(len(spatial_dict[f'Time Step {i}']['Position'])):
-                temp_vec = []
-                for k in range(len(spatial_dict[f'Time Step {i}']['Position'][f'Row {j}'])):
-                    if 'Shifted Position' not in spatial_dict[f'Time Step {i}']:
-                        spatial_dict[f'Time Step {i}']['Shifted Position'] = {}
-
-                    temp_vec.append(spatial_dict[f'Time Step {i}']['Position'][f'Row {j}'][k] -
-                                    spatial_dict[f'Time Step {i}']['Position'][f'Row {j}'][int(pelec_shift_arr[i][j])])
-                if 'Shifted Position' in spatial_dict[f'Time Step {i}']:
-                    if f'Row {j}' not in spatial_dict[f'Time Step {i}']['Shifted Position']:
-                        spatial_dict[f'Time Step {i}']['Shifted Position'][f'Row {j}'] = []
-                    spatial_dict[f'Time Step {i}']['Shifted Position'][f'Row {j}'] = temp_vec
-
-        for i in range(len(flame_dict)):
-            if 'Shifted Position' not in flame_dict[f'Time Step {i}'] and 'Position' in flame_dict[
-                f'Time Step {i}'].keys():
-                flame_dict[f'Time Step {i}']['Shifted Position'] = {}
-
-            if 'Position' in flame_dict[f'Time Step {i}'].keys():
-                for cell_key in flame_dict[f'Time Step {i}']['Position'].keys():
-                    temp_vec = []
-                    for k in range(len(flame_dict[f'Time Step {i}']['Position'][cell_key])):
-                        temp_vec.append(flame_dict[f'Time Step {i}']['Position'][cell_key][k] -
-                                        flame_dict[f'Time Step {i}']['Position'][cell_key][
-                                            int(comp_shift_arr[f'Time Step {i}'][cell_key])])
-                        if cell_key not in flame_dict[f'Time Step {i}']['Shifted Position']:
-                            flame_dict[f'Time Step {i}']['Shifted Position'][cell_key] = []
-                    flame_dict[f'Time Step {i}']['Shifted Position'][cell_key] = temp_vec
-
-        # Plot Results
-        colors = ['red', 'green', 'blue', 'orange', 'purple']
-        color_cycle = itertools.cycle(colors)
-        for time_step in range(len(spatial_dict)):
-            for row_idx in range(len(spatial_dict[f'Time Step {time_step}']['Shifted Position'])):
-                if f'Row {j}' in spatial_dict[f'Time Step {time_step}']['Shifted Position']:
-                    fig, ax = plt.subplots()
-                    ax.plot(spatial_dict[f'Time Step {time_step}']['Shifted Position'][f'Row {j}'],
-                            spatial_dict[f'Time Step {time_step}']['Temperature'][f'Row {j}'], label='Temperature',
-                            marker='.', linestyle='-', color='k')
-
-                for cell_idx in range((row_idx * ddt_bin_size), ((row_idx + 1) * ddt_bin_size) - 1):
-                    if flame_dict[f'Time Step {time_step}']:
-                        if f'Cell {cell_idx}' in flame_dict[f'Time Step {time_step}']['Shifted Position'].keys():
-                            ax.plot(flame_dict[f'Time Step {time_step}']['Shifted Position'][f'Cell {cell_idx}'],
-                                    flame_dict[f'Time Step {time_step}']['Temperature'][f'Cell {cell_idx}'],
-                                    label=f'Cell {cell_idx}',
-                                    linestyle='-', color=next(color_cycle))
-
-                plt.xlabel('Position [s]')
-                plt.ylabel('Temperature [K]')
-                plt.title(f'Time Step {time_step}, Row {row_idx}')
-                ax.legend()
-                ax.set_xlim(-max(spatial_dict[f'Time Step {time_step}']['Shifted Position'][f'Row {row_idx}']),
-                            max(spatial_dict[f'Time Step {time_step}']['Shifted Position'][f'Row {row_idx}']))
-                # Save the plot to a file
-                filename = os.path.join(output_path, f"Flame-Animation-Time-Step-{time_step}-Row-{row_idx}.png")
-                plt.savefig(filename, format='png')
-                plt.show()
 
     return
 
@@ -1180,7 +1076,8 @@ def createVariableAnimation(folder_path, output_filename, fps=15):
 def single_pltfile_processing(args):
     def load_data():
         raw_data = yt.load(pltFile_dir)
-        slice = raw_data.ray(np.array([0.0, domain_size[1], 0.0]), np.array([domain_size[0], domain_size[1], 0.0]))
+        slice = raw_data.ray(np.array([domain_info[1][0][0], domain_info[1][0][1], 0.0]),
+                             np.array([domain_info[1][1][0], domain_info[1][1][1], 0.0]))
         ray_sort = np.argsort(slice["boxlib", "x"])
         time = raw_data.current_time.to_value()
 
@@ -1198,13 +1095,13 @@ def single_pltfile_processing(args):
 
     """
     # Step 1: Unpack the argumnents provided
-    pltFile_dir = args[0]
-    processing_flags = args[1][0]
-    animation_pltfiles = args[1][1]
-    domain_info = args[1][2]
-    domain_size = domain_info[0][1]
-    domain_grid = domain_info[-1]
-    input_params = args[1][3]
+    iter_val, const_list, input_params = args
+
+    pltFile_dir = iter_val
+    processing_flags = const_list[0]
+    animation_bnd_arr = const_list[1]
+    domain_info = const_list[2]
+    output_path = const_list[3]
 
     # Step 2: Load the pltFile for individual processing
     time, raw_data, plt_data, sort_arr = load_data()
@@ -1223,6 +1120,11 @@ def single_pltfile_processing(args):
             [result_dict['Flame']['Index'], result_dict['Flame']['Position']] = wave_tracking_function(plt_data,
                                                                                                        sort_arr, "Temp",
                                                                                                        "Flame")
+
+        # Gas Velocity
+        if processing_flags['Flame Processing'].get('Relative Velocity', False):
+            result_dict['Flame']['Gas Velocity'] = plt_data["boxlib", "x_velocity"][sort_arr][
+                                                       result_dict['Flame']['Index'] + 10].to_value() / 100
 
         # Thermodynamic State
         if processing_flags['Flame Processing'].get('Thermodynamic State', False):
@@ -1250,8 +1152,7 @@ def single_pltfile_processing(args):
         if processing_flags['Flame Processing'].get('Flame Thickness', False) or processing_flags[
             'Flame Processing'].get('Surface Length', False):
             temp_plt_dir = ensure_long_path_prefix(
-                os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
-                             f"Animation-Frames", f"Flame-Thickness-Plt-Files"))
+                os.path.join(output_path, f"Animation-Frames", f"Flame-Thickness-Plt-Files"))
 
             if os.path.exists(temp_plt_dir) is False:
                 os.makedirs(temp_plt_dir, exist_ok=True)
@@ -1260,8 +1161,8 @@ def single_pltfile_processing(args):
                     'Flame Processing'].get('Surface Length', False):
                     [result_dict['Flame']['Surface Length'],
                      result_dict['Flame']['Flame Thickness']] = flame_geometry_function(raw_data,
-                                                                                        domain_info[0][1][1],
-                                                                                        domain_grid,
+                                                                                        domain_info[1][0][1],
+                                                                                        domain_info[-1],
                                                                                         temp_plt_dir,
                                                                                         thickness_check=True,
                                                                                         contour_check=True)
@@ -1270,14 +1171,16 @@ def single_pltfile_processing(args):
                 if processing_flags['Flame Processing'].get('Flame Thickness', False) and not processing_flags[
                     'Flame Processing'].get('Surface Length', False):
                     result_dict['Flame']['Flame Thickness'] = flame_geometry_function(raw_data,
-                                                                                      domain_info[0][1][1], domain_grid,
+                                                                                      domain_info[1][0][1],
+                                                                                      domain_info[-1],
                                                                                       temp_plt_dir,
                                                                                       thickness_check=True)
 
                 if processing_flags['Flame Processing'].get('Surface Length', False) and not processing_flags[
                     'Flame Processing'].get('Flame Thickness', False):
                     result_dict['Flame']['Surface Length'] = flame_geometry_function(raw_data,
-                                                                                     domain_info[0][1][1], domain_grid,
+                                                                                     domain_info[1][0][1],
+                                                                                     domain_info[-1],
                                                                                      None,
                                                                                      contour_check=True)
             except:
@@ -1347,349 +1250,221 @@ def single_pltfile_processing(args):
 
     # Step 3.5: State Variation Animation
     if 'Domain State Animations' in processing_flags:
-        # Step 3.5.1: Get first time step to determine minimum parameters
-        temp_data = yt.load(animation_pltfiles[0])
-        temp_slice = temp_data.ray(np.array([0.0, domain_info[0][1][1], 0.0]),
-                                   np.array([domain_info[0][1][0], domain_info[0][1][1], 0.0]))
+        plot_check = processing_flags.get('Domain State Animations', {})
 
-        min_val_marker = np.empty(5 + len(input_params.species), dtype=object)
-        min_val_arr = np.zeros(5 + len(input_params.species))
-        for i in range(len(min_val_arr)):
-            if i == 0:
-                min_val_marker[i] = str('Temp')
-                min_val_arr[i] = np.min(temp_slice["boxlib", str('Temp')])
-            elif i == 1:
-                min_val_marker[i] = 'pressure'
-                min_val_arr[i] = np.min(temp_slice["boxlib", str('pressure')])
-            elif i == 2:
-                min_val_marker[i] = 'x_velocity'
-                min_val_arr[i] = np.min(temp_slice["boxlib", str('x_velocity')])
-            elif i == 3:
-                min_val_marker[i] = 'HRR-Cantera'
-                min_val_arr[i] = np.min(result_dict['Flame']['Heat Release Rate Cantera'])
-            elif i == 4:
-                min_val_marker[i] = 'HRR-PeleC'
-                min_val_arr[i] = np.min(result_dict['Flame']['Heat Release Rate PeleC'])
-            else:
-                min_val_marker[i] = str("Y(" + input_params.species[i - 5] + ")")
-                min_val_arr[i] = np.min(temp_slice["boxlib", str("Y(" + input_params.species[i - 5] + ")")])
+        for key, value in plot_check.items():
+            if key == 'Combined':
+                min_bnd_val = []
+                max_bnd_val = []
+                for i in range(len(value[0])):
+                    # Collect the plot bounds based on the current desire
+                    bnd_arr_index = np.where(animation_bnd_arr[:, 0] == value[0][i])[0][
+                        0]  # Get the first matching index
+                    min_bnd_val.append(animation_bnd_arr[bnd_arr_index, 1])
+                    max_bnd_val.append(animation_bnd_arr[bnd_arr_index, 2])
 
-        # Step 3.5.2: Get last time step to determine minimum parameters
-        temp_data = yt.load(animation_pltfiles[1])
-        temp_slice = temp_data.ray(np.array([0.0, domain_info[0][1][1], 0.0]),
-                                   np.array([domain_info[0][1][0], domain_info[0][1][1], 0.0]))
+                hrr_arr = None
+                if key == 'Heat Release Rate Cantera' or key == 'Heat Release Rate PeleC':
+                    hrr_arr = result_dict['Flame'][value[0]]
 
-        max_val_marker = np.empty(5 + len(input_params.species), dtype=object)
-        max_val_arr = np.zeros(5 + len(input_params.species))
-        for i in range(len(max_val_arr)):
-            if i == 0:
-                max_val_marker[i] = str('Temp')
-                max_val_arr[i] = np.max(temp_slice["boxlib", str('Temp')])
-            elif i == 1:
-                max_val_marker[i] = 'pressure'
-                max_val_arr[i] = np.max(temp_slice["boxlib", str('pressure')])
-            elif i == 2:
-                max_val_marker[i] = 'x_velocity'
-                max_val_arr[i] = np.max(temp_slice["boxlib", str('x_velocity')])
-            elif i == 3:
-                max_val_marker[i] = 'HRR-Cantera'
-                max_val_arr[i] = np.min(result_dict['Flame']['Heat Release Rate Cantera'])
-            elif i == 4:
-                max_val_marker[i] = 'HRR-PeleC'
-                max_val_arr[i] = np.min(result_dict['Flame']['Heat Release Rate PeleC'])
-            else:
-                max_val_marker[i] = str("Y(" + input_params.species[i - 5] + ")")
-                max_val_arr[i] = np.max(temp_slice["boxlib", str("Y(" + input_params.species[i - 5] + ")")])
-
-        # Step 3.5.3: Plot Temperature
-        if processing_flags['Domain State Animations'].get('Temperature', False):
-            # Create directory for plt files
-            temp_plt_dir = ensure_long_path_prefix(
-                os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
-                             f"Animation-Frames", f"Temp-Plt-Files"))
-
-            if os.path.exists(temp_plt_dir) is False:
-                os.makedirs(temp_plt_dir, exist_ok=True)
-
-            createVariablePltFrame(plt_data, sort_arr, time, min_val_arr[0], max_val_arr[0], "Temp", domain_info)
-
-        # Step 3.5.4: Plot Pressure
-        if processing_flags['Domain State Animations'].get('Pressure', False):
-            # Create directory for plt files
-            temp_plt_dir = ensure_long_path_prefix(
-                os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
-                             f"Animation-Frames", f"pressure-Plt-Files"))
-
-            if os.path.exists(temp_plt_dir) is False:
-                os.makedirs(temp_plt_dir, exist_ok=True)
-
-            createVariablePltFrame(plt_data, sort_arr, time, min_val_arr[1], max_val_arr[1], "pressure", domain_info)
-
-        # Step 3.5.5: Plot Velocity
-        if processing_flags['Domain State Animations'].get('Velocity', False):
-            # Create directory for plt files
-            temp_plt_dir = ensure_long_path_prefix(
-                os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
-                             f"Animation-Frames", f"x_velocity-Plt-Files"))
-
-            if os.path.exists(temp_plt_dir) is False:
-                os.makedirs(temp_plt_dir, exist_ok=True)
-
-            createVariablePltFrame(plt_data, sort_arr, time, min_val_arr[2], max_val_arr[2], "x_velocity", domain_info)
-
-        # Step 3.5.5: Plot Velocity
-        if processing_flags['Domain State Animations'].get('Heat Release Rate Cantera', False):
-            # Create directory for plt files
-            temp_plt_dir = ensure_long_path_prefix(
-                os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
-                             f"Animation-Frames", f"HRR-Cantera-Plt-Files"))
-
-            if os.path.exists(temp_plt_dir) is False:
-                os.makedirs(temp_plt_dir, exist_ok=True)
-
-            createVariablePltFrame(plt_data, sort_arr, time, min_val_arr[3], max_val_arr[3], "HRR-Cantera",
-                                   domain_info, hrr_arr=result_dict['Flame']['Heat Release Rate Cantera'])
-
-        if processing_flags['Domain State Animations'].get('Heat Release Rate PeleC', False):
-            # Create directory for plt files
-            temp_plt_dir = ensure_long_path_prefix(
-                os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
-                             f"Animation-Frames", f"HRR-PeleC-Plt-Files"))
-
-            if os.path.exists(temp_plt_dir) is False:
-                os.makedirs(temp_plt_dir, exist_ok=True)
-
-            createVariablePltFrame(plt_data, sort_arr, time, min_val_arr[3], max_val_arr[3], "HRR-PeleC",
-                                   domain_info, hrr_arr=result_dict['Flame']['Heat Release Rate PeleC'])
-
-        # Step 3.5.6: Plot Species
-        if processing_flags['Domain State Animations'].get('Species', False):
-            for i in range(len(input_params.species)):
                 # Create directory for plt files
+                combined_key = "-".join(value[0])
                 temp_plt_dir = ensure_long_path_prefix(
-                    os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
-                                 f"Animation-Frames", f"Y({str(input_params.species[i])})-Plt-Files"))
+                    os.path.join(output_path, f"Animation-Frames", f"{combined_key}-Plt-Files"))
+
                 if os.path.exists(temp_plt_dir) is False:
                     os.makedirs(temp_plt_dir, exist_ok=True)
 
-                createVariablePltFrame(plt_data, sort_arr, time, min_val_arr[i + 4], max_val_arr[i + 4],
-                                       f"Y({str(input_params.species[i])})", domain_info)
+                state_animation(
+                    method='Plot',
+                    plt_type=value[0],
+                    mim_bnd_val=min_bnd_val,
+                    max_bnd_val=max_bnd_val,
+                    reference_loc=None,
+                    time=time,
+                    plt_data=plt_data,
+                    sort_arr=sort_arr,
+                    pelec_key=value[1],
+                    domain_size=domain_info,
+                    hrr_arr=hrr_arr,
+                    output_dir_path=temp_plt_dir,
+                )
+
+            else:
+                if isinstance(value, (np.ndarray, list, tuple)):
+                    bool_check = value[0]
+                    pelec_key = value[1]
+                else:
+                    bool_check = value
+                    pelec_key = None
+
+                if bool_check:
+                    # Collect the plot bounds based on the current desire
+                    bnd_arr_index = np.where(animation_bnd_arr[:, 0] == key)[0][0]  # Get the first matching index
+                    min_bnd_val = animation_bnd_arr[bnd_arr_index, 1]
+                    max_bnd_val = animation_bnd_arr[bnd_arr_index, 2]
+
+                    # Create directory for plt files
+                    temp_plt_dir = ensure_long_path_prefix(
+                        os.path.join(output_path, f"Animation-Frames", f"{key}-Plt-Files"))
+
+                    if os.path.exists(temp_plt_dir) is False:
+                        os.makedirs(temp_plt_dir, exist_ok=True)
+
+                    hrr_arr = None
+                    if key == 'Heat Release Rate Cantera' or key == 'Heat Release Rate PeleC':
+                        hrr_arr = result_dict['Flame'][key]
+
+                    state_animation(
+                        method='Plot',
+                        plt_type=key,
+                        mim_bnd_val=min_bnd_val,
+                        max_bnd_val=max_bnd_val,
+                        reference_loc=None,
+                        time=time,
+                        plt_data=plt_data,
+                        sort_arr=sort_arr,
+                        pelec_key=pelec_key,
+                        domain_size=domain_info,
+                        hrr_arr=hrr_arr,
+                        output_dir_path=temp_plt_dir,
+                    )
+
+        """
+        # Step 3.5.3: Plot Temperature
+        if processing_flags['Domain State Animations'].get('Temperature', False):
+            # Select appropriate bounds
+            index = np.where(animation_bnd_arr[:, 0] == 'Temperature')[0][0]  # Get the first matching index
+
+            # Extract min and max values for the key
+            min_val = animation_bnd_arr[index, 1]
+            max_val = animation_bnd_arr[index, 2]
+
+            # Create directory for plt files
+            temp_plt_dir = ensure_long_path_prefix(os.path.join(output_path, f"Animation-Frames", f"Temp-Plt-Files"))
+
+            if os.path.exists(temp_plt_dir) is False:
+                os.makedirs(temp_plt_dir, exist_ok=True)
+
+            createVariablePltFrame(plt_data, sort_arr, time, min_val, max_val, "Temp", domain_info, output_path)
+
+        # Step 3.5.4: Plot Pressure
+        if processing_flags['Domain State Animations'].get('Pressure', False):
+            # Select appropriate bounds
+            index = np.where(animation_bnd_arr[:, 0] == 'Pressure')[0][0]  # Get the first matching index
+
+            # Extract min and max values for the key
+            min_val = animation_bnd_arr[index, 1]
+            max_val = animation_bnd_arr[index, 2]
+
+            # Create directory for plt files
+            temp_plt_dir = ensure_long_path_prefix(
+                os.path.join(output_path, f"Animation-Frames", f"pressure-Plt-Files"))
+
+            if os.path.exists(temp_plt_dir) is False:
+                os.makedirs(temp_plt_dir, exist_ok=True)
+
+            createVariablePltFrame(plt_data, sort_arr, time, min_val, max_val, "pressure", domain_info, output_path)
+
+        # Step 3.5.5: Plot Velocity
+        if processing_flags['Domain State Animations'].get('Velocity', False):
+            # Select appropriate bounds
+            index = np.where(animation_bnd_arr[:, 0] == 'Velocity')[0][0]  # Get the first matching index
+
+            # Extract min and max values for the key
+            min_val = animation_bnd_arr[index, 1]
+            max_val = animation_bnd_arr[index, 2]
+
+            # Create directory for plt files
+            temp_plt_dir = ensure_long_path_prefix(os.path.join(output_path, f"Animation-Frames", f"x_velocity-Plt-Files"))
+
+            if os.path.exists(temp_plt_dir) is False:
+                os.makedirs(temp_plt_dir, exist_ok=True)
+
+            createVariablePltFrame(plt_data, sort_arr, time, min_val, max_val, "x_velocity", domain_info, output_path)
+
+        # Step 3.5.5: Plot Velocity
+        if processing_flags['Domain State Animations'].get('Heat Release Rate Cantera', False):
+            # Select appropriate bounds
+            index = np.where(animation_bnd_arr[:, 0] == 'Heat Release Rate Cantera')[0][0]  # Get the first matching index
+
+            # Extract min and max values for the key
+            min_val = animation_bnd_arr[index, 1]
+            max_val = animation_bnd_arr[index, 2]
+
+            # Create directory for plt files
+            temp_plt_dir = ensure_long_path_prefix(os.path.join(output_path, f"Animation-Frames", f"HRR-Cantera-Plt-Files"))
+
+            if os.path.exists(temp_plt_dir) is False:
+                os.makedirs(temp_plt_dir, exist_ok=True)
+
+            createVariablePltFrame(plt_data, sort_arr, time, min_val, max_val, "HRR-Cantera",
+                                   domain_info, output_path, hrr_arr = result_dict['Flame']['Heat Release Rate Cantera'])
+
+        if processing_flags['Domain State Animations'].get('Heat Release Rate PeleC', False):
+            # Select appropriate bounds
+            index = np.where(animation_bnd_arr[:, 0] == 'Heat Release Rate PeleC')[0][0]  # Get the first matching index
+
+            # Extract min and max values for the key
+            min_val = animation_bnd_arr[index, 1]
+            max_val = animation_bnd_arr[index, 2]
+
+            # Create directory for plt files
+            temp_plt_dir = ensure_long_path_prefix(os.path.join(output_path,f"Animation-Frames", f"HRR-PeleC-Plt-Files"))
+
+            if os.path.exists(temp_plt_dir) is False:
+                os.makedirs(temp_plt_dir, exist_ok=True)
+
+            createVariablePltFrame(plt_data, sort_arr, time, min_val, max_val, "HRR-PeleC",
+                                   domain_info, output_path, hrr_arr = result_dict['Flame']['Heat Release Rate PeleC'])
+
+        # Step 3.5.6: Plot Species
+        if processing_flags['Domain State Animations'].get('Species', False):
+            # Select appropriate bounds
+            index = np.where(animation_bnd_arr[:, 0] == 'Species')[0][0]  # Get the first matching index
+
+            # Extract min and max values for the key
+            min_val = animation_bnd_arr[index, 1]
+            max_val = animation_bnd_arr[index, 2]
+
+            for i in range(len(input_params.species)):
+                # Create directory for plt files
+                temp_plt_dir = ensure_long_path_prefix(os.path.join(output_path, f"Animation-Frames", f"Y({str(input_params.species[i])})-Plt-Files"))
+                if os.path.exists(temp_plt_dir) is False:
+                    os.makedirs(temp_plt_dir, exist_ok=True)
+
+                createVariablePltFrame(plt_data, sort_arr, time, min_val[i + 4], max_val[i + 4], f"Y({str(input_params.species[i])})", domain_info, output_path)
 
         # Step 3.5.3: Plot Combined
         if processing_flags['Domain State Animations'].get('Combined', False):
+            # Select appropriate bounds
+            index_1 = np.where(animation_bnd_arr[:, 0] == f"{processing_flags['Domain State Animations']['Combined'][0]}")[0][0]  # Get the first matching index
+            index_2 = np.where(animation_bnd_arr[:, 0] == f"{processing_flags['Domain State Animations']['Combined'][2]}")[0][0]  # Get the first matching index
+
+            # Extract min and max values for the key
+            min_val_1 = animation_bnd_arr[index_1, 1]
+            max_val_1 = animation_bnd_arr[index_1, 2]
+
+            min_val_2 = animation_bnd_arr[index_2, 1]
+            max_val_2 = animation_bnd_arr[index_2, 2]
+
             # Create directory for plt files
             temp_plt_dir = ensure_long_path_prefix(
-                os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
-                             f"Animation-Frames", f"{processing_flags['Domain State Animations']['Combined'][0]}-"
-                                                  f"{processing_flags['Domain State Animations']['Combined'][1]}-Plt-Files"))
+                os.path.join(output_path, f"Animation-Frames", f"{processing_flags['Domain State Animations']['Combined'][0]}-"
+                                                               f"{processing_flags['Domain State Animations']['Combined'][1]}-Plt-Files"))
             if os.path.exists(temp_plt_dir) is False:
                 os.makedirs(temp_plt_dir, exist_ok=True)
 
             createVariablePltFrame(plt_data, sort_arr, time,
-                                   [min_val_arr[np.argwhere(
-                                       min_val_marker == processing_flags['Domain State Animations']['Combined'][0])][
-                                        0][0],
-                                    min_val_arr[np.argwhere(
-                                        min_val_marker == processing_flags['Domain State Animations']['Combined'][1])][
-                                        0][0]],
-                                   [max_val_arr[np.argwhere(
-                                       max_val_marker == processing_flags['Domain State Animations']['Combined'][0])][
-                                        0][0],
-                                    max_val_arr[np.argwhere(
-                                        max_val_marker == processing_flags['Domain State Animations']['Combined'][1])][
-                                        0][0]],
+                                   [min_val_1, min_val_2], [max_val_1, max_val_2],
                                    [processing_flags['Domain State Animations']['Combined'][0],
-                                    processing_flags['Domain State Animations']['Combined'][1]], domain_info)
+                                    processing_flags['Domain State Animations']['Combined'][1]], domain_info, output_path)
+        """
 
     return result_dict
 
 
-def single_ddt_pltfile_processing(args):
-    def load_data():
-        raw_data = yt.load(pltFile_dir)
-
-        # Create sudo-grid at the maximum level present
-        region = raw_data.box(np.array([domain_grid[0][ddt_idx[0] - (ddt_bin_size // 2) - 1][0],
-                                        domain_grid[1][ddt_idx[1] - (ddt_bin_size // 2) - 1][0], 0.0]),
-                              np.array([domain_grid[0][ddt_idx[0] + (ddt_bin_size // 2)][0],
-                                        domain_grid[1][ddt_idx[1] + (ddt_bin_size // 2)][0], 1.0]))
-
-        try:
-            test_calc = region["boxlib", "x"].to_value().reshape(ddt_bin_size, ddt_bin_size)
-
-        except:
-            sys.exit(
-                'ERROR: Domain is not refined throughout all time steps! Must provide further refinement before running')
-
-        """
-        max_level = raw_data.index.max_level          
-        full_data = raw_data.covering_grid(level=max_level,
-                                           left_edge=[0.0, 0.0, 0.0],
-                                           dims=raw_data.domain_dimensions * [2 ** max_level, 2 ** max_level, 1],
-                                           # And any fields to preload (this is optional!)
-                                           # fields=desired_varables
-                                           )
-        """
-
-        time = raw_data.current_time.to_value()
-
-        plt_check = False
-        if plt_check:
-            plt.figure(figsize=(8, 6))
-            plt.plot(region["boxlib", "x"][:, 0].to_value().flatten(),
-                     region["boxlib", "Temp"][:, 0].to_value().flatten(), linestyle='-', color='k')
-            plt.xlabel('x')
-            plt.ylabel('y')
-            plt.show()
-
-        return time, raw_data, region
-
-    """
-
-    """
-    # Step 1: Unpack the argumnents provided
-    pltFile_dir = args[0]
-    ddt_idx = args[1][0]
-    domain_grid = args[1][1]
-    processing_flags = args[1][2]
-    animation_pltfiles = args[1][3]
-    input_params = args[1][4]
-
-    # Step 3: Load the pltFile for individual processing
-    time, raw_data, plt_data = load_data()
-    """
-    temp_x = np.arange(ddt_idx[0] - (ddt_bin_size // 2) - 1, ddt_idx[0] + (ddt_bin_size // 2) + 1)
-    temp_y = np.arange(ddt_idx[1] - (ddt_bin_size // 2) - 1, ddt_idx[1] + (ddt_bin_size // 2) + 1)
-    temp_xx, temp_yy = np.meshgrid(temp_x, temp_y)
-    plt.figure(figsize=(8, 6))
-    plt.pcolormesh(temp_xx, temp_yy, np.reshape(plt_data["boxlib", 'Temp'].to_value(), (ddt_bin_size, ddt_bin_size)),
-                   cmap='gist_heat', shading='auto')
-    plt.colorbar(label='Temperature')
-    plt.xlabel('x')
-    plt.ylabel('y')
-    plt.show()
-    """
-    # Step 4:
-    result_dict = {}
-    result_dict['Time'] = time
-
-    # Step 4.1: Collect the PeleC Domain Information
-    result_dict['PeleC'] = {}
-    result_dict['PeleC']['Position'] = np.empty((ddt_bin_size, ddt_bin_size), dtype=object)
-    if processing_flags['PeleC Processing'].get('Temperature', False):
-        result_dict['PeleC']['Temperature'] = np.empty((ddt_bin_size, ddt_bin_size))
-    if processing_flags['PeleC Processing'].get('Pressure', False):
-        result_dict['PeleC']['Pressure'] = np.empty((ddt_bin_size, ddt_bin_size))
-    if processing_flags['PeleC Processing'].get('Density', False):
-        result_dict['PeleC']['Density'] = np.empty((ddt_bin_size, ddt_bin_size))
-    if processing_flags['PeleC Processing'].get('Species', False):
-        result_dict['PeleC']['Species'] = np.empty((ddt_bin_size, ddt_bin_size), dtype=object)
-    if processing_flags['PeleC Processing'].get('Heat Release Rate Cantera', False):
-        result_dict['PeleC']['Heat Release Rate Cantera'] = np.empty((ddt_bin_size, ddt_bin_size))
-    if processing_flags['PeleC Processing'].get('Heat Release Rate PeleC', False):
-        result_dict['PeleC']['Heat Release Rate PeleC'] = np.empty((ddt_bin_size, ddt_bin_size))
-    if processing_flags['PeleC Processing'].get('Max Heat Release Rate Cantera', False):
-        result_dict['PeleC']['Max Heat Release Rate Cantera'] = np.empty((ddt_bin_size, ddt_bin_size))
-    if processing_flags['PeleC Processing'].get('Max Heat Release Rate PeleC', False):
-        result_dict['PeleC']['Max Heat Release Rate PeleC'] = np.empty((ddt_bin_size, ddt_bin_size))
-
-    if processing_flags['Comparison Type'].get('Ignition Delay Pressure', False):
-        result_dict['Ignition Delay Pressure'] = np.empty((ddt_bin_size, ddt_bin_size), dtype=object)
-
-    if processing_flags['Comparison Type'].get('Ignition Delay Volume', False):
-        result_dict['Ignition Delay Volume'] = np.empty((ddt_bin_size, ddt_bin_size), dtype=object)
-
-    if processing_flags['Comparison Type'].get('Flame', False):
-        result_dict['Flame'] = np.empty((ddt_bin_size, ddt_bin_size), dtype=object)
-
-    for i, x_value in enumerate(np.arange(ddt_idx[0] - (ddt_bin_size // 2) - 1, ddt_idx[0] + (ddt_bin_size // 2))):
-        for j, y_value in enumerate(np.arange(ddt_idx[1] - (ddt_bin_size // 2) - 1, ddt_idx[1] + (ddt_bin_size // 2))):
-            result_dict['PeleC']['Position'][i, j] = [
-                np.rot90(np.reshape(plt_data["boxlib", 'x'].to_value(), (ddt_bin_size, ddt_bin_size)))[i, j],
-                np.rot90(np.reshape(plt_data["boxlib", 'y'].to_value(), (ddt_bin_size, ddt_bin_size)))[i, j]]
-
-            if processing_flags['PeleC Processing'].get('Temperature', False):
-                result_dict['PeleC']['Temperature'][i, j] = \
-                np.rot90(np.reshape(plt_data["boxlib", 'Temp'].to_value(), (ddt_bin_size, ddt_bin_size)))[i, j]
-
-            if processing_flags['PeleC Processing'].get('Pressure', False):
-                result_dict['PeleC']['Pressure'][i][j] = 10 * np.rot90(
-                    np.reshape(plt_data["boxlib", 'pressure'].to_value(), (ddt_bin_size, ddt_bin_size)))[i, j]
-
-            if processing_flags['PeleC Processing'].get('Density', False):
-                result_dict['PeleC']['Density'][i][j] = 1000 * np.rot90(
-                    np.reshape(plt_data["boxlib", 'density'].to_value(), (ddt_bin_size, ddt_bin_size)))[i, j]
-
-            if processing_flags['PeleC Processing'].get('Species', False):
-                species_comp = {}
-                for k in range(len(input_params.species)):
-                    species_comp.update({str(input_params.species[k]): np.rot90(
-                        np.reshape(plt_data["boxlib", str("Y(" + input_params.species[k] + ")")].to_value(),
-                                   (ddt_bin_size, ddt_bin_size)))[i, j]})
-                result_dict['PeleC']['Species'][i][j] = species_comp
-            """
-            if processing_flags['PeleC Processing'].get('Heat Release Rate Cantera', False) or processing_flags['PeleC Processing'].get('Heat Release Rate PeleC', False):
-                try:
-                    result_dict['Flame']['Heat Release Rate PeleC'] = raw_data["boxlib", str('heatRelease')][sort_arr].to_value()
-                    result_dict['Flame']['Max Heat Release Rate PeleC'] = max(result_dict['Flame']['Heat Release Rate'])
-                except:
-                    [result_dict['Flame']['Heat Release Rate'], result_dict['Flame']['Max Heat Release Rate']] = heat_release_rate_function(plt_data, sort_arr, input_params)
-
-                [result_dict['PeleC']['Heat Release Rate'][i], result_dict['PeleC']['Max Heat Release Rate'][i]] = heat_release_rate_function(plt_data, (x_value, y_value), input_params)
-            """
-            # Step 4.2: Constant Pressure Ignition Delay Processing
-            if processing_flags['Comparison Type'].get('Ignition Delay Pressure', False):
-                # Step 4.2.1: Calculate the ignition behavior for a given initial state
-                try:
-                    result_dict['Ignition Delay Pressure'][i, j] = cantera_ignition_function(plt_data, (i, j),
-                                                                                             processing_flags,
-                                                                                             input_params)
-                except:
-                    result_dict['Ignition Delay Pressure'][i, j] = None
-
-            # Step 4.3: Constant Volume Ignition Delay Processing
-            if processing_flags['Comparison Type'].get('Ignition Delay Volume', False):
-                # Step 4.3.1: Calculate the ignition behavior for a given initial state
-                try:
-                    result_dict['Ignition Delay Volume'][i, j] = cantera_ignition_function(plt_data, (i, j),
-                                                                                           processing_flags,
-                                                                                           input_params,
-                                                                                           reactor_type='Volume')
-                except:
-                    result_dict['Ignition Delay Volume'][i, j] = None
-
-            # Step 4.4: Flame Processing
-            if processing_flags['Comparison Type'].get('Flame', False):
-                # Step 4.4.1: Calculate the flame behavior for a given initial state
-                try:
-                    # result_dict['Flame'][i,j] = run_with_timeout(function_timeout, cantera_flame_function, plt_data, (i, j), processing_flags, input_params)
-                    result_dict['Flame'][i, j] = cantera_flame_function(plt_data, (i, j), processing_flags,
-                                                                        input_params)
-                except:
-                    result_dict['Flame'][i, j] = None
-
-    return result_dict
-
-
-def pelec_processing_function(plt_dir, domain_info, input_params, check_flags, output_dir=None):
-    def parallel_processing_function(iter_arr, const_list, predicate, nProcs):
-        """
-
-        :param iter_arr:
-        :param const_list:
-        :param predicate:
-        :param nProcs:
-        :return:
-        """
-        # Perform the multiprocessing
-        with multiprocessing.Pool(
-                processes=nProcs, initargs=()
-        ) as pool:
-            y = pool.map(predicate,
-                         zip(iter_arr,
-                             itertools.repeat(const_list)))
-        return y
-
+def pelec_processing_function(plt_dir, domain_info, animation_bnd_arr, check_flags, output_dir):
     def file_output(file_path, smoothing_check):
         # Step 1: Dynamically create the text file header depending on the assigned flags
         header_data = ["Time [s]"]
@@ -1725,7 +1500,7 @@ def pelec_processing_function(plt_dir, domain_info, input_params, check_flags, o
         if check_flags['Flame Processing'].get('Heat Release Rate Cantera', False):
             header_data.extend(["Max Heat Release Rate Cantera [W/m3]"])
         if check_flags['Flame Processing'].get('Heat Release Rate PeleC', False):
-            header_data.extend(["Max Heat Release Rate PeleC [W/m3]"])
+            header_data.extend(["Max Heat Release Rate PeleC [egs/cm3]"])
         # Flame Thickness
         if check_flags['Flame Processing'].get('Flame Thickness', False):
             header_data.extend(["Flame Thickness [m]"])
@@ -1881,8 +1656,7 @@ def pelec_processing_function(plt_dir, domain_info, input_params, check_flags, o
     """
     # Step 1:
     print('Starting Raw Data Loading and Processing')
-    plt_result = parallel_processing_function(plt_dir,
-                                              (check_flags, [plt_dir[0], plt_dir[-1]], domain_info, input_params,),
+    plt_result = parallel_processing_function(plt_dir, (check_flags, animation_bnd_arr, domain_info, output_dir,),
                                               single_pltfile_processing, n_proc)
     print('Completed Raw Data Loading and Processing')
 
@@ -1908,7 +1682,12 @@ def pelec_processing_function(plt_dir, domain_info, input_params, check_flags, o
                 collective_results['Flame']['Position']) / np.gradient(collective_results['Time']['Value'])
         # Step 3.2: Relative Velocity
         if check_flags['Flame Processing'].get('Relative Velocity', False):
-            print('ERROR: Relative Velocity is still a work in progress')
+            if check_flags['Flame Processing'].get('Velocity', False):
+                collective_results['Flame']['Relative Velocity'] = collective_results['Flame']['Velocity'] - \
+                                                                   collective_results['Flame']['Gas Velocity']
+            else:
+                print('ERROR: Must Enable Velocity Flag to compute the relative velocity')
+
         # Step 3.3: Data Smoothing
         if check_flags['Flame Processing'].get('Smoothing', False) and check_flags['Flame Processing'].get('Position',
                                                                                                            False):
@@ -1991,112 +1770,14 @@ def pelec_processing_function(plt_dir, domain_info, input_params, check_flags, o
             smoothing_function(collective_results, 'Post-Shock', 'Thermodynamic State')
 
         print('Completed Post-Shock Processing')
-    # Step 7: Create Variable Evolution
-    if 'Domain State Animations' in check_flags:
-        print('Starting Animation Processing')
-        # Step :
-        animation_dir = ensure_long_path_prefix(os.path.join(os.path.dirname(os.path.realpath(__file__)),
-                                                             f"Processed-Global-Results"))
 
-        if check_flags['Domain State Animations'].get('Flame Spectrum', False):
-            # Create directory for plt files
-            temp_plt_dir = ensure_long_path_prefix(
-                os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
-                             f"Flame-Contour-FFT-Plt-Files"))
-
-            # Create the animation file
-            createVariableAnimation(temp_plt_dir,
-                                    os.path.join(animation_dir, 'Flame-Frequency-Evolution-Animation.mp4'), fps=15)
-
-        if check_flags['Domain State Animations'].get('Temperature', False):
-            # Create directory for plt files
-            temp_plt_dir = ensure_long_path_prefix(
-                os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
-                             f"Animation-Frames", f"Temp-Plt-Files"))
-
-            # Create the animation file
-            createVariableAnimation(temp_plt_dir,
-                                    os.path.join(animation_dir, 'Temperature-Evolution-Animation.mp4'), fps=15)
-
-        if check_flags['Domain State Animations'].get('Pressure', False):
-            # Create directory for plt files
-            temp_plt_dir = ensure_long_path_prefix(
-                os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
-                             f"Animation-Frames", f"pressure-Plt-Files"))
-
-            # Create the animation file
-            createVariableAnimation(temp_plt_dir,
-                                    os.path.join(animation_dir, 'Pressure-Evolution-Animation.mp4'), fps=15)
-
-        if check_flags['Domain State Animations'].get('Velocity', False):
-            # Create directory for plt files
-            temp_plt_dir = ensure_long_path_prefix(
-                os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
-                             f"Animation-Frames", f"x_velocity-Plt-Files"))
-
-            # Create the animation file
-            createVariableAnimation(temp_plt_dir,
-                                    os.path.join(animation_dir, 'X-Velocity-Evolution-Animation.mp4'), fps=15)
-
-        if check_flags['Domain State Animations'].get('Species', False):
-            for i in range(len(input_params.species)):
-                temp_plt_dir = ensure_long_path_prefix(
-                    os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
-                                 f"Animation-Frames", f"Y({str(input_params.species[i])})-Plt-Files"))
-
-                # Create the animation file
-                createVariableAnimation(temp_plt_dir,
-                                        os.path.join(animation_dir,
-                                                     f"Y({str(input_params.species[i])})-Evolution-Animation.mp4"),
-                                        fps=15)
-
-        if check_flags['Domain State Animations'].get('Heat Release Rate Cantera', False):
-            # Create directory for plt files
-            temp_plt_dir = ensure_long_path_prefix(
-                os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
-                             f"Animation-Frames", f"HRR-Cantera-Plt-Files"))
-
-            # Create the animation file
-            createVariableAnimation(temp_plt_dir,
-                                    os.path.join(animation_dir, 'HRR-Cantera-Evolution-Animation.mp4'), fps=15)
-
-        if check_flags['Domain State Animations'].get('Heat Release Rate PeleC', False):
-            # Create directory for plt files
-            temp_plt_dir = ensure_long_path_prefix(
-                os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
-                             f"Animation-Frames", f"HRR-PeleC-Plt-Files"))
-
-            # Create the animation file
-            createVariableAnimation(temp_plt_dir,
-                                    os.path.join(animation_dir, 'HRR-Cantera-Evolution-Animation.mp4'), fps=15)
-
-        if check_flags['Domain State Animations'].get('Flame Thickness', False):
-            # Create directory for plt files
-            temp_plt_dir = ensure_long_path_prefix(
-                os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
-                             f"Animation-Frames", f"Flame-Thickness-Plt-Files"))
-
-            # Create the animation file
-            createVariableAnimation(temp_plt_dir,
-                                    os.path.join(animation_dir, 'Flame-Thickness-Evolution-Animation.mp4'), fps=15)
-
-        if check_flags['Domain State Animations'].get('Combined', False):
-            temp_plt_dir = ensure_long_path_prefix(
-                os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
-                             f"Animation-Frames", f"{check_flags['Domain State Animations']['Combined'][0]}-"
-                                                  f"{check_flags['Domain State Animations']['Combined'][1]}-Plt-Files"))
-
-            # Create the animation file
-            createVariableAnimation(temp_plt_dir, os.path.join(animation_dir,
-                                                               f"{check_flags['Domain State Animations']['Combined'][0]}"
-                                                               f"-{check_flags['Domain State Animations']['Combined'][1]}-Evolution-Animation.mp4"),
-                                    fps=15)
-
-        print('Completed Animation Processing')
     # Step 4: Write to file, if any of the sub-dictionary values except 'Domain State Animations' are true
+    print('Start Output File Writing')
     for key, sub_dict in check_flags.items():
         if 'Smoothing' in sub_dict and sub_dict['Smoothing'] == True:
             smoothing_flag = True
+        else:
+            smoothing_flag = False
         if key != 'Domain State Animations':
             if any(sub_dict.values()):  # If any value is True
                 write_to_file = True
@@ -2109,285 +1790,36 @@ def pelec_processing_function(plt_dir, domain_info, input_params, check_flags, o
 
         for master_key, sub_dict in check_flags.items():
             if 'Smoothing' in sub_dict and sub_dict['Smoothing'] == True:
-                file_output(ensure_long_path_prefix(os.path.join(output_dir, 'Wave-Tracking-Smooth-Results.txt')), True)
+                file_output(ensure_long_path_prefix(os.path.join(output_dir, 'Wave-Tracking-Smooth-Results.txt')),
+                            True)
+    print('Completed Output File Writing')
 
-    return
+    # Step 7: Create Variable Evolution
+    print('Starting Animation Processing')
+    if 'Domain State Animations' in check_flags:
+        plot_check = check_flags.get('Domain State Animations', {})
 
+        for key, value in plot_check.items():
+            if isinstance(value, (np.ndarray, list, tuple)):
+                bool_check = value[0]
+                pelec_key = value[1]
+            else:
+                bool_check = value
+                pelec_key = None
 
-def pelec_ddt_processing_function(ddt_pltFile, plt_dir, domain_info, input_params, check_flags, output_dir=False):
-    def parallel_processing_function(iter_arr, const_list, predicate, nProcs):
-        """
+            if bool_check:
+                # Create directory for plt files
+                temp_plt_dir = ensure_long_path_prefix(
+                    os.path.join(output_dir, f"Animation-Frames", f"{key}-Plt-Files"))
 
-        :param iter_arr:
-        :param const_list:
-        :param predicate:
-        :param nProcs:
-        :return:
-        """
-        # Perform the multiprocessing
-        with multiprocessing.Pool(
-                processes=nProcs, initargs=()
-        ) as pool:
-            y = pool.map(predicate,
-                         zip(iter_arr,
-                             itertools.repeat(const_list)))
-        return y
+                state_animation(
+                    method='Animate',
+                    folder_path=temp_plt_dir,
+                    animation_filename=ensure_long_path_prefix(
+                        os.path.join(output_dir, f"{key}-Evolution-Animation.mp4")),
+                )
 
-    def file_output(file_path, spatial_cell, time_step, result_type=None):
-        # Step 1: Dynamically create the text file header depending on the assigned flags
-        if result_type == 'PeleC':
-            header_data = ["Time [s]"]
-            if check_flags['PeleC Processing'].get('Temperature', False):
-                header_data.extend(["Temperature [K]"])
-            if check_flags['PeleC Processing'].get('Pressure', False):
-                header_data.extend(["Pressure [Pa]"])
-            if check_flags['PeleC Processing'].get('Density', False):
-                header_data.extend(["Density [kg/m3]"])
-            if check_flags['PeleC Processing'].get('Species', False):
-                for i in range(len(input_params.species)):
-                    header_data.extend([f"Y({str(input_params.species[i])})"])
-            if check_flags['PeleC Processing'].get('Heat Release Rate Cantera', False):
-                header_data.extend(["Heat Release Rate Cantera [W/m3]"])
-
-            if check_flags['PeleC Processing'].get('Heat Release Rate PeleC', False):
-                header_data.extend(["Heat Release Rate PeleC [W/m3]"])
-
-        elif result_type == 'Ignition Delay Pressure' or result_type == 'Ignition Delay Volume':
-            header_data = ["Time [s]"]
-            if check_flags['Ignition Delay Processing'].get('Temperature', False):
-                header_data.extend(["Temperature [K]"])
-            if check_flags['Ignition Delay Processing'].get('Pressure', False):
-                header_data.extend(["Pressure [Pa]"])
-            if check_flags['Ignition Delay Processing'].get('Density', False):
-                header_data.extend(["Density [kg/m3]"])
-            if check_flags['Ignition Delay Processing'].get('Species', False):
-                for i in range(len(input_params.species)):
-                    header_data.extend([f"Y({str(input_params.species[i])})"])
-            if check_flags['Ignition Delay Processing'].get('Heat Release Rate Cantera', False):
-                header_data.extend(["Heat Release Rate Cantera [W/m3]"])
-
-        elif result_type == 'Flame':
-            header_data = ["Position [m]"]
-            if check_flags['Flame Processing'].get('Temperature', False):
-                header_data.extend(["Temperature [K]"])
-            if check_flags['Flame Processing'].get('Pressure', False):
-                header_data.extend(["Pressure [Pa]"])
-            if check_flags['Flame Processing'].get('Density', False):
-                header_data.extend(["Density [kg/m3]"])
-            if check_flags['Flame Processing'].get('Velocity', False):
-                header_data.extend(["Velocity [m/s]"])
-            if check_flags['Flame Processing'].get('Species', False):
-                for i in range(len(input_params.species)):
-                    header_data.extend([f"Y({str(input_params.species[i])})"])
-            if check_flags['Flame Processing'].get('Heat Release Rate Cantera', False):
-                header_data.extend(["Heat Release Rate Cantera [W/m3]"])
-
-        #
-        with (open(ensure_long_path_prefix(file_path), "w") as outfile):
-            outfile.write("#")
-            for i in range(len(header_data)):
-                outfile.write("{0:<55.0f} ".format(int(i + 1)))
-            outfile.write("\n#")
-            for i in range(len(header_data)):
-                outfile.write("{0:<55s} ".format(header_data[i]))
-            outfile.write("\n")
-
-            if result_type == 'PeleC':
-                for i in range(len(plt_result)):
-                    outfile.write(" {0:<55e}".format(plt_result[i]['Time']))
-                    # Temperature
-                    if check_flags['PeleC Processing'].get('Temperature', False):
-                        outfile.write(" {0:<55e}".format(plt_result[i]['PeleC']['Temperature'][spatial_cell]))
-                    # Pressure
-                    if check_flags['PeleC Processing'].get('Pressure', False):
-                        outfile.write(" {0:<55e}".format(plt_result[i]['PeleC']['Pressure'][spatial_cell]))
-                    # Density
-                    if check_flags['PeleC Processing'].get('Density', False):
-                        outfile.write(" {0:<55e}".format(plt_result[i]['PeleC']['Density'][spatial_cell]))
-                    # Species
-                    if check_flags['PeleC Processing'].get('Species', False):
-                        for j in range(len(input_params.species)):
-                            outfile.write(" {0:<55e}".format(plt_result[i]['PeleC']['Species'][spatial_cell]))
-                    # Heat Release Rate
-                    if check_flags['PeleC Processing'].get('Heat Release Rate Cantera', False):
-                        outfile.write(
-                            " {0:<55e}".format(plt_result[i]['PeleC']['Max Heat Release Rate Cantera'][spatial_cell]))
-
-                    if check_flags['PeleC Processing'].get('Heat Release Rate PeleC', False):
-                        outfile.write(
-                            " {0:<55e}".format(plt_result[i]['PeleC']['Max Heat Release Rate PeleC'][spatial_cell]))
-
-                    outfile.write("\n")
-
-            elif result_type == 'Ignition Delay Pressure' or result_type == 'Ignition Delay Volume':
-                if result_type == 'Ignition Delay Pressure':
-                    for i in range(len(plt_result[time_step]['Ignition Delay Pressure'][spatial_cell]['Time'])):
-                        outfile.write(" {0:<55e}".format(
-                            plt_result[time_step]['Ignition Delay Pressure'][spatial_cell]['Time'][i]))
-                        # Temperature
-                        if check_flags['Ignition Delay Processing'].get('Temperature', False):
-                            outfile.write(" {0:<55e}".format(
-                                plt_result[time_step]['Ignition Delay Pressure'][spatial_cell]['Temperature'][i]))
-                        # Pressure
-                        if check_flags['Ignition Delay Processing'].get('Pressure', False):
-                            outfile.write(" {0:<55e}".format(
-                                plt_result[time_step]['Ignition Delay Pressure'][spatial_cell]['Pressure'][i]))
-                        # Density
-                        if check_flags['Ignition Delay Processing'].get('Density', False):
-                            outfile.write(" {0:<55e}".format(
-                                plt_result[time_step]['Ignition Delay Pressure'][spatial_cell]['Density'][i]))
-                        # Species
-                        if check_flags['Ignition Delay Processing'].get('Species', False):
-                            for j in range(len(input_params.species)):
-                                outfile.write(" {0:<55e}".format(
-                                    plt_result[time_step]['Ignition Delay Pressure'][spatial_cell]['Species'][j]))
-                        # Heat Release Rate
-                        if check_flags['Ignition Delay Processing'].get('Heat Release Rate Cantera', False):
-                            outfile.write(" {0:<55e}".format(
-                                plt_result[time_step]['Ignition Delay Pressure'][spatial_cell][
-                                    'Max Heat Release Rate Cantera'][i]))
-
-                        outfile.write("\n")
-                if result_type == 'Ignition Delay Volume':
-                    for i in range(len(plt_result[time_step]['Ignition Delay Volume'][spatial_cell]['Time'])):
-                        outfile.write(
-                            " {0:<55e}".format(plt_result[time_step]['Ignition Delay Volume'][spatial_cell]['Time'][i]))
-                        # Temperature
-                        if check_flags['Ignition Delay Processing'].get('Temperature', False):
-                            outfile.write(" {0:<55e}".format(
-                                plt_result[time_step]['Ignition Delay Volume'][spatial_cell]['Temperature'][i]))
-                        # Pressure
-                        if check_flags['Ignition Delay Processing'].get('Pressure', False):
-                            outfile.write(" {0:<55e}".format(
-                                plt_result[time_step]['Ignition Delay Volume'][spatial_cell]['Pressure'][i]))
-                        # Density
-                        if check_flags['Ignition Delay Processing'].get('Density', False):
-                            outfile.write(" {0:<55e}".format(
-                                plt_result[time_step]['Ignition Delay Volume'][spatial_cell]['Density'][i]))
-                        # Species
-                        if check_flags['Ignition Delay Processing'].get('Species', False):
-                            for j in range(len(input_params.species)):
-                                outfile.write(" {0:<55e}".format(
-                                    plt_result[time_step]['Ignition Delay Volume'][spatial_cell]['Species'][j]))
-                        # Heat Release Rate
-                        if check_flags['Ignition Delay Processing'].get('Heat Release Rate Cantera', False):
-                            outfile.write(" {0:<55e}".format(
-                                plt_result[time_step]['Ignition Delay Volume'][spatial_cell][
-                                    'Max Heat Release Rate Cantera'][i]))
-
-                        outfile.write("\n")
-            elif result_type == 'Flame':
-                for i in range(len(plt_result[time_step]['Flame'][spatial_cell]['Grid'])):
-                    outfile.write(" {0:<55e}".format(plt_result[time_step]['Flame'][spatial_cell]['Grid'][i]))
-                    # Temperature
-                    if check_flags['Ignition Delay Processing'].get('Temperature', False):
-                        outfile.write(
-                            " {0:<55e}".format(plt_result[time_step]['Flame'][spatial_cell]['Temperature'][i]))
-                    # Pressure
-                    if check_flags['Ignition Delay Processing'].get('Pressure', False):
-                        outfile.write(" {0:<55e}".format(plt_result[time_step]['Flame'][spatial_cell]['Pressure']))
-                    # Density
-                    if check_flags['Ignition Delay Processing'].get('Density', False):
-                        outfile.write(" {0:<55e}".format(plt_result[time_step]['Flame'][spatial_cell]['Density'][i]))
-                    # Velocity
-                    if check_flags['Ignition Delay Processing'].get('Velocity', False):
-                        outfile.write(" {0:<55e}".format(plt_result[time_step]['Flame'][spatial_cell]['Velocity'][i]))
-                    # Species
-                    if check_flags['Ignition Delay Processing'].get('Species', False):
-                        for j in range(len(input_params.species)):
-                            outfile.write(
-                                " {0:<55e}".format(plt_result[time_step]['Flame'][spatial_cell]['Species'][j]))
-                    # Heat Release Rate
-                    if check_flags['Ignition Delay Processing'].get('Heat Release Rate Cantera', False):
-                        outfile.write(" {0:<55e}".format(
-                            plt_result[time_step]['Flame'][spatial_cell]['Max Heat Release Rate Cantera'][i]))
-
-                    outfile.write("\n")
-            outfile.close()
-            return
-
-    # Step 1: Determine the location of DDT
-    temp_plt_data = yt.load(ddt_pltFile)
-    max_level = temp_plt_data.index.max_level
-
-    # Create sudo-grid at the maximum level present
-    temp_ddt_data = temp_plt_data.covering_grid(level=max_level,
-                                                left_edge=[0.0, 0.0, 0.0],
-                                                dims=temp_plt_data.domain_dimensions * [2 ** max_level, 2 ** max_level,
-                                                                                        1],
-                                                # And any fields to preload (this is optional!)
-                                                # fields=desired_varables
-                                                )
-
-    # Find max pressure location
-    ddt_idx = np.unravel_index(np.argmax(temp_ddt_data["boxlib", 'density'].to_value(), axis=None),
-                               temp_ddt_data["boxlib", 'density'].to_value().shape)
-    del temp_plt_data, temp_ddt_data
-    # Step 1:
-    print('Starting Raw Data Loading and Processing')
-    plt_time_dir = plt_dir[
-                   plt_dir.index(ddt_pltFile) - check_flags['Processing Parameters']['Time Window'][0]:plt_dir.index(
-                       ddt_pltFile) + check_flags['Processing Parameters']['Time Window'][1]]
-    plt_result = parallel_processing_function(plt_time_dir, (
-    ddt_idx, domain_info[-1], check_flags, [plt_dir[0], plt_dir[-1]], input_params,), single_ddt_pltfile_processing,
-                                              n_proc)
-    print('Completed Raw Data Loading and Processing')
-
-    # Step 2:
-    if check_flags['Comparison Type'].get('Ignition Delay Pressure', False):
-        file_path = os.path.join(output_dir, f"Processed-DDT-Results", f"Ignition-Delay-Pressure-Plots")
-        if os.path.exists(file_path) is False:
-            os.mkdir(file_path)
-
-        createAnchoredPlotFrame(plt_result, input_params, comp_var='Ignition Delay Pressure', fixed_var='Temperature',
-                                fixed_val=2000, output_path=file_path)
-
-    if check_flags['Comparison Type'].get('Ignition Delay Volume', False):
-        file_path = os.path.join(output_dir, f"Processed-DDT-Results", f"Ignition-Delay-Volume-Plots")
-        if os.path.exists(file_path) is False:
-            os.mkdir(file_path)
-
-        createAnchoredPlotFrame(plt_result, input_params, comp_var='Ignition Delay Volume', fixed_var='Temperature',
-                                fixed_val=2000, output_path=file_path)
-
-    if check_flags['Comparison Type'].get('Flame', False):
-        file_path = os.path.join(output_dir, f"Processed-DDT-Results", f"Flame-Plots")
-        if os.path.exists(file_path) is False:
-            os.mkdir(file_path)
-
-        createAnchoredPlotFrame(plt_result, input_params, comp_var='Flame', fixed_var='Temperature', fixed_val=2000,
-                                output_path=file_path)
-
-    # Step 3:
-    if os.path.exists(os.path.join(output_dir, f"Processed-DDT-Results")) is False:
-        os.mkdir(os.path.join(output_dir, f"Processed-DDT-Results"))
-
-    for spatial_cell in range(check_flags['Processing Parameters']['Spatial Window']):
-        if os.path.exists(
-                os.path.join(os.path.join(output_dir, f"Processed-DDT-Results", f"Cell-{spatial_cell}"))) is False:
-            os.mkdir(
-                ensure_long_path_prefix(os.path.join(output_dir, f"Processed-DDT-Results", f"Cell-{spatial_cell}")))
-
-        if check_flags['Comparison Type'].get('PeleC', False):
-            file_output(
-                os.path.join(output_dir, f"Processed-DDT-Results", f"Cell-{spatial_cell}", f"PeleC-Results.dat"),
-                spatial_cell, None, result_type='PeleC')
-
-        for time_step in range(0, np.sum(check_flags['Processing Parameters']['Time Window'])):
-            if check_flags['Comparison Type'].get('Ignition Delay Pressure', False):
-                file_output(os.path.join(output_dir, f"Processed-DDT-Results", f"Cell-{spatial_cell}",
-                                         f"Ignition-Delay-Const-Pressure-Time-Step-{time_step}.dat"),
-                            spatial_cell, time_step, result_type='Ignition Delay Pressure')
-
-            if check_flags['Comparison Type'].get('Ignition Delay Volume', False):
-                file_output(os.path.join(output_dir, f"Processed-DDT-Results", f"Cell-{spatial_cell}",
-                                         f"Ignition-Delay-Const-Volume-Time-Step-{time_step}.dat"),
-                            spatial_cell, time_step, result_type='Ignition Delay Volume')
-
-            if check_flags['Comparison Type'].get('Flame', False):
-                file_output(os.path.join(output_dir, f"Processed-DDT-Results", f"Cell-{spatial_cell}",
-                                         f"Flame-Time-Step-{time_step}.dat"),
-                            spatial_cell, time_step, result_type='Flame')
+        print('Completed Animation Processing')
 
     return
 
@@ -2401,7 +1833,7 @@ def main():
     ####################################################################################################################
     # Step 0: Set all the desired tasks to be performed bny the python script
     skip_load = 0
-    row_index = "Middle"  # Desired row location for data collection
+    row_index = "Center"  # Desired row location for data collection
     ddt_plt_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'Raw-PeleC-Data', 'plt308219')
 
     check_flag_dict = {
@@ -2409,17 +1841,17 @@ def main():
             'Position': True,
             'Velocity': True,
             'Relative Velocity': False,
-            'Thermodynamic State': True,
-            'Heat Release Rate Cantera': True,
-            'Heat Release Rate PeleC': True,
-            'Flame Thickness': True,
-            'Surface Length': True,
-            'Smoothing': True
+            'Thermodynamic State': False,
+            'Heat Release Rate Cantera': False,
+            'Heat Release Rate PeleC': False,
+            'Flame Thickness': False,
+            'Surface Length': False,
+            'Smoothing': False
         },
         'Leading Shock Processing': {
-            'Position': True,
-            'Velocity': True,
-            'Smoothing': True
+            'Position': False,
+            'Velocity': False,
+            'Smoothing': False
         },
         'Maximum Pressure Processing': {
             'Position': False,
@@ -2427,86 +1859,47 @@ def main():
             'Smoothing': False
         },
         'Pre-Shock Processing': {
-            'Thermodynamic State': True,
-            'Smoothing': True
+            'Thermodynamic State': False,
+            'Smoothing': False
         },
         'Post-Shock Processing': {
-            'Thermodynamic State': True,
-            'Smoothing': True
+            'Thermodynamic State': False,
+            'Smoothing': False
         },
         'Domain State Animations': {
-            'Temperature': False,
+            'Temperature': (True, 'Temp'),
+            'Pressure': (True, 'pressure'),
+            'Velocity': (False, 'x_velocity'),
+            'Species': False,
+            'Heat Release Rate Cantera': (False, None),
+            'Heat Release Rate PeleC': (False, None),
+            'Flame Thickness': (False, None),
+            'Combined': (('Temperature', 'Pressure'), ('Temp', 'pressure'))
+        },
+        'Local State Animations': {
+            'Temperature': True,
             'Pressure': False,
             'Velocity': False,
             'Species': False,
-            'Heat Release Rate Cantera': True,
-            'Heat Release Rate PeleC': True,
+            'Heat Release Rate Cantera': False,
+            'Heat Release Rate PeleC': False,
             'Flame Thickness': False,
             # 'Combined': ('Temp', 'pressure')
         }
     }
 
-    detonation_check_flag = {
-        'Processing Parameters': {
-            'Time Window': (7, 2),
-        },
-        'Comparison Type': {
-            'PeleC': True,
-            'Ignition Delay Pressure': False,
-            'Ignition Delay Volume': False,
-            'Flame': True
-        },
-        'PeleC Processing': {
-            'Temperature': True,
-            'Pressure': True,
-            'Density': True,
-            'Species': False,
-            'Heat Release Rate Cantera': False,
-            'Heat Release Rate PeleC': False
-        },
-        'Ignition Delay Processing': {
-            'Temperature': True,
-            'Pressure': True,
-            'Density': True,
-            'Species': False,
-            'Heat Release Rate Cantera': False
-        },
-        'Flame Processing': {
-            'Temperature': True,
-            'Pressure': True,
-            'Density': True,
-            'Velocity': True,
-            'Species': True,
-            'Heat Release Rate Cantera': False
-        }
-    }
-
     # Step 1: Initialize the code with the desired processed variables and mixture composition
-    input_params = MyClass()
-    input_params.T = 503.15
-    input_params.P = 10.0 * 100000
-    input_params.Phi = 1.0
-    input_params.Fuel = 'H2'
-    input_params.mech = 'Li-Dryer-H2-mechanism.yaml'
-    input_params.species = mechanism_species(input_params.mech)
-
-    if input_params.Fuel == "H2":
-        input_params.oxygenAmount = 0.5
-    if input_params.Fuel == "C2H6":
-        input_params.oxygenAmount = 3.5
-    if input_params.Fuel == "C4H10":
-        input_params.oxygenAmount = 6.5
-    input_params.nitrogenAmount = 0
-    input_params.X = {input_params.Fuel: input_params.Phi, 'O2': input_params.oxygenAmount,
-                      'N2': input_params.nitrogenAmount}
-
-    # Step 2: Create the result directories
-    dir_path = os.path.dirname(os.path.realpath(__file__))
-    if os.path.exists(os.path.join(dir_path, f"Processed-Global-Results")) is False:
-        os.mkdir(os.path.join(dir_path, f"Processed-Global-Results"))
-    output_dir_path = os.path.join(dir_path, f"Processed-Global-Results")
+    initialize_parameters(
+        T=503.15,
+        P=10.0 * 100000,
+        Phi=1.0,
+        Fuel='H2',
+        mech='Li-Dryer-H2-mechanism.yaml',
+    )
 
     # Step 3: Collect all the present pelec data directories
+    dir_path = os.path.dirname(os.path.realpath(__file__))
+
     time_data_dir = []
     for raw_data_folder in os.listdir(dir_path):
         if os.path.isdir(os.path.join(dir_path, raw_data_folder)) and raw_data_folder.startswith('Raw-PeleC'):
@@ -2522,13 +1915,57 @@ def main():
         updated_data_list = updated_data_list[0::skip_load]
 
     # Step 5: Determine the domain sizing parameters (size, # of cells)
-    domain_info = domain_size_parameters(updated_data_list[0], row_index)
+    if row_index == 'DDT':
+        domain_info = domain_size_parameters(ddt_plt_dir, row_index)
+    else:
+        domain_info = domain_size_parameters(updated_data_list[0], row_index)
 
-    # Step 6: Individual PltFile Processing
-    pelec_processing_function(updated_data_list, domain_info, input_params, check_flag_dict, output_dir=output_dir_path)
+    # Step 6: Create the result directories
+    if os.path.exists(os.path.join(dir_path, f"Processed-Global-Results")) is False:
+        os.mkdir(os.path.join(dir_path, f"Processed-Global-Results"))
+    output_dir_path = os.path.join(dir_path, f"Processed-Global-Results", f"y-{domain_info[1][0][1]:.3g}cm")
 
-    # Step 7:
-    # pelec_ddt_processing_function(ddt_plt_dir, updated_data_list, domain_info, input_params, detonation_check_flag, output_dir=output_dir_path)
+    # Step 7: Pre-determine the maximum value present in simulations using the DDT "frame" as the center of a bin
+    ddt_idx = updated_data_list.index(ddt_plt_dir)
+    temp_plt_files = updated_data_list[
+                     max(0, ddt_idx - plotting_bnds_bin):min(len(updated_data_list), ddt_idx + plotting_bnds_bin + 1)]
+    temp_max_arr = parallel_processing_function(temp_plt_files, (domain_info, check_flag_dict,), animation_bounds,
+                                                n_proc)
+
+    # Find the number of rows and columns (assuming all sub-arrays have the same structure)
+    n_rows = len(temp_max_arr[0])  # Number of rows (same for all sub-arrays)
+    n_cols = len(temp_max_arr)  # Number of sub-arrays
+    # Initialize an empty list to store final results
+    final_results = []
+    # Iterate over each row
+    for i in range(n_rows):
+        row_values_2nd_col = []
+        row_values_3rd_col = []
+        row_texts = []
+        # Extract the text and values from the 2nd and 3rd columns
+        for j in range(n_cols):
+            text = temp_max_arr[j][i][0]  # Extract the 'text' part
+            value_2nd_col = temp_max_arr[j][i][1]  # Extract the value from the 2nd column
+            value_3rd_col = temp_max_arr[j][i][2]  # Extract the value from the 3rd column
+
+            row_values_2nd_col.append(value_2nd_col)
+            row_values_3rd_col.append(value_3rd_col)
+            row_texts.append(text)
+        # Find the index of the min value in the 2nd column and max value in the 3rd column
+        min_index_2nd_col = row_values_2nd_col.index(min(row_values_2nd_col))
+        max_index_3rd_col = row_values_3rd_col.index(max(row_values_3rd_col))
+        # Retrieve the text, min value, and max value
+        min_text = row_texts[min_index_2nd_col]
+        min_value = row_values_2nd_col[min_index_2nd_col]
+        max_value = row_values_3rd_col[max_index_3rd_col]
+        # Append the final result as a list of [text, min value, max value]
+        final_results.append([min_text, min_value, max_value])
+
+    # Convert the result to a numpy array (optional)
+    animation_bnd_arr = np.array(final_results, dtype=object)
+
+    # Step 8: Individual PltFile Processing
+    pelec_processing_function(updated_data_list, domain_info, animation_bnd_arr, check_flag_dict, output_dir_path)
 
     return
 
