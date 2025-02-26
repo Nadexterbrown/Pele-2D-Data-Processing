@@ -3,6 +3,7 @@ from scipy.interpolate import RegularGridInterpolator, griddata
 from sklearn.neighbors import NearestNeighbors
 from scipy.spatial import cKDTree
 from sdtoolbox.thermo import soundspeed_fr
+from matplotlib.ticker import ScalarFormatter
 import matplotlib.animation as animation
 from matplotlib.tri import Triangulation
 import matplotlib.image as mpimg
@@ -16,12 +17,14 @@ yt.set_log_level(0)
 ########################################################################################################################
 # Global Program Setting Variables
 ########################################################################################################################
-version = 30
+version = 31
 
 flame_thickness_bin_size = 11
-flame_contour_temp = 2500
-plotting_bnds_bin = 3
+flame_temp = 2500
+plotting_bnds_bin = 5
 n_procs = 18
+
+data_set = 'PeleC'
 
 
 ########################################################################################################################
@@ -429,60 +432,68 @@ def plt_var_bnds(args):
 
     temp_plt_files = iter_var
     domain_info = kwargs.get('domain_info', [])
-    CHECK_FLAGS = kwargs.get('CHECK_FLAGS', [])
+    CHECK_FLAGS = kwargs.get('CHECK_FLAGS', {})
 
-    # Step 2: Create an array of the keys where the value is True
+    # Step 1: Extract the keys where the value is True (including support for combined flags)
     keys_with_true_values = [
-        key for key, value in CHECK_FLAGS['Domain State Animations'].items()
-        if key not in {'Combined', 'Flame Thickness', 'Surface Contour'} and (
-                (isinstance(value, (tuple, list, np.ndarray)) and value[0]) or
-                (isinstance(value, bool) and value) or
-                any(key in combined for combined in CHECK_FLAGS['Domain State Animations'].get('Combined', []))
-        )
+        key for key, value in CHECK_FLAGS.get('Domain State Animations', {}).items()
+        if key not in {'Combined', 'Flame Thickness', 'Surface Contour'}  # Exclude specific keys
+           and isinstance(value, dict)  # Ensure the value is a dictionary
+           and value.get('Flag', False)  # Check if the 'Flag' is True
     ]
-    # Step 2: Initialize the temp_max_val_arr with the same length as the number of True values in the dictionary
+
+    # Initialize the temp_bounds_arr to store bounds for each key
     temp_bounds_arr = np.empty((len(keys_with_true_values), 3), dtype=object)
 
-    # Step 3: Load data and collect the relevant parameters
+    # Step 2: Load data from the plot files using yt
     raw_data = yt.load(temp_plt_files)
     slice = raw_data.ray(
         np.array([domain_info[1][0][0], domain_info[1][0][1], 0.0]),
         np.array([domain_info[1][1][0], domain_info[1][1][1], 0.0])
     )
 
+    # Step 3: Loop through each variable and determine bounds
     for i, key in enumerate(keys_with_true_values):
-        if key == 'Temperature':
-            temp_arr = slice['boxlib', 'Temp'].to_value()
-            value_arr = convert_units(temp_arr, 'Temperature')
-        elif key == 'Pressure':
-            temp_arr = slice['boxlib', 'pressure'].to_value()
-            value_arr = convert_units(temp_arr, 'Pressure')
-        elif key == 'Velocity':
-            temp_arr = slice['boxlib', 'x_velocity'].to_value()
-            value_arr = convert_units(temp_arr, 'x_velocity')
-        elif key == 'Species':
-            print('Max Value Determination for Species is W.I.P.')
-            continue
-        elif key == 'Heat Release Rate Cantera':
-            temp_arr, _ = heat_release_rate_extractor('Cantera', plt_data=slice,
-                                                      sort_arr=np.argsort(slice['boxlib', 'x']))
-            value_arr = convert_units(temp_arr, 'Heat Release Rate Cantera')
-        elif key == 'Heat Release Rate PeleC':
-            try:
-                temp_arr, _ = heat_release_rate_extractor('PeleC', plt_data=slice,
-                                                          sort_arr=np.argsort(slice['boxlib', 'x']))
-                value_arr = convert_units(temp_arr, 'Heat Release Rate PeleC')
-            except:
+        try:
+            if key == 'Temperature':
+                temp_arr = slice['boxlib', 'Temp'].to_value()
+                value_arr = convert_units(temp_arr, 'Temperature')
+            elif key == 'Pressure':
+                temp_arr = slice['boxlib', 'pressure'].to_value()
+                value_arr = convert_units(temp_arr, 'Pressure')
+            elif key == 'Velocity':
+                temp_arr = slice['boxlib', 'x_velocity'].to_value()
+                value_arr = convert_units(temp_arr, 'x_velocity')
+            elif key == 'Species':
+                print('Max Value Determination for Species is W.I.P.')
+                continue
+            elif key == 'Heat Release Rate Cantera':
                 temp_arr, _ = heat_release_rate_extractor('Cantera', plt_data=slice,
                                                           sort_arr=np.argsort(slice['boxlib', 'x']))
                 value_arr = convert_units(temp_arr, 'Heat Release Rate Cantera')
-        else:
-            continue
+            elif key == 'Heat Release Rate PeleC':
+                try:
+                    temp_arr, _ = heat_release_rate_extractor('PeleC', plt_data=slice,
+                                                              sort_arr=np.argsort(slice['boxlib', 'x']))
+                    value_arr = convert_units(temp_arr, 'Heat Release Rate PeleC')
+                except:
+                    temp_arr, _ = heat_release_rate_extractor('Cantera', plt_data=slice,
+                                                              sort_arr=np.argsort(slice['boxlib', 'x']))
+                    value_arr = convert_units(temp_arr, 'Heat Release Rate Cantera')
+            else:
+                continue  # Skip if key is not recognized
 
-        # Step 3: Write bounds to value
-        temp_bounds_arr[i, 0] = key
-        temp_bounds_arr[i, 1] = np.min(value_arr)
-        temp_bounds_arr[i, 2] = np.max(value_arr)
+            # Step 4: Assign the min and max values for this variable
+            temp_bounds_arr[i, 0] = key
+            temp_bounds_arr[i, 1] = np.min(value_arr)
+            temp_bounds_arr[i, 2] = np.max(value_arr)
+
+        except KeyError as e:
+            print(f"Warning: Missing data for {key}. Skipping.")
+            continue
+        except Exception as e:
+            print(f"Error processing {key}: {e}")
+            continue
 
     return temp_bounds_arr
 
@@ -495,19 +506,19 @@ def animation_axis(plt_dirs, ddt_dir, ddt_plt_file, domain_info, CHECK_FLAGS):
 
     try:
         ddt_idx = plt_dirs.index(os.path.abspath(
-            os.path.join(os.path.dirname(os.path.realpath(__file__)), ddt_dir, 'Raw-PeleC-Data', ddt_plt_file)))
+            os.path.join(os.path.dirname(os.path.realpath(__file__)), ddt_dir, f'Raw-{data_set}-Data', ddt_plt_file)))
     except:
         print('DDT Folder not in current directory, finding appropriate files.')
         temp_dir_path = os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), ddt_dir))
         plt_dirs = [os.path.join(temp_dir_path, raw_data_folder, time_step)
                     for raw_data_folder in os.listdir(temp_dir_path)
                     if os.path.isdir(os.path.join(temp_dir_path, raw_data_folder)) and raw_data_folder.startswith(
-                'Raw-PeleC')
+                f'Raw-{data_set}')
                     for time_step in os.listdir(os.path.join(temp_dir_path, raw_data_folder))
                     if os.path.isdir(os.path.join(temp_dir_path, raw_data_folder, time_step)) and time_step.startswith(
                 'plt')]
         ddt_idx = plt_dirs.index(os.path.abspath(
-            os.path.join(os.path.dirname(os.path.realpath(__file__)), ddt_dir, 'Raw-PeleC-Data', ddt_plt_file)))
+            os.path.join(os.path.dirname(os.path.realpath(__file__)), ddt_dir, f'Raw-{data_set}-Data', ddt_plt_file)))
 
     temp_plt_files = plt_dirs[max(0, ddt_idx - plotting_bnds_bin):min(len(plt_dirs), ddt_idx + plotting_bnds_bin + 1)]
 
@@ -538,77 +549,167 @@ def state_animation(method, **kwargs):
     ###########################################
     # Internal Functions
     ###########################################
-    def plot_frame(reference_loc=None):
-        def plot_axis(ax, x_data, y_data, label, linestyle, color, ylabel, ylim, log_scale=False):
-            """Helper function to plot data on a single axis."""
-            ax.plot(x_data, y_data, label=label, linestyle=linestyle, color=color)
-            ax.set_ylabel(ylabel)
+    def plot_axis(ax, x_data, y_data, label, linestyle, color, ylabel, ylim=None):
+        """Helper function to plot data on a single axis."""
+        ax.plot(x_data, y_data, label=label, linestyle=linestyle, color=color)
+        ax.set_ylabel(ylabel)
+        if ylim is not None:
             ax.set_ylim(*ylim)
-            if log_scale:
-                ax.set_yscale('log')
-            ax.legend(loc='best')
 
+    def get_filtered_data(reference_loc, x_data_arr, y_data_arr):
+        if reference_loc is not None:
+            indices = np.where(
+                (x_data_arr >= x_data_arr[reference_loc] - reference_loc / 2) &
+                (x_data_arr <= x_data_arr[reference_loc] + reference_loc / 2)
+            )[0]
+            return x_data_arr[indices], y_data_arr[indices]
+        return x_data_arr, y_data_arr
+
+    def plot_single_dataset_frame(reference_loc=None):
         # Step 1: Create the figure and axes
-        fig, ax1 = plt.subplots()
+        fig, ax1 = plt.subplots(figsize=(10, 6))
         axes = [ax1]
 
-        def get_filtered_data(reference_loc, x_data_arr, y_data_arr):
-            if reference_loc is not None:
-                indices = np.where(
-                    (x_data_arr >= x_data_arr[reference_loc] - reference_loc / 2) &
-                    (x_data_arr <= x_data_arr[reference_loc] + reference_loc / 2)
-                )[0]
-                return x_data_arr[indices], y_data_arr[indices]
-            return x_data_arr, y_data_arr
+        # Step 2: Plot the data
+        tmp_x_data, tmp_y_data = get_filtered_data(reference_loc, x_data_arr, y_data_arr)
 
-        if isinstance(var_name, (np.ndarray, list, tuple)):
-            for i, obj in enumerate(var_name):
-                tmp_x_data, tmp_y_data = get_filtered_data(reference_loc, x_data_arr, y_data_arr)
-                if i == 0:
-                    plot_axis(ax=axes[0], x_data=tmp_x_data, y_data=tmp_y_data, label=obj, linestyle='-', color='k',
-                              ylabel=obj, ylim=(y_bounds[i][0], y_bounds[i][1]))
-                    ax1.set_xlabel('Position [cm]')
-                    ax1.grid(True, axis='x')
-                else:
-                    ax = ax1.twinx()
-                    ax.spines["right"].set_position(("outward", 60 * i))
-                    plot_axis(ax=ax, x_data=tmp_x_data, y_data=tmp_y_data, label=obj, linestyle='--', color=f"C{i}",
-                              ylabel=obj, ylim=(y_bounds[i][0], y_bounds[i][1]), log_scale=(obj == "pressure"))
-                    axes.append(ax)
-            title = " and ".join(var_name) + f" Variation at y = {domain_size[1][1][1]} cm and t = {time} s"
+        # Check for log scale (e.g., pressure, heat release rate)
+        is_log_scale = var_name in ['Pressure']
+
+        if y_bounds is not None:
+            plot_axis(ax=ax1, x_data=tmp_x_data, y_data=tmp_y_data,
+                      label=var_name, linestyle='-', color='k',
+                      ylabel=var_name, ylim=(y_bounds[0], y_bounds[1]))
         else:
-            tmp_x_data, tmp_y_data = get_filtered_data(reference_loc, x_data_arr, y_data_arr)
-            plot_axis(ax=ax1, x_data=tmp_x_data, y_data=tmp_y_data, label=var_name, linestyle='-', color='k',
-                      ylabel=var_name, ylim=(y_bounds[0], y_bounds[1]), log_scale=(var_name == "Pressure"))
-            title = f"{var_name} Variation at y = {domain_size[1][1][1]} cm and t = {time} s"
+            plot_axis(ax=ax1, x_data=tmp_x_data, y_data=tmp_y_data,
+                      label=var_name, linestyle='-', color='k',
+                      ylabel=var_name)
 
+        ax1.set_xlabel('Position [cm]')
+        ax1.set_ylabel(var_name)
+        ax1.grid(True, axis='x')
+
+        # Apply log scale if necessary
+        ax1.set_yscale('log' if is_log_scale else 'linear')
+
+        # Step 3: Set the title and axis labels
+        title = f"{var_name} Variation at y = {domain_size[1][1][1]} cm and t = {time} s"
         wrapped_title = "\n".join(textwrap.wrap(title, width=55))
         plt.suptitle(wrapped_title, ha="center")
 
         ax1.set_xlim(x_bounds if x_bounds is not None else (0, domain_size[1][1][0]))
-        plt.tight_layout()
 
+        # Step 4: Create filename and save plot
         formatted_time = f"{time:.16f}".rstrip('0').rstrip('.')
-        # Create filename and save plot
-        if isinstance(var_name, (np.ndarray, list, tuple)):
-            filename = os.path.join(output_dir_path, f"{'-'.join(var_name)}-Animation-Time-{formatted_time}.png")
-        else:
-            filename = os.path.join(output_dir_path, f"{var_name}-Animation-Time-{formatted_time}.png")
+        filename = os.path.join(output_dir_path, f"{var_name}-Animation-{plt_folder}.png")
 
+        plt.tight_layout()
         plt.savefig(filename, format='png')
         plt.close()
 
+    def plot_collective_dataset_frame(reference_loc=None):
+        # Step 1: Create the figure and axes
+        fig, ax1 = plt.subplots(figsize=(12, 8))  # Increased figure size for better spacing
+        axes = [ax1]
+
+        # Step 2: Plot each variable on its respective axis
+        for i, obj in enumerate(var_name):
+            tmp_x_data, tmp_y_data = get_filtered_data(reference_loc, x_data_arr, y_data_arr)
+
+            # Determine if log scale is needed
+            is_log_scale = obj in ['Pressure']
+
+            if i == 0:
+                # Plot the first variable on the main axis
+                if y_bounds is not None:
+                    plot_axis(ax=axes[0], x_data=tmp_x_data, y_data=tmp_y_data[i], label=obj, linestyle='-', color='k',
+                              ylabel=obj, ylim=(y_bounds[i][0], y_bounds[i][1]))
+                else:
+                    plot_axis(ax=axes[0], x_data=tmp_x_data, y_data=tmp_y_data[i], label=obj, linestyle='-', color='k',
+                              ylabel=obj)
+                ax1.set_xlabel('Position [cm]')
+                ax1.set_ylabel(obj)
+                ax1.grid(True, axis='x')
+                ax1.set_yscale('log' if is_log_scale else 'linear')  # Apply log scale if necessary
+            else:
+                # Create a new y-axis for additional variables
+                ax = ax1.twinx()
+                ax.spines["right"].set_position(("outward", 60 * (i - 1)))  # Offset each new axis outward
+                if y_bounds is not None:
+                    plot_axis(ax=ax, x_data=tmp_x_data, y_data=tmp_y_data[i], label=obj, linestyle='--', color=f"C{i}",
+                              ylabel=obj, ylim=(y_bounds[i][0], y_bounds[i][1]))
+                else:
+                    plot_axis(ax=ax, x_data=tmp_x_data, y_data=tmp_y_data[i], label=obj, linestyle='--', color=f"C{i}",
+                              ylabel=obj)
+                ax.set_yscale('log' if is_log_scale else 'linear')  # Apply log scale if necessary
+                axes.append(ax)
+
+        # Step 3: Adjust right-side y-axis label positions to prevent overlap
+        for j, ax in enumerate(axes[1:], start=1):  # Iterate over the additional axes
+            # Manually set the position of each right y-axis
+            manual_position = 1.01 + 0.2 * (j - 1)  # Adjust this formula or use fixed values for specific positions
+            ax.spines["right"].set_position(("axes", manual_position))  # Set axis position relative to plot area
+
+        # Step 4: Add the title
+        title = " and ".join(var_name) + f" Variation at y = {domain_size[1][1][1]} cm and t = {time} s"
+        wrapped_title = "\n".join(textwrap.wrap(title, width=55))
+        plt.suptitle(wrapped_title, ha="center")
+
+        # Step 5: Set the x-axis limits
+        ax1.set_xlim(x_bounds if x_bounds is not None else (0, domain_size[1][1][0]))
+
+        formatter = ScalarFormatter(useOffset=False, useMathText=False)
+        formatter.set_scientific(False)
+        ax.xaxis.set_major_formatter(formatter)
+        ax.ticklabel_format(style='plain', axis='x')
+
+        # Step 6: Add a legend outside the plot area
+        handles, labels = ax1.get_legend_handles_labels()  # Collect handles and labels from the first axis
+        for ax in axes[1:]:  # For each additional axis, collect handles and labels
+            h, l = ax.get_legend_handles_labels()
+            handles.extend(h)
+            labels.extend(l)
+        fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, -0.01), ncol=len(var_name),
+                   title="Variables")
+
+        # Step 7: Adjust layout and save the plot
+        plt.tight_layout()  # Leave space for title and legend
+
+        formatted_time = f"{time:.16f}".rstrip('0').rstrip('.')
+        # Step 8: Save the figure
+        filename = os.path.join(output_dir_path, f"{'-'.join(var_name)}-Animation-{plt_folder}.png")
+        plt.savefig(filename, format='png', bbox_inches='tight')
+        plt.close()
+
     def create_animation():
-        image_files = [os.path.join(folder_path, f) for f in sorted(os.listdir(folder_path)) if f.endswith('.png')]
+        # Extract numeric parts of filenames for sorting
+        def extract_frame_number(filename):
+            match = re.search(r'plt(\d+)', filename)
+            return int(match.group(1)) if match else -1
+
+        # Filter and sort files by frame number
+        image_files = [
+            os.path.join(folder_path, f)
+            for f in sorted(os.listdir(folder_path), key=extract_frame_number)
+            if f.endswith('.png')  # Only include PNG files
+        ]
+
+        if not image_files:
+            print("No image files found in the folder.")
+            return
+
+        # Load the first image to determine figure size
         first_image = mpimg.imread(image_files[0])
         fig = plt.figure(figsize=(first_image.shape[1] / 100, first_image.shape[0] / 100), dpi=100)
         plt.axis('off')
         img_display = plt.imshow(first_image)
 
+        # Animation update function
         def update(frame):
             img_display.set_array(mpimg.imread(image_files[frame]))
             return img_display,
 
+        # Create and save the animation
         ani = animation.FuncAnimation(fig, update, frames=len(image_files), blit=True)
         writer = animation.FFMpegWriter(fps=15, metadata=dict(artist='Me'), bitrate=1800)
         ani.save(animation_filename, writer=writer)
@@ -625,12 +726,16 @@ def state_animation(method, **kwargs):
     y_bounds = kwargs.get('y_bounds', None)
     domain_size = kwargs.get('domain_size', [])
     var_name = kwargs.get('var_name', "")
+    plt_folder = kwargs.get('plt_folder', "")
     folder_path = kwargs.get('folder_path', "")
     output_dir_path = kwargs.get('output_dir_path', "")
     animation_filename = kwargs.get('animation_filename', "")
 
     if method == 'Plot':
-        plot_frame(reference_loc=reference_loc)
+        if isinstance(var_name, str):
+            plot_single_dataset_frame(reference_loc=reference_loc)
+        else:
+            plot_collective_dataset_frame(reference_loc=reference_loc)
     elif method == 'Animate':
         create_animation()
     else:
@@ -659,7 +764,7 @@ def wave_tracking(wave_type, **kwargs):
 
     def find_wave_idx(data, wave_type):
         if wave_type == 'Flame':
-            return np.argwhere(data >= 2000)[-1][0]
+            return np.argwhere(data >= flame_temp)[-1][0]
         elif wave_type == 'Maximum Pressure':
             return np.argmax(data)
         elif wave_type == 'Leading Shock':
@@ -940,7 +1045,7 @@ def flame_geometry_function(raw_data, domain_info, output_dir, CHECK_FLAGS):
         triangulation = Triangulation(x_coords, y_coords)
 
         # Use tricontour to compute the contour line
-        contour = plt.tricontour(triangulation, temperatures, levels=[flame_contour_temp])
+        contour = plt.tricontour(triangulation, temperatures, levels=[flame_temp])
 
         # If no contour is found, use grid interpolation
         if not contour.collections:
@@ -956,7 +1061,7 @@ def flame_geometry_function(raw_data, domain_info, output_dir, CHECK_FLAGS):
 
             # Create a new triangulation on the regular grid and compute the contour
             triangulation = Triangulation(xi.flatten(), yi.flatten())
-            contour = plt.tricontour(triangulation, temperature_grid.flatten(), levels=[flame_contour_temp])
+            contour = plt.tricontour(triangulation, temperature_grid.flatten(), levels=[flame_temp])
 
         # Extract the contour line vertices
         paths = contour.collections[0].get_paths()
@@ -1382,127 +1487,164 @@ def single_file_processing(args):
     # Step 8: Domain State Animations
     if 'Domain State Animations' in CHECK_FLAGS:
         for key, value in CHECK_FLAGS.get('Domain State Animations', {}).items():
-            if key not in ['Surface Contour', 'Flame Thickness']:
-                if key == 'Combined':
-                    if isinstance(value, (np.ndarray, list, tuple)):
-                        bool_check = True
-                        var_name = value[0]
-                        pele_name = value[1]
-                    else:
-                        bool_check = value
-                        var_name = key
+            # Skip specific keys
+            if key in ['Surface Contour', 'Flame Thickness']:
+                continue
 
-                    if bool_check:
-                        x_data_arr, y_data_arr, y_lim = [], [], []
-                        for i in range(len(var_name)):
-                            if pre_loaded_data is not None and len(pre_loaded_data) > 0 and 'Position' in \
-                                    pre_loaded_data[0]:
-                                x_data_arr.append(pre_loaded_data[np.argwhere(pre_loaded_data[0] == 'Position')[0][0]])
-                            else:
-                                x_data_arr.append(plt_data['boxlib', 'x'][sort_arr].to_value())
+            # Check if value is a dictionary and extract relevant flags
+            if isinstance(value, dict):
+                bool_check = value.get('Flag', False)
+                pele_name = value.get('PeleC', key)
+            else:
+                continue
 
-                            if pre_loaded_data is not None and len(pre_loaded_data) > 0 and var_name in pre_loaded_data[
-                                0]:
-                                y_data_arr.append(pre_loaded_data[np.argwhere(pre_loaded_data[0] == var_name)[0][0]])
-                            elif var_name == 'Heat Release Rate Cantera' or var_name == 'Heat Release Rate PeleC':
-                                y_data_arr.append(result_dict['Flame'][f'{var_name} Array'])
-                            else:
-                                y_data_arr.append(plt_data['boxlib', pele_name][sort_arr].to_value())
-
-                            bnd_arr_index = [item[0] for item in animation_bnds].index(var_name[i])
-                            y_lim.append([animation_bnds[bnd_arr_index][1], animation_bnds[bnd_arr_index][2]])
-
-                        temp_plt_dir = ensure_long_path_prefix(
-                            os.path.join(output_dir, f"Animation-Frames", f"{'-'.join(var_name)}-Plt-Files"))
-                        os.makedirs(temp_plt_dir, exist_ok=True)
-                        state_animation(method='Plot',
-                                        time=time,
-                                        x_data_arr=x_data_arr,
-                                        y_data_arr=y_data_arr,
-                                        y_bounds=y_lim,
-                                        domain_size=domain_info,
-                                        var_name=var_name,
-                                        output_dir_path=temp_plt_dir)
-
+            if bool_check:
+                # Handle x_data_arr
+                if pre_loaded_data is not None and len(pre_loaded_data) > 0 and 'Position' in pre_loaded_data[0]:
+                    x_data_arr = pre_loaded_data[np.argwhere(pre_loaded_data[0] == 'Position')[0][0]]
                 else:
-                    if isinstance(value, (np.ndarray, list, tuple)):
-                        bool_check = value[0]
-                        var_name = key
-                        pele_name = value[1]
-                    else:
-                        bool_check = value
-                        var_name = key
-                        pele_name = key
+                    x_data_arr = plt_data['boxlib', 'x'][sort_arr].to_value()
 
-                    if bool_check:
-                        if pre_loaded_data is not None and len(pre_loaded_data) > 0 and 'Position' in pre_loaded_data[
-                            0]:
-                            x_data_arr = pre_loaded_data[np.argwhere(pre_loaded_data[0] == 'Position')[0][0]]
-                        else:
-                            x_data_arr = plt_data['boxlib', 'x'][sort_arr].to_value()
-                        if pre_loaded_data is not None and len(pre_loaded_data) > 0 and var_name in pre_loaded_data[0]:
-                            y_data_arr = pre_loaded_data[np.argwhere(pre_loaded_data[0] == var_name)[0][0]]
-                        elif var_name == 'Heat Release Rate Cantera' or var_name == 'Heat Release Rate PeleC':
-                            y_data_arr = result_dict['Flame'][f'{var_name} Array']
-                        else:
-                            y_data_arr = plt_data['boxlib', pele_name][sort_arr].to_value()
+                # Handle y_data_arr
+                if pre_loaded_data is not None and len(pre_loaded_data) > 0 and key in pre_loaded_data[0]:
+                    y_data_arr = pre_loaded_data[np.argwhere(pre_loaded_data[0] == key)[0][0]]
+                elif key in ['Heat Release Rate Cantera', 'Heat Release Rate PeleC']:
+                    y_data_arr = result_dict['Flame'].get(f'{key} Array', None)
+                else:
+                    y_data_arr = plt_data['boxlib', pele_name][sort_arr].to_value()
 
-                        bnd_arr_index = [item[0] for item in animation_bnds].index(var_name)
-                        y_lim = [animation_bnds[bnd_arr_index][1], animation_bnds[bnd_arr_index][2]]
+                # Determine bounds
+                bnd_arr_index = [item[0] for item in animation_bnds].index(key)
+                y_lim = [animation_bnds[bnd_arr_index][1], animation_bnds[bnd_arr_index][2]]
 
-                        temp_plt_dir = ensure_long_path_prefix(
-                            os.path.join(output_dir, f"Animation-Frames", f"{var_name}-Plt-Files"))
-                        os.makedirs(temp_plt_dir, exist_ok=True)
-                        state_animation(method='Plot',
-                                        time=time,
-                                        x_data_arr=x_data_arr,
-                                        y_data_arr=y_data_arr,
-                                        y_bounds=y_lim,
-                                        domain_size=domain_info,
-                                        var_name=var_name,
-                                        output_dir_path=temp_plt_dir)
+                # Prepare directory for output
+                if " " in key:  # Check if there's a space
+                    animation_str = key.replace(" ", "-")  # Join with a hyphen
+                else:
+                    animation_str = key  # If no space, keep the original string
+
+                temp_plt_dir = ensure_long_path_prefix(
+                    os.path.join(output_dir, "Animation-Frames", f"{animation_str}-Plt-Files"))
+                os.makedirs(temp_plt_dir, exist_ok=True)
+
+                # Call state_animation
+                state_animation(
+                    method='Plot',
+                    time=time,
+                    x_data_arr=x_data_arr,
+                    y_data_arr=y_data_arr,
+                    y_bounds=y_lim,
+                    domain_size=domain_info,
+                    var_name=key,
+                    plt_folder=raw_data.basename,
+                    output_dir_path=temp_plt_dir
+                )
+
+    if 'Combined State Animations' in CHECK_FLAGS:
+        # Step 1: Extract the names of the enabled subdictionaries
+        subdict_names = [
+            key for key, value in CHECK_FLAGS.get('Combined State Animations', {}).items()
+            if isinstance(value, dict) and value.get('Flag', False)
+        ]
+        animation_str = []
+        for name in subdict_names:
+            if " " in name:  # Check if there's a space
+                animation_str.append(name.replace(" ", "-"))  # Join with a hyphen
+            else:
+                animation_str.append(name)  # If no space, keep the original string
+        # Step 2: Extract the pelec strings of the enabled subdictionaries
+        pelec_values = [
+            value['PeleC']
+            for value in CHECK_FLAGS.get('Combined State Animations', {}).values()
+            if isinstance(value, dict) and value.get('Flag', False)
+        ]
+
+        # Step 3: Create a temporary array to store the plot data for each enabled subdictionary
+        temp_plot_data = np.empty(len(pelec_values), dtype=object)
+        for i, pelec_str in enumerate(pelec_values):
+            temp_plot_data[i] = plt_data['boxlib', pelec_str][sort_arr].to_value()
+
+        # Step 4: Find the corresponding bounds for each subdictionary
+        bnd_arr_indices = [
+            [item[0] for item in animation_bnds].index(name) for name in subdict_names
+        ]
+        y_lims = [[animation_bnds[idx][1], animation_bnds[idx][2]] for idx in bnd_arr_indices]
+
+        # Step 5: Create the output directory for the combined state animations
+        temp_plt_dir = ensure_long_path_prefix(
+            os.path.join(output_dir, f"Animation-Frames", f"{'-'.join(animation_str)}-Plt-Files"))
+        os.makedirs(temp_plt_dir, exist_ok=True)
+
+        state_animation(method='Plot',
+                        time=time,
+                        x_data_arr=plt_data['boxlib', 'x'][sort_arr].to_value(),
+                        y_data_arr=temp_plot_data,
+                        y_bounds=y_lims,
+                        domain_size=domain_info,
+                        var_name=subdict_names,
+                        plt_folder=raw_data.basename,
+                        output_dir_path=temp_plt_dir)
 
     # Step 9: Local State Animation
-    if 'Local State Animation' in CHECK_FLAGS:
+    if 'Local State Animations' in CHECK_FLAGS:
+        # Step 1: Extract the names of the enabled subdictionaries
+        subdict_names = [
+            key for key, value in CHECK_FLAGS.get('Local State Animations', {}).items()
+            if isinstance(value, dict) and value.get('Flag', False)
+        ]
+        animation_str = []
+        for name in subdict_names:
+            if " " in name:  # Check if there's a space
+                animation_str.append(name.replace(" ", "-"))  # Join with a hyphen
+            else:
+                animation_str.append(name)  # If no space, keep the original string
+
+        # Step 2: Extract the pelec strings of the enabled subdictionaries
+        pelec_values = [
+            value['PeleC']
+            for value in CHECK_FLAGS.get('Local State Animations', {}).values()
+            if isinstance(value, dict) and value.get('Flag', False)
+        ]
+
+        # Step 3: Create a temporary array to store the plot data for each enabled subdictionary
+        temp_plot_data = np.empty(len(pelec_values), dtype=object)
+        for i, pelec_str in enumerate(pelec_values):
+            temp_plot_data[i] = plt_data['boxlib', pelec_str][sort_arr].to_value()
+
+        # Step 4: Find the corresponding bounds for each subdictionary
+        bnd_arr_indices = [
+            [item[0] for item in animation_bnds].index(name) for name in subdict_names
+        ]
+
         local_physical_window = CHECK_FLAGS['Local State Animations']['Physical Window']
-        wave_idx = result_dict[f'{CHECK_FLAGS['Local State Animations']['Wave of Interest']}']['Index'] if 'Index' in \
-                                                                                                           CHECK_FLAGS[
-                                                                                                               'Local State Animations'][
-                                                                                                               'Wave of Interest'] else wave_tracking(
-            plt_data, sort_arr, pre_loaded_data=pre_loaded_data)
-        for key, value in CHECK_FLAGS.get('Domain State Animations', {}).items():
-            if key not in ['Surface Contour', 'Flame Thickness']:
-                bool_check, var_name, pele_name = (True, value[0], value[1]) if isinstance(value, (
-                np.ndarray, list, tuple)) else (value, key, key)
-                if bool_check:
-                    if pre_loaded_data is not None and len(pre_loaded_data) > 0 and 'Position' in pre_loaded_data[0]:
-                        x_data_arr = pre_loaded_data[np.argwhere(pre_loaded_data[0] == 'Position')[0][0]]
-                    else:
-                        x_data_arr = plt_data['boxlib', 'x'][sort_arr].to_value()
+        wave_loc = result_dict[f'{CHECK_FLAGS['Local State Animations']['Wave of Interest']}'][
+            'Position'] if 'Position' in result_dict[
+            f'{CHECK_FLAGS['Local State Animations']['Wave of Interest']}'] else wave_tracking(plt_data, sort_arr,
+                                                                                               pre_loaded_data=pre_loaded_data)
 
-                    if pre_loaded_data is not None and len(pre_loaded_data) > 0 and var_name in pre_loaded_data[0]:
-                        y_data_arr = pre_loaded_data[np.argwhere(pre_loaded_data[0] == var_name)[0][0]]
-                    elif var_name == 'Heat Release Rate Cantera' or var_name == 'Heat Release Rate PeleC':
-                        y_data_arr = result_dict['Flame'][f'{var_name} Array']
-                    else:
-                        y_data_arr = plt_data['boxlib', pele_name][sort_arr].to_value()
+        x_idx = [np.searchsorted(plt_data['boxlib', 'x'][sort_arr].to_value(), wave_loc - local_physical_window,
+                                 side='left'),
+                 np.searchsorted(plt_data['boxlib', 'x'][sort_arr].to_value(), wave_loc + local_physical_window,
+                                 side='right')]
+        x_lim = [plt_data['boxlib', 'x'][sort_arr][x_idx[0]].to_value(),
+                 plt_data['boxlib', 'x'][sort_arr][x_idx[1]].to_value()]
+        y_lims = [[animation_bnds[idx][1], animation_bnds[idx][2]] for idx in bnd_arr_indices]
 
-                    bnd_arr_index = [item[0] for item in animation_bnds].index(var_name)
-                    x_lim = [np.searchsorted(x_data_arr / 100, wave_idx - local_physical_window, side='left'),
-                             np.searchsorted(x_data_arr / 100, wave_idx + local_physical_window, side='right')]
-                    y_lim = [animation_bnds[bnd_arr_index][1], animation_bnds[bnd_arr_index][2]]
-                    temp_plt_dir = ensure_long_path_prefix(os.path.join(output_dir, f"Animation-Frames",
-                                                                        f"{'-'.join(['Local', CHECK_FLAGS['Local State Animations']['Wave of Interest'], var_name])}-Plt-Files"))
-                    os.makedirs(temp_plt_dir, exist_ok=True)
-                    state_animation(method='Plot',
-                                    time=time,
-                                    x_data_arr=x_data_arr,
-                                    y_data_arr=y_data_arr,
-                                    x_bounds=x_lim,
-                                    y_bounds=y_lim,
-                                    domain_size=domain_info,
-                                    var_name=var_name,
-                                    output_dir_path=temp_plt_dir)
+        # Step 5: Create the output directory for the combined state animations
+        temp_plt_dir = ensure_long_path_prefix(
+            os.path.join(output_dir, f"Animation-Frames", f"Local-{'-'.join(animation_str)}-Plt-Files"))
+        os.makedirs(temp_plt_dir, exist_ok=True)
+
+        state_animation(method='Plot',
+                        time=time,
+                        x_data_arr=plt_data['boxlib', 'x'][sort_arr].to_value(),
+                        y_data_arr=temp_plot_data,
+                        x_bounds=x_lim,
+                        y_bounds=None,
+                        domain_size=domain_info,
+                        var_name=subdict_names,
+                        plt_folder=raw_data.basename,
+                        output_dir_path=temp_plt_dir)
 
     return result_dict
 
@@ -1605,28 +1747,64 @@ def pelec_processing(pelec_dirs, domain_info, animation_bnds, output_dir, CHECK_
     print('Starting Animation Processing')
 
     def process_animations(animation_type, prefix=None):
-        for key, value in CHECK_FLAGS.get(animation_type, {}).items():
-            if key != 'Combined':
-                bool_check = value[0] if isinstance(value, (np.ndarray, list, tuple)) else value
-                if bool_check:
-                    if prefix:
-                        temp_plt_dir = ensure_long_path_prefix(
-                            os.path.join(output_dir, f"Animation-Frames", f"{prefix}-{key}-Plt-Files"))
-                        animation_filename = ensure_long_path_prefix(
-                            os.path.join(output_dir, f"{prefix}-{key}-Evolution-Animation.mp4"))
-                    else:
-                        temp_plt_dir = ensure_long_path_prefix(
-                            os.path.join(output_dir, f"Animation-Frames", f"{key}-Plt-Files"))
-                        animation_filename = ensure_long_path_prefix(
-                            os.path.join(output_dir, f"{key}-Evolution-Animation.mp4"))
+        subdict_names = [
+            key for key, value in CHECK_FLAGS.get(animation_type, {}).items()
+            if isinstance(value, dict) and value.get('Flag', False)
+        ]
+
+        if animation_type == 'Domain State Animations':
+            for name in subdict_names:
+                if " " in name:  # Check if there's a space
+                    animation_str = name.replace(" ", "-")  # Join with a hyphen
+                else:
+                    animation_str = name  # If no space, keep the original string
+
+                temp_plt_dir = ensure_long_path_prefix(
+                    os.path.join(output_dir, f"Animation-Frames", f"{animation_str}-Plt-Files"))
+                animation_filename = ensure_long_path_prefix(
+                    os.path.join(output_dir, f"{animation_str}-Evolution-Animation.mp4"))
+
+                try:
                     state_animation(
                         method='Animate',
                         folder_path=temp_plt_dir,
                         animation_filename=animation_filename,
                     )
+                except Exception as e:
+                    print(f"Error: Unable to create {animation_str} animation: {e}")
+        else:
+            animation_str = []
+            for name in subdict_names:
+                if " " in name:  # Check if there's a space
+                    animation_str.append(name.replace(" ", "-"))  # Join with a hyphen
+                else:
+                    animation_str.append(name)  # If no space, keep the original string
+
+            animation_str = '-'.join(animation_str)
+
+            if prefix is None:
+                temp_plt_dir = ensure_long_path_prefix(
+                    os.path.join(output_dir, f"Animation-Frames", f"{animation_str}-Plt-Files"))
+                animation_filename = ensure_long_path_prefix(
+                    os.path.join(output_dir, f"{animation_str}-Evolution-Animation.mp4"))
+            else:
+                temp_plt_dir = ensure_long_path_prefix(
+                    os.path.join(output_dir, f"Animation-Frames", f"{prefix}-{animation_str}-Plt-Files"))
+                animation_filename = ensure_long_path_prefix(
+                    os.path.join(output_dir, f"{prefix}-{animation_str}-Evolution-Animation.mp4"))
+
+            try:
+                state_animation(
+                    method='Animate',
+                    folder_path=temp_plt_dir,
+                    animation_filename=animation_filename,
+                )
+            except Exception as e:
+                print(f"Error: Unable to create {animation_str} animation: {e}")
 
     process_animations('Domain State Animations', )
-    # process_animations('Local State Animations', prefix=f"Local-{CHECK_FLAGS['Local State Animations']['Wave of Interest']}")
+    process_animations('Combined State Animations', )
+    process_animations('Local State Animations', prefix=f"Local")
 
     print('Completed Animation Processing')
     return
@@ -1679,15 +1857,32 @@ def main():
             'Thermodynamic State': True
         },
         'Domain State Animations': {
-            'Temperature': (True, 'Temp'),
-            'Pressure': (True, 'pressure'),
-            'Velocity': (True, 'x_velocity'),
+            'Temperature': {'PeleC': 'Temp', 'Flag': True},
+            'Pressure': {'PeleC': 'pressure', 'Flag': True},
+            'Velocity': {'PeleC': 'x_velocity', 'Flag': True},
+            'Species': {'PeleC': None, 'Flag': None},
+            'Heat Release Rate Cantera': {'PeleC': None, 'Flag': True},
+            'Heat Release Rate PeleC': {'PeleC': 'heatRelease', 'Flag': True},
+            'Surface Contour': {'PeleC': None, 'Flag': True},
+            'Flame Thickness': {'PeleC': None, 'Flag': True},
+        },
+        'Combined State Animations': {
+            'Temperature': {'PeleC': 'Temp', 'Flag': True, 'Local': False},
+            'Pressure': {'PeleC': 'pressure', 'Flag': True, 'Local': False},
+            'Velocity': {'PeleC': 'x_velocity', 'Flag': False, 'Local': False},
             'Species': False,
-            'Heat Release Rate Cantera': True,
-            'Heat Release Rate PeleC': (True, 'heatRelease'),
-            'Surface Contour': True,
-            'Flame Thickness': True,
-            # 'Combined': (('Temperature', 'Pressure'), ('Temp', 'pressure'))
+            'Heat Release Rate Cantera': False,
+            'Heat Release Rate PeleC': {'PeleC': 'heatRelease', 'Flag': True, 'Local': False}
+        },
+        'Local State Animations': {
+            'Wave of Interest': 'Flame',
+            'Physical Window': 0.01,
+            'Temperature': {'PeleC': 'Temp', 'Flag': True},
+            'Pressure': {'PeleC': 'pressure', 'Flag': True},
+            'Velocity': {'PeleC': 'x_velocity', 'Flag': False},
+            'Species': False,
+            'Heat Release Rate Cantera': False,
+            'Heat Release Rate PeleC': {'PeleC': 'heatRelease', 'Flag': True}
         }
     }
 
@@ -1705,8 +1900,8 @@ def main():
 
     time_data_dir = [os.path.join(dir_path, raw_data_folder, time_step)
                      for raw_data_folder in os.listdir(dir_path)
-                     if
-                     os.path.isdir(os.path.join(dir_path, raw_data_folder)) and raw_data_folder.startswith('Raw-PeleC')
+                     if os.path.isdir(os.path.join(dir_path, raw_data_folder)) and raw_data_folder.startswith(
+            f'Raw-{data_set}')
                      for time_step in os.listdir(os.path.join(dir_path, raw_data_folder))
                      if
                      os.path.isdir(os.path.join(dir_path, raw_data_folder, time_step)) and time_step.startswith('plt')]
@@ -1716,7 +1911,7 @@ def main():
 
     # Step 5: Determine the domain sizing parameters (size, # of cells)
     domain_info = domain_size_parameters(
-        os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), ddt_dir, 'Raw-PeleC-Data',
+        os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), ddt_dir, f'Raw-{data_set}-Data',
                                      ddt_plt_file)) if row_idx == 'DDT' else updated_data_list[0], row_idx)
 
     # Step 6: Create the result directories
