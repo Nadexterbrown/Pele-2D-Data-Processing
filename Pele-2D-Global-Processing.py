@@ -7,7 +7,6 @@ import matplotlib.animation as animation
 from sdtoolbox.thermo import soundspeed_fr
 from sipbuild.generator.parser.annotations import string
 from sklearn.neighbors import NearestNeighbors
-from scipy.ndimage import gaussian_filter1d
 
 
 class MyClass():
@@ -158,7 +157,10 @@ def waveTrackingFunction(raw_data, ray_sort, tracking_str, tracking_var, wave_ty
     elif wave_type == "Leading Shock Processing" or wave_type == "Pre-Shock Processing" or wave_type == "Post-Shock Processing":
         # From the farthest right point in the domain, determine the leading pressure wave location by 1% increase from this value
         pressure_baseline = temp_data[-1]
-        wave_index = np.argwhere(temp_data >= 1.01 * pressure_baseline)[-1][0]
+        try:
+            wave_index = np.argwhere(temp_data >= 1.01 * pressure_baseline)[-1][0]
+        except:
+            wave_index = 0
     elif wave_type == "Maximum Pressure Processing":
         temp_index = temp_data
         wave_index = np.argwhere(temp_index == np.max(temp_index))[-1][0]
@@ -708,6 +710,9 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
         with open(file_path, "w") as outfile:
             outfile.write("#")
             for i in range(len(header_data)):
+                outfile.write("{0:<55.0f} ".format(int(i + 1)))
+            outfile.write("\n#")
+            for i in range(len(header_data)):
                 outfile.write("{0:<55s} ".format(header_data[i]))
             outfile.write("\n")
             # Step 2:
@@ -872,7 +877,7 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
     if len(sub_dicts_with_position) > 1:
         compound_position_processing = True
         temp_arr = parallelProcessingFunction(data_dir, (domain_info, sub_dicts_with_position),
-                                              wavePositionProcessingFunction, 12)
+                                              wavePositionProcessingFunction, 24)
         comp_pos_arr = np.array(temp_arr)[np.argsort(np.array(temp_arr)[:, 0])]
         del temp_arr
     # Step 2.2: Thermodynamic State
@@ -882,7 +887,7 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
     if len(sub_dicts_with_thermo) > 1:
         compound_thermodynamic_processing = True
         temp_arr = parallelProcessingFunction(data_dir, (domain_info, input_params, sub_dicts_with_thermo),
-                                              thermodynamicStateProcessingFunction, 12)
+                                              thermodynamicStateProcessingFunction, 24)
         comp_thermo_arr = np.array(temp_arr)[np.argsort(np.array(temp_arr)[:, 0, 0])]
         del temp_arr
 
@@ -913,7 +918,7 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
         # Relative Velocity
         if check_flags['Flame Processing'].get('Relative Velocity', False):
             temp_arr = parallelProcessingFunction(data_dir, (domain_info,),
-                                                  gasRelativeVelocityProcessingFunction, 12)
+                                                  gasRelativeVelocityProcessingFunction, 24)
             temp_arr = np.array(temp_arr)
             sort_arr = np.argsort(temp_arr[:, 0])
 
@@ -924,7 +929,7 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
         # Thermodynamic State
         if check_flags['Flame Processing'].get('Thermodynamic State', False) and not compound_thermodynamic_processing:
             temp_arr = parallelProcessingFunction(data_dir, (domain_info, input_params, ['Flame Processing'],),
-                                                  thermodynamicStateProcessingFunction, 12)
+                                                  thermodynamicStateProcessingFunction, 24)
             temp_arr = np.array(temp_arr)
             sort_arr = np.argsort(temp_arr[:, 0])
 
@@ -939,7 +944,7 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
 
         # Surface Length
         if check_flags['Flame Processing'].get('Surface Length', False):
-            temp_arr = parallelProcessingFunction(data_dir, (domain_info,), flameAreaContourFunction, 12)
+            temp_arr = parallelProcessingFunction(data_dir, (domain_info,), flameAreaContourFunction, 24)
             flame_surf_len_arr = np.array(temp_arr)
             del temp_arr
 
@@ -970,7 +975,7 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
         # Position
         if check_flags['Leading Shock Processing'].get('Position', False) and not compound_position_processing:
             temp_arr = parallelProcessingFunction(data_dir, (domain_info, ['Leading Shock Processing'],),
-                                                  wavePositionProcessingFunction, 12)
+                                                  wavePositionProcessingFunction, 24)
             temp_arr = np.array(temp_arr)
             sort_arr = np.argsort(temp_arr[:, 0])
 
@@ -1012,7 +1017,7 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
         # Position
         if check_flags['Maximum Pressure Processing'].get('Position', False) and not compound_position_processing:
             temp_arr = parallelProcessingFunction(data_dir, (domain_info, ['Maximum Pressure Processing'],),
-                                                  wavePositionProcessingFunction, 12)
+                                                  wavePositionProcessingFunction, 24)
             temp_arr = np.array(temp_arr)
             sort_arr = np.argsort(temp_arr[:, 0])
 
@@ -1032,7 +1037,7 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
                                                           False) and not compound_thermodynamic_processing:
             temp_arr = parallelProcessingFunction(data_dir,
                                                   (domain_info, input_params, ['Maximum Pressure Processing'],),
-                                                  thermodynamicStateProcessingFunction, 12)
+                                                  thermodynamicStateProcessingFunction, 24)
             temp_arr = np.array(temp_arr)
             sort_arr = np.argsort(temp_arr[:, 0])
 
@@ -1072,7 +1077,7 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
         if check_flags['Pre-Shock Processing'].get('Thermodynamic State',
                                                    False) and not compound_thermodynamic_processing:
             temp_arr = parallelProcessingFunction(data_dir, (domain_info, input_params, ['Pre-Shock Processing'],),
-                                                  thermodynamicStateProcessingFunction, 12)
+                                                  thermodynamicStateProcessingFunction, 24)
             temp_arr = np.array(temp_arr)
             sort_arr = np.argsort(temp_arr[:, 0])
 
@@ -1103,7 +1108,7 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
         if check_flags['Post-Shock Processing'].get('Thermodynamic State',
                                                     False) and not compound_thermodynamic_processing:
             temp_arr = parallelProcessingFunction(data_dir, (domain_info, input_params, ['Post-Shock Processing'],),
-                                                  thermodynamicStateProcessingFunction, 12)
+                                                  thermodynamicStateProcessingFunction, 24)
             temp_arr = np.array(temp_arr)
             sort_arr = np.argsort(temp_arr[:, 0])
 
@@ -1183,7 +1188,7 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
                 os.makedirs(temp_plt_dir, exist_ok=True)
             # Create all the plt files in parallel
             parallelProcessingFunction(data_dir, (domain_info, input_params, 'Temp', min_val_arr[0], max_val_arr[0],),
-                                       createVariablePltFrame, 16)
+                                       createVariablePltFrame, 24)
             # Create the animation file
             createVariableAnimation(temp_plt_dir,
                                     os.path.join(temp_animation_dir, 'Temperature-Evolution-Animation.mp4'), fps=15)
@@ -1201,7 +1206,7 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
             # Create all the plt files in parallel
             parallelProcessingFunction(data_dir,
                                        (domain_info, input_params, 'pressure', min_val_arr[1], max_val_arr[1],),
-                                       createVariablePltFrame, 16)
+                                       createVariablePltFrame, 24)
             # Create the animation file
             createVariableAnimation(temp_plt_dir, os.path.join(temp_animation_dir, 'Pressure-Evolution-Animation.mp4'),
                                     fps=15)
@@ -1219,7 +1224,7 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
             # Create all the plt files in parallel
             parallelProcessingFunction(data_dir,
                                        (domain_info, input_params, 'x_velocity', min_val_arr[2], max_val_arr[2],),
-                                       createVariablePltFrame, 16)
+                                       createVariablePltFrame, 24)
             # Create the animation file
             createVariableAnimation(temp_plt_dir,
                                     os.path.join(temp_animation_dir, 'X-Velocity-Evolution-Animation.mp4'), fps=15)
@@ -1240,7 +1245,7 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
                                                       str("Y(" + input_params.result_species[i] + ")"),
                                                       min_val_arr[i + 3],
                                                       max_val_arr[i + 3],),
-                                           createVariablePltFrame, 16)
+                                           createVariablePltFrame, 24)
                 # Create the animation file
                 createVariableAnimation(temp_plt_dir, os.path.join(temp_animation_dir,
                                                                    f"Y({str(input_params.result_species[i])})-Evolution-Animation.mp4"),
@@ -1274,7 +1279,7 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
                                                    max_val_arr[np.argwhere(max_val_marker ==
                                                                            check_flags['Domain State Animations'][
                                                                                'Combined'][1])][0][0]],),
-                                       createVariablePltFrame, 16)
+                                       createVariablePltFrame, 24)
             # Create the animation file
             createVariableAnimation(temp_plt_dir, os.path.join(temp_animation_dir,
                                                                f"{check_flags['Domain State Animations']['Combined'][0]}"
@@ -1306,17 +1311,17 @@ def main():
 
     check_flag_dict = {
         'Flame Processing': {
-            'Position': False,
-            'Velocity': False,
+            'Position': True,
+            'Velocity': True,
             'Relative Velocity': False,
-            'Thermodynamic State': False,
-            'Surface Length': False,
-            'Smoothing': False
+            'Thermodynamic State': True,
+            'Surface Length': True,
+            'Smoothing': True
         },
         'Leading Shock Processing': {
-            'Position': False,
-            'Velocity': False,
-            'Smoothing': False
+            'Position': True,
+            'Velocity': True,
+            'Smoothing': True
         },
         'Maximum Pressure Processing': {
             'Position': False,
@@ -1325,24 +1330,24 @@ def main():
         },
         'Pre-Shock Processing': {
             'Thermodynamic State': True,
-            'Smoothing': False
+            'Smoothing': True
         },
         'Post-Shock Processing': {
             'Thermodynamic State': True,
-            'Smoothing': False
+            'Smoothing': True
         },
         'Domain State Animations': {
-            'Temperature': False,
-            'Pressure': False,
-            'Velocity': False,
+            'Temperature': True,
+            'Pressure': True,
+            'Velocity': True,
             'Species': False,
-            # 'Combined':('Temp','pressure')
+            'Combined': ('Temp', 'pressure')
         }
     }
 
-    skip_load = 10  # 0 for no skip
+    skip_load = 0  # 0 for no skip
     # row_index = "Middle"  # Desired row location for data collection
-    row_index = "Middle"  # Desired y_location for data collection in cm
+    row_index = 8.89e-2 / 4  # Desired y_location for data collection in cm
     mass_fraction_variables = np.array(["H", "H2", "H2O", "H2O2", "HO2", "N2", "O", "O2", "OH"])
 
     # Step 1: Initialize the code with the desired processed variables and mixture composition
