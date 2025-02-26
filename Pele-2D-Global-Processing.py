@@ -1,11 +1,12 @@
-import os, yt, multiprocessing, re, time, textwrap, cProfile, itertools
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import os, yt, multiprocessing, re, time, textwrap, itertools
+from scipy.interpolate import RegularGridInterpolator, griddata
 from sklearn.neighbors import NearestNeighbors
+from scipy.spatial import cKDTree
 from sdtoolbox.thermo import soundspeed_fr
 import matplotlib.animation as animation
+from matplotlib.tri import Triangulation
 import matplotlib.image as mpimg
 import matplotlib.pyplot as plt
-import dask.array as da
 import cantera as ct
 import numpy as np
 
@@ -14,8 +15,9 @@ yt.set_log_level(0)
 ########################################################################################################################
 # Global Program Setting Variables
 ########################################################################################################################
-flame_thickness_bin_size = 21
-plotting_bnds_bin = 5
+flame_thickness_bin_size = 11
+flame_contour_temp = 2500
+plotting_bnds_bin = 3
 n_procs = 24
 
 ########################################################################################################################
@@ -80,29 +82,40 @@ def initialize_parameters(T, P, Phi, Fuel, mech, nitrogenAmount=0):
 ########################################################################################################################
 # Function Scripts
 ########################################################################################################################
-def worker_function(iter_var, const_list, shared_input_params, predicate, kwargs):
+def worker_function(args):
     """Worker function to process data and return the result."""
+    iter_var, const_list, shared_input_params, predicate, kwargs = args
     global input_params
     input_params = shared_input_params
     result = predicate((iter_var, const_list, kwargs))
     return result
 
 def parallel_processing_function(iter_arr, const_list, predicate, **kwargs):
-    """Perform parallel processing using ProcessPoolExecutor to allow dynamic task execution."""
-    results = []
-    with ProcessPoolExecutor(max_workers=n_procs) as executor:
-        # Submit tasks asynchronously
-        future_to_task = {
-            executor.submit(worker_function, iter_var, const_list, input_params, predicate, kwargs): iter_var
-            for iter_var in iter_arr
-        }
+    if n_procs > 1:
+        """Perform parallel processing using multiprocessing.Pool."""
+        # Perform the multiprocessing
+        with multiprocessing.Pool(
+                processes=n_procs, initializer=init_pool, initargs=(input_params,)
+        ) as pool:
+            # Use itertools.repeat for constant arguments
+            tasks = zip(
+                iter_arr,
+                itertools.repeat(const_list),
+                itertools.repeat(input_params),
+                itertools.repeat(predicate),
+                itertools.repeat(kwargs)
+            )
 
-        # Collect results as they complete
-        for future in as_completed(future_to_task):
-            try:
-                results.append(future.result())
-            except Exception as exc:
-                print(f"Task generated an exception: {exc}")
+            # Perform parallel mapping
+            results = pool.map(worker_function, tasks)
+
+    else:
+        """Run the function in without parallel."""
+        results = []
+        print(len(iter_arr))
+        for i in range(len(iter_arr)):
+            results.append(worker_function((iter_arr[i], const_list, input_params, predicate, kwargs)))
+
     return results
 
 def init_pool(global_params):
@@ -209,6 +222,24 @@ def data_smoothing_function(collective_results, master_key, slave_key, bin_size=
 
     return collective_results
 
+def convert_units(value, type: str) -> np.array:
+    if type == 'Position' or type == 'x' or type == 'y' or type == 'Flame Thickness' or type == 'Flame Length':
+        return value / 100
+    elif type == 'Temperature' or type == 'Temp':
+        return value
+    elif type == 'Pressure' or type == 'pressure':
+        return value / 10
+    elif type == 'Density' or type == 'density':
+        return value * 1000
+    elif type == 'Velocity' or type == 'Relative Velocity' or type == 'x_velocity' or type == 'y_velocity':
+        return value / 100
+    elif type == 'Heat Release Rate Cantera':
+        return value
+    elif type == 'Heat Release Rate PeleC':
+        return value
+    else:
+        return value
+
 def domain_size_parameters(directory_path, desired_y_location):
     """
     Extract domain size parameters from the given directory path and desired y-location.
@@ -221,15 +252,17 @@ def domain_size_parameters(directory_path, desired_y_location):
     ds = yt.load(directory_path)
     max_level = ds.index.max_level
 
-    # Create a covering grid at the maximum level present
+    # Step 2:
     data = ds.covering_grid(level=max_level,
                             left_edge=[0.0, 0.0, 0.0],
-                            dims=ds.domain_dimensions * [2 ** max_level, 2 ** max_level, 1])
+                            dims=ds.domain_dimensions * [2 ** max_level, 2 ** max_level, 1],
+                            # And any fields to preload (this is optional!)
+                            # fields=desired_varables
+                            )
 
-    # Collect unique x and y coordinates from all grids at the maximum level
-    x_coords = np.unique(np.concatenate([grid['boxlib', 'x'].to_value().flatten() for grid in ds.index.grids if grid.Level == max_level]))
-    y_coords = np.unique(np.concatenate([grid['boxlib', 'y'].to_value().flatten() for grid in ds.index.grids if grid.Level == max_level]))
-
+    # Create a covering grid at the maximum level present
+    x_coords = np.arange(ds.domain_left_edge[0].to_value(), ds.domain_right_edge[0].to_value(), data.dds[0].to_value())
+    y_coords = np.arange(ds.domain_left_edge[1].to_value(), ds.domain_right_edge[1].to_value(), data.dds[1].to_value())
     grid_arr = np.array([x_coords, y_coords], dtype=object)
 
     # Determine the y-slice index and location based on the desired y-location
@@ -288,27 +321,33 @@ def plt_var_bnds(args):
     for i, key in enumerate(keys_with_true_values):
         if key == 'Temperature':
             temp_arr = slice['boxlib', 'Temp'].to_value()
+            value_arr = convert_units(temp_arr, 'Temperature')
         elif key == 'Pressure':
             temp_arr = slice['boxlib', 'pressure'].to_value()
+            value_arr = convert_units(temp_arr, 'Pressure')
         elif key == 'Velocity':
             temp_arr = slice['boxlib', 'x_velocity'].to_value()
+            value_arr = convert_units(temp_arr, 'x_velocity')
         elif key == 'Species':
             print('Max Value Determination for Species is W.I.P.')
             continue
         elif key == 'Heat Release Rate Cantera':
             temp_arr, _ = heat_release_rate_extractor('Cantera', plt_data=slice, sort_arr=np.argsort(slice['boxlib', 'x']))
+            value_arr = convert_units(temp_arr, 'Heat Release Rate Cantera')
         elif key == 'Heat Release Rate PeleC':
             try:
                 temp_arr, _ = heat_release_rate_extractor('PeleC', plt_data=slice, sort_arr=np.argsort(slice['boxlib', 'x']))
+                value_arr = convert_units(temp_arr, 'Heat Release Rate PeleC')
             except:
                 temp_arr, _ = heat_release_rate_extractor('Cantera', plt_data=slice, sort_arr=np.argsort(slice['boxlib', 'x']))
+                value_arr = convert_units(temp_arr, 'Heat Release Rate Cantera')
         else:
             continue
 
         # Step 3: Write bounds to value
         temp_bounds_arr[i, 0] = key
-        temp_bounds_arr[i, 1] = np.min(temp_arr)
-        temp_bounds_arr[i, 2] = np.max(temp_arr)
+        temp_bounds_arr[i, 1] = np.min(value_arr)
+        temp_bounds_arr[i, 2] = np.max(value_arr)
 
     return temp_bounds_arr
 
@@ -467,7 +506,7 @@ def wave_tracking(wave_type, **kwargs):
         elif wave_type == 'Maximum Pressure':
             return np.argmax(data)
         elif wave_type == 'Leading Shock':
-            return np.argmax(data >= 1.01 * data[-1])
+            return np.argwhere(data >= 1.01 * data[-1])[-1][0]
         else:
             raise ValueError('Invalid Wave Type! Must be Flame, Maximum Pressure, or Leading Shock')
 
@@ -491,8 +530,8 @@ def thermodynamic_state_extractor(wave_type, **kwargs):
         wave_loc_adjustments = {
             'Flame': 1e-4,
             'Maximum Pressure': 0,
-            'Pre-Shock': -1e-3,
-            'Post-Shock': 1e-3
+            'Pre-Shock': 1e-3,
+            'Post-Shock': -1e-3
         }
         if wave_type not in wave_loc_adjustments:
             raise ValueError('Invalid Wave Type!')
@@ -570,7 +609,7 @@ def heat_release_rate_extractor(method, **kwargs):
             else:
                 temp_obj.TPY = (
                     plt_data['boxlib', 'Temp'][sort_arr][i].to_value(),
-                    plt_data['boxlib', 'pressure'][sort_arr][i].to_value() * 10,
+                    plt_data['boxlib', 'pressure'][sort_arr][i].to_value() / 10,
                     single_species_comp
                 )
 
@@ -604,134 +643,404 @@ def flame_geometry_function(raw_data, domain_info, output_dir, CHECK_FLAGS):
     def plot_contour(raw_contour, sorted_contours, output_dir_path):
         plt.figure(figsize=(8, 6))
         plt.scatter(raw_contour[:, 0], raw_contour[:, 1], color='k', label='Raw Contour')
-        for contour in sorted_contours:
-            plt.plot(contour[:, 0], contour[:, 1], label='Sorted Flame Contour')
+
+        if len(sorted_contours) > 1:
+            for contour in sorted_contours:
+                plt.plot(contour[:, 0], contour[:, 1], label='Sorted Flame Contour')
+        else:
+            plt.plot(sorted_contours[:, 0], sorted_contours[:, 1], label='Sorted Flame Contour')
         plt.xlabel('X Coordinate')
         plt.ylabel('Y Coordinate')
         plt.title(raw_data.current_time.to_value())
         plt.grid(True, linestyle='--', alpha=0.5)
         plt.legend()
-        filename = os.path.join(output_dir_path, 'Animation-Frames', 'Surface Contour-Plt-Files', f"Flame-Length-Animation-Time-{raw_data.current_time.to_value():.16f}".rstrip('0').rstrip('.') + '.png')
+        filename = os.path.join(output_dir_path, f"Flame-Length-Animation-Time-{raw_data.current_time.to_value():.16f}".rstrip('0').rstrip('.') + '.png')
         plt.savefig(filename, format='png')
         plt.close()
 
-    def plot_flame_thickness_and_contour(raw_contour, region_grid, flame_x_idx, flame_y_idx, nearest_norm_points, output_dir_path):
+    def plot_flame_thickness_and_contour(region_grid, region_temperature, contour_arr, normal_line, interpolator, output_dir_path):
+        # Step 1:
+        X, Y = np.meshgrid(np.unique(region_grid[:, 0]), np.unique(region_grid[:, 1]))
+        # Step 2: Create a contour plot of the temperature field
         plt.figure(figsize=(8, 6))
-        plt.scatter(raw_contour[:, 0], raw_contour[:, 1], color='k', label='Raw Contour')
-        for segment in sorted_segments:
-            plt.plot(segment[:, 0], segment[:, 1], label='Sorted Flame Contour')
-        plt.scatter(region_grid[:, 0], region_grid[:, 1], marker='o', color='k', alpha=0.5, label='Region Grid Points')
-        plt.scatter(grid[0][flame_x_idx], grid[1][flame_y_idx], marker='o', color='r', s=100, label=f'Flame Center: ({grid[0][flame_x_idx], grid[1][flame_y_idx]})')
-        plt.scatter(nearest_norm_points[:, 0], nearest_norm_points[:, 1], marker='o', color='b', label='Points Along Normal')
+        plt.scatter(region_grid[len(region_grid) // 2, 0], region_grid[len(region_grid) // 2, 1], marker='o',
+                    color='r', s=100, label=f'Flame Center: ({region_grid[len(region_grid) // 2, 0], region_grid[len(region_grid) // 2, 1]})')
+        plt.scatter(X.flatten(), Y.flatten(), c=region_temperature.flatten(), cmap='hot')  # 'c' sets the colors
+        plt.scatter(normal_line[:, 0], normal_line[:, 1], c=np.flip(interpolator(normal_line).flatten()), cmap='hot')
+        plt.plot(contour_arr[:, 0], contour_arr[:, 1], label='Sorted Flame Contour')
+        plt.xlim(min(X.flatten()), max(X.flatten()))
+        plt.ylim(min(Y.flatten()), max(Y.flatten()))
         plt.xlabel('X Coordinate')
         plt.ylabel('Y Coordinate')
-        plt.xlim(min(region_grid[:, 0]), max(region_grid[:, 0]))
-        plt.ylim(min(region_grid[:, 1]), max(region_grid[:, 1]))
+        plt.colorbar()
+
         plt.title(f'Flame Normal: {raw_data.current_time.to_value()}')
-        plt.grid(True, linestyle='--', alpha=0.5)
-        plt.legend()
-        filename = ensure_long_path_prefix(os.path.join(output_dir_path, 'Animation-Frames', 'Flame-Thickness-Plt-Files', f"Flame-Thickness-Animation-Time-{raw_data.current_time.to_value():.16f}".rstrip('0').rstrip('.') + '.png'))
+        filename = os.path.join(output_dir_path,f"Flame-Thickness-Animation-Time-{raw_data.current_time.to_value():.16f}".rstrip('0').rstrip('.') + '.png')
         plt.savefig(filename, format='png')
         plt.close()
 
-    def filter_nonphysical_points(points, x_max_threshold):
-        return points[points[:, 0] <= x_max_threshold - 1e-3]
-
-    def sort_by_nearest_neighbors(points):
-        points = np.array(points)
-        buffer = 0.0125 * raw_data.domain_right_edge.to_value()[1]
-        valid_indices = (points[:, 1] >= raw_data.domain_left_edge.to_value()[1] + buffer) & (points[:, 1] <= raw_data.domain_right_edge.to_value()[1] - buffer)
+    def sort_by_nearest_neighbors(points, domain_grid):
+        buffer = 0.0075 * raw_data.domain_right_edge.to_value()[1]
+        valid_indices = (points[:, 1] >= raw_data.domain_left_edge.to_value()[1] + buffer) & (
+                    points[:, 1] <= raw_data.domain_right_edge.to_value()[1] - buffer)
         points = points[valid_indices]
-        nbrs = NearestNeighbors(n_neighbors=len(points), algorithm='ball_tree').fit(points)
-        distances, indices = nbrs.kneighbors(points)
-        origin_idx = np.argmin(points[:, 1])
+
+        # Use cKDTree for more efficient nearest neighbor search
+        tree = cKDTree(points)
+        origin_idx = np.argmin(np.lexsort((points[:, 0], points[:, 1])))
         order = [origin_idx]
         distance_arr = []
         segments = []
         segment_start = 0
+
         for i in range(1, len(points)):
-            temp_idx = np.argwhere(indices[:, 0] == order[i - 1])[0][0]
-            for neighbor_idx in indices[temp_idx, 1:]:
+            distances, indices = tree.query(points[order[i - 1]], k=len(points))
+            for neighbor_idx in indices[1:]:  # Skip the first as it's the point itself
                 if neighbor_idx not in order:
                     order.append(neighbor_idx)
                     break
+
             distance_arr.append(np.linalg.norm(points[order[i]] - points[order[i - 1]]))
-            if distance_arr[-1] > 0.1 * raw_data.domain_right_edge[1].to_value():
+            if distance_arr[-1] > 50 * (domain_grid[0][1] - domain_grid[0][0]):
                 segments.append(points[order][segment_start:i])
                 segment_start = i
+
+        if len(np.concatenate(segments)) < 0.95 * len(points):
+            nbrs = NearestNeighbors(n_neighbors=len(points), algorithm='ball_tree').fit(points)
+            distances, indices = nbrs.kneighbors(points)
+            origin_idx = np.argmin(points[:, 1])
+            order = [origin_idx]
+            distance_arr = []
+            segments = []
+            segment_start = 0
+            for i in range(1, len(points)):
+                temp_idx = np.argwhere(indices[:, 0] == order[i - 1])[0][0]
+                for neighbor_idx in indices[temp_idx, 1:]:
+                    if neighbor_idx not in order:
+                        order.append(neighbor_idx)
+                        break
+
+                distance_arr.append(np.linalg.norm(points[order[i]] - points[order[i - 1]]))
+                if distance_arr[-1] > 50 * (domain_grid[0][1] - domain_grid[0][0]):
+                    segments.append(points[order][segment_start:i])
+                    segment_start = i
+
         return points[order], segments, np.sum(distance_arr)
 
-    def acquire_flame_contour(raw_data, x_boundary):
-        raw_contour = raw_data.all_data().extract_isocontours("Temp", 2000)[:, :2]
-        return filter_nonphysical_points(np.unique(raw_contour, axis=0), x_boundary)
+    def manually_aquire_flame_contour(raw_data):
+        # Get the maximum refinement level
+        max_level = raw_data.index.max_level
+        # Initialize containers for the highest level data
+        x_coords, y_coords, temperatures = [], [], []
+        # Loop through grids and extract data at the highest level
+        for grid in raw_data.index.grids:
+            if grid.Level == max_level:
+                x_coords.append(grid["boxlib", "x"].to_value().flatten())
+                y_coords.append(grid["boxlib", "y"].to_value().flatten())
+                temperatures.append(grid["Temp"].flatten())
 
-    def flame_thickness(raw_data, contour_arr, center_val, grid, output_dir_path):
-        def compute_contour_normal(points):
+        x_coords = np.concatenate(x_coords)
+        y_coords = np.concatenate(y_coords)
+        temperatures = np.concatenate(temperatures)
+
+        # Create a triangulation
+        triangulation = Triangulation(x_coords, y_coords)
+
+        # Use tricontour to compute the contour line
+        contour = plt.tricontour(triangulation, temperatures, levels=[flame_contour_temp])
+
+        # If no contour is found, use grid interpolation
+        if not contour.collections:
+            print("No contour found at the specified level. Using interpolation...")
+
+            # Create a regular grid for interpolation
+            xi = np.linspace(np.min(x_coords), np.max(x_coords), 1e4)
+            yi = np.linspace(np.min(y_coords), np.max(y_coords), 1e4)
+            xi, yi = np.meshgrid(xi, yi)
+
+            # Interpolate temperatures onto the regular grid
+            temperature_grid = griddata((x_coords, y_coords), temperatures, (xi, yi), method='cubic')
+
+            # Create a new triangulation on the regular grid and compute the contour
+            triangulation = Triangulation(xi.flatten(), yi.flatten())
+            contour = plt.tricontour(triangulation, temperature_grid.flatten(), levels=[flame_contour_temp])
+
+        # Extract the contour line vertices
+        paths = contour.collections[0].get_paths()
+        contour_points = np.vstack([path.vertices for path in paths])
+
+        return contour_points
+
+    def flame_thickness(raw_data, contour_arr, center_val, domain_grid, output_dir_path):
+        def compute_contour_normal(points: object, temperatures: np.ndarray) -> object:
             dx = np.gradient(points[:, 0])
             dy = np.gradient(points[:, 1])
             normals = np.column_stack((dy, -dx))
-            return normals / np.linalg.norm(normals, axis=1)[:, np.newaxis]
+            normals = normals[~np.isnan(normals).any(axis=1)]
 
-        def closest_point_from_poly(points, line):
-            t_range = np.linspace(-10, 10, 10000)
-            line_points = np.column_stack((grid[0][flame_x_idx] + t_range * line[0], grid[1][flame_y_idx] + t_range * line[1]))
-            line_points = line_points[(line_points[:, 0] >= min(points[:, 0])) & (line_points[:, 0] <= max(points[:, 0])) & (line_points[:, 1] >= min(points[:, 1])) & (line_points[:, 1] <= max(points[:, 1]))]
-            min_distance_indices = [np.argmin(np.linalg.norm(points - line_point, axis=1)) for line_point in line_points]
-            return np.unique(min_distance_indices), points[np.unique(min_distance_indices)]
+            normals = normals / np.linalg.norm(normals, axis=1)[:, np.newaxis]
 
-        normal_vect = compute_contour_normal(contour_arr)
+            # Compute the temperature gradient (in both x and y directions) for a 2D temperature array
+            temp_gradient_y, temp_gradient_x = np.gradient(temperatures)
+
+            # Assuming that points is a list of coordinates, we need to extract the temperature gradient
+            # at the corresponding indices from the 2D temperature field.
+            # If 'points' corresponds to indices in the temperature field, we can use:
+            temp_gradient_at_points = [temp_gradient_y[int(p[1]), int(p[0])] if 0 <= int(p[1]) < temperatures.shape[0] and 0 <= int(p[0]) < temperatures.shape[1] else [0,0] for p in points]
+
+            # Ensure normals point toward the cold temperature (negative gradient direction)
+            dot_product = np.einsum('ij,ij->i', normals, -np.array(temp_gradient_at_points))
+            normals[dot_product > 0] *= -1
+
+            return normals
+
+        def calculate_normal_vector_line(points, normal_vector):
+            # Step 1: Determine the spacing to be used for the normal vector
+            dx = np.abs(np.unique(points[:, 0])[1] - np.unique(points[:, 0])[0])
+            dy = np.abs(np.unique(points[:, 1])[1] - np.unique(points[:, 1])[0])
+            t_step = min(dx, dy) / np.linalg.norm(normal_vector)  # Adjust step size for resolution
+
+            # Center point of the array
+            center_point = points[points.shape[0] // 2]
+
+            # Step 2: Determine the bounds for the normal vector
+            t_min_x = (np.min(points[:, 0]) - center_point[0]) / normal_vector[0] if normal_vector[0] != 0 else -np.inf
+            t_max_x = (np.max(points[:, 0]) - center_point[0]) / normal_vector[0] if normal_vector[0] != 0 else np.inf
+            t_min_y = (np.min(points[:, 1]) - center_point[1]) / normal_vector[1] if normal_vector[1] != 0 else -np.inf
+            t_max_y = (np.max(points[:, 1]) - center_point[1]) / normal_vector[1] if normal_vector[1] != 0 else np.inf
+
+            t_start = max(min(t_min_x, t_max_x), min(t_min_y, t_max_y))
+            t_end = min(max(t_min_x, t_max_x), max(t_min_y, t_max_y))
+
+            # Step 3: Generate t_range
+            t_range = np.arange(t_start, t_end, t_step/1e2, dtype=np.float32)
+
+            # Step 4: Generate line points along the normal vector
+            x_line_points = np.array(center_point[0] + t_range * normal_vector[0], dtype=np.float32)
+            y_line_points = np.array(center_point[1] + t_range * normal_vector[1], dtype=np.float32)
+            line_points = np.column_stack((x_line_points, y_line_points))
+
+            # Step 5: Filter line points to ensure they remain within bounds
+            min_x, max_x = np.min(points[:, 0]), np.max(points[:, 0])
+            min_y, max_y = np.min(points[:, 1]), np.max(points[:, 1])
+            line_points_filtered = line_points[
+                (line_points[:, 0] >= min_x) & (line_points[:, 0] <= max_x) &
+                (line_points[:, 1] >= min_y) & (line_points[:, 1] <= max_y)
+                ]
+
+            return line_points_filtered
+
+        def create_subgrid_and_filter_grids(raw_data, contour_arr, flame_idx):
+            """
+            Filter grids based on mean x values, and create a subgrid around the contour location.
+
+            Parameters:
+                grids: The list of grids at the highest refinement level.
+                contour_arr: The contour array containing the flame contour points.
+                flame_idx: The index of the flame contour point.
+                num_indices: The number of indices around the contour to include in the subgrid (default is 10).
+                extend_to_edge: If True, the subgrid will extend to the edge of the grid instead of using a fixed number of indices.
+
+            Returns:
+                subgrid_x: The x coordinates of the subgrid.
+                subgrid_y: The y coordinates of the subgrid.
+                subgrid_temperatures: The temperature values in the subgrid.
+                filtered_grids: The filtered list of grids.
+            """
+            # Step 1: Collect the flame position from the contour array
+            flame_x, flame_y = contour_arr[flame_idx]
+
+            # Step 1: Collect the max level grids
+            max_level = raw_data.index.max_level
+            grids = [grid for grid in raw_data.index.grids if grid.Level == max_level]
+
+            # Step 2: Pre-allocate lists for subgrid data and filtered grids
+            subgrid_x, subgrid_y, subgrid_temperatures = [], [], []
+            filtered_grids = []
+
+            # Step 3: Pre-extract the grid data once for efficiency
+            grid_data = []
+            for temp_grid in grids:
+                x = temp_grid["boxlib", "x"].to_value().flatten()
+                y = temp_grid["boxlib", "y"].to_value().flatten()
+                temp = temp_grid["Temp"].flatten()
+                grid_data.append((x, y, temp))
+
+            # Step 4: Filter grids based on mean x difference
+            for i, (x, y, temp) in enumerate(grid_data):
+                # Calculate the mean x value for the current grid
+                current_mean_x = np.mean(x)
+
+                if i < len(grids) - 1:
+                    # If the difference in mean x values is too large, skip the current grid
+                    if current_mean_x > flame_x + 100 * domain_grid[0][1]:
+                        continue
+
+                # If this grid is not skipped, append it to the filtered list
+                filtered_grids.append(grids[i])
+                # Collect the values from this grid
+                subgrid_x.extend(x)
+                subgrid_y.extend(y)
+                subgrid_temperatures.extend(temp)
+
+            subgrid_x = np.array(subgrid_x)
+            subgrid_y = np.array(subgrid_y)
+            subgrid_total_temperatures = np.array(subgrid_temperatures)
+
+            # Step 6: Find the nearest index to the flame contour
+            flame_x_idx = np.argmin(np.abs(subgrid_x - flame_x))
+            flame_y_idx = np.argmin(np.abs(subgrid_y - flame_y))
+
+            flame_x_arr = subgrid_x[subgrid_y  == subgrid_y[flame_y_idx]]
+            flame_y_arr = subgrid_y[subgrid_x  == subgrid_x[flame_x_idx]]
+
+            # Step 2: Determine the number of indices to the left and right of the flame_x_idx
+            # Assuming flame_x_arr is sorted, we find the index of flame_x_idx in flame_x_arr
+            flame_x_arr_idx = np.argmin(np.abs(flame_x_arr - flame_x))
+
+            # Determine the number of indices on each side in the x direction
+            left_x_indices = flame_x_arr_idx
+            right_x_indices = len(flame_x_arr) - flame_x_arr_idx - 1
+
+            # Step 3: Determine the number of indices to the top and bottom of the flame_y_idx
+            flame_y_arr_idx = np.argmin(np.abs(flame_y_arr - flame_y))
+
+            # Determine the number of indices on each side in the y direction
+            top_y_indices = flame_y_arr_idx
+            bottom_y_indices = len(flame_y_arr) - flame_y_arr_idx - 1
+
+            # Step 4: Ensure the indices don't exceed the available indices on either side
+            # If there are fewer than the requested number of indices on the left or right, adjust the number
+            left_x_indices = min(left_x_indices, flame_thickness_bin_size)
+            right_x_indices = min(right_x_indices, flame_thickness_bin_size)
+
+            # Similarly for the y direction
+            top_y_indices = min(top_y_indices, flame_thickness_bin_size)
+            bottom_y_indices = min(bottom_y_indices, flame_thickness_bin_size)
+
+            # If the total number of indices on both sides is less than the flame_thickness_bin_size,
+            # extend the subgrid to the edge of the grid.
+            if left_x_indices + right_x_indices < flame_thickness_bin_size:
+                total_needed_x = flame_thickness_bin_size - (left_x_indices + right_x_indices)
+
+                # Distribute the remaining needed indices to both sides
+                left_x_indices += total_needed_x // 2
+                right_x_indices += total_needed_x - total_needed_x // 2  # Ensure the total is correct
+
+            if top_y_indices + bottom_y_indices < flame_thickness_bin_size:
+                total_needed_y = flame_thickness_bin_size - (top_y_indices + bottom_y_indices)
+
+                # Distribute the remaining needed indices to both sides
+                top_y_indices += total_needed_y // 2
+                bottom_y_indices += total_needed_y - total_needed_y // 2  # Ensure the total is correct
+
+            # Step 5: Create subgrid with the appropriate number of indices on either side of flame_x_idx and flame_y_idx
+            subgrid_flame_x = flame_x_arr[flame_x_arr_idx - left_x_indices:flame_x_arr_idx + right_x_indices + 1]
+            subgrid_flame_y = flame_y_arr[flame_y_arr_idx - top_y_indices:flame_y_arr_idx + bottom_y_indices + 1]
+
+            # Step 6: Create a grid of temperature values corresponding to the subgrid (subgrid_x, subgrid_y)
+            subgrid_temperatures = np.full((len(subgrid_flame_x), len(subgrid_flame_y)), np.nan)
+
+            # Iterate over the subgrid (x, y) pairs and find the corresponding temperature from the collective data
+            for i, y in enumerate(subgrid_flame_y):
+                for j, x in enumerate(subgrid_flame_x):
+                    # Find the index in the collective data that corresponds to the current (x, y)
+                    matching_indices = np.where((subgrid_x == x) & (subgrid_y == y))
+
+                    if len(matching_indices[0]) > 0:
+                        # If a match is found, assign the temperature at the (x, y) position
+                        subgrid_temperatures[i,j] = subgrid_total_temperatures[matching_indices[0][0]]
+
+            # Step 7: Create a 2D grid of (x, y) coordinates for the subgrid
+            region_grid = np.dstack((subgrid_flame_x, subgrid_flame_y))[0]
+            region_temperature = subgrid_temperatures.reshape(np.meshgrid(subgrid_flame_x, subgrid_flame_y)[0].shape)
+
+            break_outer = False
+            for i in range(2):
+                if i == 0:
+                    temp_arr = region_temperature
+                else:
+                   temp_arr = np.flip(region_temperature, axis=i - 1)
+
+                for j in range(4):
+                    temp_grid = np.rot90(temp_arr, k=j)
+
+                    # Compute alignment score (difference between grid and contour points)
+                    interpolator = RegularGridInterpolator((np.unique(region_grid[:, 0]), np.unique(region_grid[:, 1])),
+                                                           temp_grid, bounds_error=False, fill_value=None)
+                    contour_temps = interpolator(np.array(np.meshgrid(subgrid_flame_x, subgrid_flame_y)).T.reshape(-1, 2)).reshape(np.meshgrid(subgrid_flame_x, subgrid_flame_y)[0].shape)
+
+                    if np.all(contour_temps == region_temperature):
+                        break_outer = True
+                        break  # Break out of the inner loop
+
+                if break_outer:
+                    break  # Break out of the outer loop
+
+            return region_grid, region_temperature, interpolator, [flame_x_idx, flame_y_idx]
+
+        # Step 2: Determine the flame location index and the normal vector at that point
         flame_idx = np.argmin(abs(contour_arr[:, 1] - center_val[0][1]))
+        # Step
+        region_grid, region_temperature, temperature_interpolator, flame_xy_idx = create_subgrid_and_filter_grids(raw_data, contour_arr, flame_idx)
+        # Step 1: Determine the normal vectors at each point on the contour
+        normal_vect = compute_contour_normal(contour_arr, region_temperature)
         flame_norm = normal_vect[flame_idx]
-        flame_x_idx = np.argmin(abs(grid[0] - contour_arr[flame_idx][0]))
-        flame_y_idx = np.argmin(abs(grid[1] - contour_arr[flame_idx][1]))
-        left_edge = np.array([grid[0][flame_x_idx - (flame_thickness_bin_size // 2) - 1], grid[1][flame_y_idx - (flame_thickness_bin_size // 2) - 1], 0.0])
-        right_edge = np.array([grid[0][flame_x_idx + (flame_thickness_bin_size // 2)], grid[1][flame_y_idx + (flame_thickness_bin_size // 2)], 1.0])
-        region = raw_data.box(left_edge, right_edge)
-        region_grid = np.dstack((region['boxlib', 'x'].to_value(), region['boxlib', 'y'].to_value()))[0]
-        nearest_norm_idx, nearest_norm_points = closest_point_from_poly(region_grid, flame_norm)
-        region_data = region['boxlib', 'Temp'][nearest_norm_idx].to_value()
-        dx = np.diff(nearest_norm_points[:, 0] / 100)
-        dy = np.diff(nearest_norm_points[:, 1] / 100)
-        temp_grad_x = np.nan_to_num(np.diff(region_data) / dx, nan=0)
-        temp_grad_y = np.nan_to_num(np.diff(region_data) / dy, nan=0)
+        # Step 5: Determine the points nearest the normal vector line
+        normal_line = calculate_normal_vector_line(region_grid, flame_norm)
+        normal_distances = np.insert(np.cumsum(np.sqrt(np.sum(np.diff(normal_line, axis=0) ** 2, axis=1))), 0, 0)
+        # Step 7: Compute gradients and flame thickness
+        temp_grad = np.abs(np.gradient(temperature_interpolator(normal_line)) / np.gradient(normal_distances))
         try:
-            flame_thickness_val = (np.max(region_data) - np.min(region_data)) / np.max(np.sqrt(temp_grad_x ** 2 + temp_grad_y ** 2))
+            flame_thickness_val = (np.max(temperature_interpolator(normal_line)) - np.min(temperature_interpolator(normal_line))) / np.max(temp_grad)
         except ValueError:
             flame_thickness_val = 0
-        if CHECK_FLAGS.get('Domain State Animations', {}).get('Flame Thickness', False):
-            temp_plt_dir = ensure_long_path_prefix(os.path.join(output_dir_path, "Animation-Frames", "Flame-Thickness-Plt-Files"))
+
+        if CHECK_FLAGS['Domain State Animations'].get('Flame Thickness', False):
+            temp_plt_dir = ensure_long_path_prefix(os.path.join(output_dir_path, "Animation-Frames", "Flame Thickness-Plt-Files"))
             os.makedirs(temp_plt_dir, exist_ok=True)
-            plot_flame_thickness_and_contour(contour_arr, region_grid, flame_x_idx, flame_y_idx, nearest_norm_points, output_dir_path)
+            plot_flame_thickness_and_contour(region_grid, region_temperature, contour_arr, normal_line,
+                                             temperature_interpolator, temp_plt_dir)
+
         return flame_thickness_val
 
     ###########################################
     # Main Function
     ###########################################
     # Step 1:
-    grid = domain_info[-1]
+    domain_grid = domain_info[-1]
     center_val = domain_info[1]
 
+    results = np.empty(2, dtype=object)
     # Step 1: Extract the flame contour and sort the points by nearest neighbors
     raw_data.force_periodicity()
-    contour_verts = acquire_flame_contour(raw_data, grid[0][-1])
-    sorted_points, sorted_segments, contour_length = sort_by_nearest_neighbors(contour_verts)
+    try:
+        contour_verts = manually_aquire_flame_contour(raw_data)
+        sorted_points, sorted_segments, contour_length = sort_by_nearest_neighbors(contour_verts, domain_grid)
 
-    if 'Domain State Animations' in CHECK_FLAGS:
-        if CHECK_FLAGS['Domain State Animations'].get('Surface Contour', False):
-            temp_plt_dir = ensure_long_path_prefix(
-                os.path.join(output_dir, f"Animation-Frames", f"Surface Contour-Plt-Files"))
+        if 'Domain State Animations' in CHECK_FLAGS:
+            if CHECK_FLAGS['Domain State Animations'].get('Surface Contour', False):
+                temp_plt_dir = ensure_long_path_prefix(
+                    os.path.join(output_dir, f"Animation-Frames", f"Surface Contour-Plt-Files"))
 
-            if os.path.exists(temp_plt_dir) is False:
-                os.makedirs(temp_plt_dir, exist_ok=True)
+                if os.path.exists(temp_plt_dir) is False:
+                    os.makedirs(temp_plt_dir, exist_ok=True)
 
-            plot_contour(contour_verts, sorted_segments, temp_plt_dir)
+                plot_contour(contour_verts, sorted_segments, temp_plt_dir)
+    except:
+        contour_length = 0
 
     # Compute requested metrics
-    results = np.empty(2, dtype=object)
     if CHECK_FLAGS['Flame'].get('Surface Length', False):
         results[0] = contour_length
     if CHECK_FLAGS['Flame'].get('Flame Thickness', False):
-        results[1] = flame_thickness(raw_data, sorted_points, center_val, grid, output_dir)
+        if contour_length != 0:
+            try:
+                results[1] = flame_thickness(raw_data, sorted_points, center_val, domain_grid, output_dir)
+            except:
+                results[1] = 0
+        else:
+            results[1] = 0
 
     return results
 
@@ -751,8 +1060,8 @@ def single_file_processing(args):
         identifier = np.array(['Identifier', 'Position', 'Temperature', 'Pressure', 'Density'])
         position = slice['boxlib', 'x'][ray_sort].to_value()
         temperature = slice['boxlib', 'Temp'][ray_sort].to_value()
-        pressure = slice['boxlib', 'pressure'][ray_sort].to_value() / 10
-        density = slice['boxlib', 'density'][ray_sort].to_value() * 1000
+        pressure = slice['boxlib', 'pressure'][ray_sort].to_value()
+        density = slice['boxlib', 'density'][ray_sort].to_value()
 
         pre_loaded_data = np.array([identifier, position, temperature, pressure, density], dtype=object)
 
@@ -805,7 +1114,7 @@ def single_file_processing(args):
     if 'Flame' in CHECK_FLAGS:
         process_wave('Flame', 'Flame')
         if CHECK_FLAGS['Flame'].get('Relative Velocity', False):
-            result_dict['Flame']['Gas Velocity'] = plt_data["boxlib", "x_velocity"][sort_arr][result_dict['Flame']['Index'] + 10].to_value() / 100
+            result_dict['Flame']['Gas Velocity'] = plt_data["boxlib", "x_velocity"][sort_arr][result_dict['Flame']['Index'] + 10].to_value()
         if CHECK_FLAGS['Flame'].get('Heat Release Rate Cantera', False):
             result_dict['Flame']['Heat Release Rate Cantera Array'], result_dict['Flame']['Heat Release Rate Cantera'] = heat_release_rate_extractor('Cantera', plt_data=plt_data, sort_arr=np.argsort(plt_data['boxlib', 'x']))
         if CHECK_FLAGS['Flame'].get('Heat Release Rate PeleC', False):
@@ -935,7 +1244,15 @@ def single_file_processing(args):
                     y_lim = [animation_bnds[bnd_arr_index][1], animation_bnds[bnd_arr_index][2]]
                     temp_plt_dir = ensure_long_path_prefix(os.path.join(output_dir, f"Animation-Frames", f"{'-'.join(['Local', CHECK_FLAGS['Local State Animations']['Wave of Interest'], var_name])}-Plt-Files"))
                     os.makedirs(temp_plt_dir, exist_ok=True)
-                    state_animation(method='Plot', time=time, x_data_arr=x_data_arr, y_data_arr=y_data_arr, x_bounds=x_lim, y_bounds=y_lim, domain_size=domain_info, var_name=var_name, output_dir_path=temp_plt_dir)
+                    state_animation(method='Plot',
+                                    time=time,
+                                    x_data_arr=x_data_arr,
+                                    y_data_arr=y_data_arr,
+                                    x_bounds=x_lim,
+                                    y_bounds=y_lim,
+                                    domain_size=domain_info,
+                                    var_name=var_name,
+                                    output_dir_path=temp_plt_dir)
 
     return result_dict
 
@@ -950,7 +1267,7 @@ def pelec_processing(pelec_dirs, domain_info, animation_bnds, output_dir, CHECK_
         # Step 2: Loop over processing objectives (flame, Leading shock, maximum pressure, pre-shock, post-shock)
         for key in CHECK_FLAGS.keys():
             if key in {'Flame', 'Leading Shock', 'Maximum Pressure', 'Pre-Shock', 'Post-Shock'}:
-                sub_dict = CHECK_FLAGS[key]
+                sub_dict = CHECK_FLAGS.get(key, {})
                 for sub_key, sub_value in sub_dict.items():
                     if sub_value:
                         if sub_key == 'Thermodynamic State':
@@ -966,26 +1283,27 @@ def pelec_processing(pelec_dirs, domain_info, animation_bnds, output_dir, CHECK_
 
         # Step 3:
         with open(file_path, "w") as outfile:
-            outfile.write("#" + " ".join(f"{i+1:<55.0f}" for i in range(len(header_data))) + "\n#")
+            outfile.write("#" + " ".join(f"{i + 1:<55.0f}" for i in range(len(header_data))) + "\n#")
             outfile.write(" ".join(f"{header:<55s}" for header in header_data) + "\n")
 
+            # Step 3: Write Data
             time_key = 'Smooth' if smoothing_check else 'Value'
             for i in range(len(collective_results['Time'][time_key])):
+                # Write Time
                 outfile.write(f" {collective_results['Time'][time_key][i]:<55e}")
-                for key in {'Flame', 'Leading Shock', 'Maximum Pressure', 'Pre-Shock', 'Post-Shock'}:
+                # Write Other Data
+                for key in ('Flame', 'Leading Shock', 'Maximum Pressure', 'Pre-Shock', 'Post-Shock'):
                     sub_dict = CHECK_FLAGS.get(key, {})
                     for sub_key, sub_value in sub_dict.items():
                         if sub_value:
                             if sub_key == 'Thermodynamic State':
-                                if smoothing_check:
-                                    outfile.write(" ".join(f"{collective_results[key]['Smooth'][sub_key][i][j]:<55e}" for j in range(len(collective_results[key][time_key][sub_key][0]))))
-                                else:
-                                    outfile.write(" ".join(f"{collective_results[key][sub_key][i][j]:<55e}" for j in range(len(collective_results[key][sub_key][0]))))
+                                types = ("Temperature", "Pressure", "Density", "Soundspeed")
+                                temp_val = np.array([convert_units(value, t) for value, t in
+                                                     zip(collective_results[key][sub_key][i], types)])
+                                outfile.write(" ".join(f"{temp_val[j]:<55e}" for j in range(len(temp_val))))
                             else:
-                                if smoothing_check:
-                                    outfile.write(f" {collective_results[key]['Smooth'][sub_key][i]:<55e}")
-                                else:
-                                    outfile.write(f" {collective_results[key][sub_key][i]:<55e}")
+                                temp_val = convert_units(collective_results[key][sub_key][i], sub_key)
+                                outfile.write(f" {temp_val:<55e}")
                 outfile.write("\n")
 
     ###########################################
@@ -1042,10 +1360,10 @@ def pelec_processing(pelec_dirs, domain_info, animation_bnds, output_dir, CHECK_
                 if bool_check:
                     if prefix:
                         temp_plt_dir = ensure_long_path_prefix(os.path.join(output_dir, f"Animation-Frames", f"{prefix}-{key}-Plt-Files"))
-                        animation_filename = ensure_long_path_prefix(os.path.join(output_dir, f"{key}-Evolution-Animation.mp4"))
+                        animation_filename = ensure_long_path_prefix(os.path.join(output_dir, f"{prefix}-{key}-Evolution-Animation.mp4"))
                     else:
                         temp_plt_dir = ensure_long_path_prefix(os.path.join(output_dir, f"Animation-Frames", f"{key}-Plt-Files"))
-                        animation_filename = ensure_long_path_prefix(os.path.join(output_dir, f"{prefix}-{key}-Evolution-Animation.mp4"))
+                        animation_filename = ensure_long_path_prefix(os.path.join(output_dir, f"{key}-Evolution-Animation.mp4"))
                     state_animation(
                         method='Animate',
                         folder_path=temp_plt_dir,
@@ -1071,7 +1389,7 @@ def main():
     ####################################################################################################################
     # Step 1: Set all the desired tasks to be performed by the python script
     row_idx = 'Center'
-    ddt_plt_file = 'plt308219'
+    ddt_plt_file = 'plt332200'
 
     CHECK_FLAGS = {
         'Flame': {
@@ -1110,8 +1428,8 @@ def main():
             'Species': False,
             'Heat Release Rate Cantera': True,
             'Heat Release Rate PeleC': (True, 'heatRelease'),
-            'Surface Contour': False,
-            'Flame Thickness': False,
+            'Surface Contour': True,
+            'Flame Thickness': True,
             # 'Combined': (('Temperature', 'Pressure'), ('Temp', 'pressure'))
         }
     }
