@@ -366,9 +366,9 @@ def flameAreaContourFunction(args):
     rough_sort = verts[rough_index]
     # Step 3: Remove outliers, artifacts of the periodicity, and order the array
     # Let us determine the buffer region caused by the periodic boundaries required
-    buffer = 0.0125 * raw_data.domain_right_edge[1]
-    y_lower = raw_data.domain_left_edge[1] + buffer
-    y_upper = raw_data.domain_right_edge[1] - buffer
+    buffer = 0.0125 * raw_data.domain_right_edge.to_value()[1]
+    y_lower = raw_data.domain_left_edge.to_value()[1] + buffer
+    y_upper = raw_data.domain_right_edge.to_value()[1] - buffer
     # Handling 2D contours from extracted vertices
     # Assuming verts contains 3D coordinates (x, y, z), we'll extract the 2D data
     # verts is a list of arrays, each array contains (x, y, z) vertices
@@ -376,7 +376,7 @@ def flameAreaContourFunction(args):
     for i, vert in enumerate(rough_sort):
         # Extract only x and y for 2D visualization for valid points
         if (not np.isclose(vert[0], 0, atol=1e-02)
-                and not np.isclose(vert[0], raw_data.domain_right_edge[0], atol=1e-04)
+                and not np.isclose(vert[0], raw_data.domain_right_edge[0].to_value(), atol=1e-04)
                 and (y_lower <= vert[1] <= y_upper)):
             if i == 0:
                 contour_pts[i, 0] = vert[0]
@@ -390,16 +390,49 @@ def flameAreaContourFunction(args):
     #
     contour_arr = sort_by_nearest_neighbors(contour_pts)
     # Calculate the length of a line between adjacent points for the determine contour
-    contour_line = np.zeros(len(contour_arr) - 1)
+    contour_segments = []
+    current_contour = [contour_arr[0]]  # Start with the first point
+
+    contour_lines = []
+    current_line = []
+
     for i in range(1, len(contour_arr)):
-        contour_line[i - 1] = np.sqrt((contour_arr[i, 0] - contour_arr[i - 1, 0]) ** 2 +
-                                      (contour_arr[i, 1] - contour_arr[i - 1, 1]) ** 2)
+        temp_var = np.sqrt((contour_arr[i, 0] - contour_arr[i - 1, 0]) ** 2 +
+                           (contour_arr[i, 1] - contour_arr[i - 1, 1]) ** 2)
+
+        if temp_var > 0.1 * raw_data.domain_right_edge[1].to_value():
+            # If the distance exceeds the threshold, start a new contour line
+            contour_segments.append(np.array(current_contour))
+            current_contour = [contour_arr[i]]  # Start new contour with the current point
+
+            contour_lines.append(np.array(current_line))
+            current_line = []
+        else:
+            current_contour.append(contour_arr[i])
+            current_line.append(temp_var)
+
+    # Append the last contour line if not empty
+    if current_contour:
+        contour_segments.append(np.array(current_contour))
+        contour_lines.append(np.array(current_line))
+
+    """
+    contour_line = []
+    for i in range(1, len(contour_arr)):
+        temp_var = np.sqrt((contour_arr[i, 0] - contour_arr[i - 1, 0]) ** 2 +
+                           (contour_arr[i, 1] - contour_arr[i - 1, 1]) ** 2)
+        if temp_var > 0.1 * raw_data.domain_right_edge[1]:
+            continue
+        else:
+            contour_line.append(temp_var)
+    """
     # Calculate the total line length, by summing the lines between points
-    surface_length = np.sum(contour_line)
+    surface_length = sum(np.sum(distances) for distances in contour_lines)
     print('Flame Surface Length: ', surface_length, 'cm')
     # Plot the 2D contours
     plt.figure(figsize=(8, 6))
-    plt.plot(contour_arr[:, 0], contour_arr[:, 1], marker='.', linestyle='-')
+    for contour in contour_segments:
+        plt.plot(contour[:, 0], contour[:, 1], linestyle='-')
     plt.xlabel('x')
     plt.ylabel('y')
     plt.title('2D Iso-contours, Surface Length = {0:<10f} cm'.format(surface_length))
@@ -707,7 +740,7 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
 
         # Surface Length
         if check_flags['Flame Processing'].get('Surface Length', False):
-            temp_arr = parallelProcessingFunction(data_dir, (domain_info,), flameAreaContourFunction, 12)
+            temp_arr = parallelProcessingFunction(data_dir, (domain_info,), flameAreaContourFunction, 1)
             flame_surf_len_arr = np.array(temp_arr)
             del temp_arr
 
@@ -918,16 +951,16 @@ def main():
     check_flag_dict = {
         'Flame Processing': {
             'Position': True,
-            'Velocity': True,
+            'Velocity': False,
             'Relative Velocity': False,
-            'Thermodynamic State': True,
-            'Surface Length': False,
+            'Thermodynamic State': False,
+            'Surface Length': True,
             'Smoothing': True
         },
         'Leading Shock Processing': {
-            'Position': True,
-            'Velocity': True,
-            'Smoothing': True
+            'Position': False,
+            'Velocity': False,
+            'Smoothing': False
         },
         'Maximum Pressure Processing': {
             'Position': False,
@@ -936,17 +969,17 @@ def main():
         },
         'Pre-Shock Processing': {
             'Thermodynamic State': True,
-            'Smoothing': True
+            'Smoothing': False
         },
         'Post-Shock Processing': {
             'Thermodynamic State': False,
-            'Smoothing': True
+            'Smoothing': False
         }
     }
 
-    skip_load = 0  # 0 for no skip
+    skip_load = 10  # 0 for no skip
     # row_index = "Middle"  # Desired row location for data collection
-    row_index = 0.0668945  # Desired y_location for data collection in cm
+    row_index = "Middle"  # Desired y_location for data collection in cm
     mass_fraction_variables = np.array(["H", "H2", "H2O", "H2O2", "HO2", "N2", "O", "O2", "OH"])
 
     # Step 1: Initialize the code with the desired processed variables and mixture composition
