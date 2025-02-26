@@ -73,7 +73,7 @@ def domain_size_parameters(directory_path, desired_y_location):
               [data.RightEdge[0].to_value(), data.RightEdge[1].to_value()]]))
 
 
-def polynomial_fit_over_array(x, y, bin_size=51, degree=2):
+def polynomial_fit_over_array(x, y, bin_size, degree):
     """
     Fits a polynomial of the specified degree to the data within bins
     centered around each point in the input array, and evaluates the
@@ -122,16 +122,16 @@ def waveTrackingFunction(raw_data, ray_sort, tracking_str, tracking_var, wave_ty
     temp_data = raw_data["boxlib", str(tracking_str)][ray_sort].to_value()
     temp_x_pos = raw_data["boxlib", str('x')][ray_sort].to_value()
     # Step 2:
-    if wave_type == "Flame Processing":
+    if wave_type == "Flame":
         wave_index = np.argwhere(temp_data >= tracking_var)[-1][0]
-    elif wave_type == "Leading Shock Processing" or wave_type == "Pre-Shock Processing" or wave_type == "Post-Shock Processing":
+    elif wave_type == "Shock":
         # Compute the gradient of pressure with respect to space
         dp_dx = np.gradient(temp_data, temp_x_pos)
         # Find the indices where the gradient changes sign (indicating a shock)
         shock_indices = np.where(dp_dx == np.min(dp_dx))[0]
         # Classify shocks as left or right running
         wave_index = np.max(shock_indices)
-    elif wave_type == "Maximum Pressure Processing":
+    elif wave_type == "Max Pressure":
         temp_index = temp_data
         wave_index = np.argwhere(temp_index == np.max(temp_index))[-1][0]
     return wave_index, temp_x_pos[wave_index] / 100
@@ -141,56 +141,36 @@ def wavePositionProcessingFunction(args):
     #####
     #
     #####
-    # Step 1: Unpack the parallelization arguments
+    # Step 0: Unpack the parallelization arguments
     current_file = args[0]
-    domain_sizing = args[1][0]
-    tracking_obj = args[1][1]
-    # Step 2:
+    domain_sizing = args[1]
+
     domain_size = domain_sizing[0][1]
-    # Step 3:
+    # Step 1:
     raw_data = yt.load(current_file)
     slice = raw_data.ray(np.array([0.0, domain_size[1], 0.0]), np.array([domain_size[0], domain_size[1], 0.0]))
     ray_sort = np.argsort(slice["x"])
     time = raw_data.current_time.to_value()
-    # Step 4:
-    if len(tracking_obj) > 1:
-        result_arr = np.zeros(len(tracking_obj) + 1)
-        result_arr[0] = time
-        for i, wave_type in enumerate(tracking_obj):
-            if wave_type == "Flame Processing":
-                tracking_str = "Temp"
-                tracking_val = 2000
-            else:
-                tracking_str = "pressure"
-                tracking_val = None
-            # Now determine the wave position at the given time
-            [_, temp_pos] = waveTrackingFunction(slice, ray_sort, tracking_str, tracking_val, wave_type)
-            result_arr[i + 1] = temp_pos
-    else:
-        result_arr = np.zeros(2)
-        result_arr[0] = time
-        if tracking_obj[0] == "Flame Processing":
-            tracking_str = "Temp"
-            tracking_val = 2000
-        else:
-            tracking_str = "pressure"
-            tracking_val = None
-        [_, result_arr[1]] = waveTrackingFunction(slice, ray_sort, tracking_str, tracking_val, tracking_obj[0])
+    # Step 3:
+    [_, flame_position] = waveTrackingFunction(slice, ray_sort, "Temp", 2000, "Flame")
+    [_, shock_position] = waveTrackingFunction(slice, ray_sort, "pressure", None, "Shock")
+    [_, max_pressure_position] = waveTrackingFunction(slice, ray_sort, "pressure", None, "Max Pressure")
+    wave_array = np.array([time, flame_position, shock_position, max_pressure_position])
 
-    return result_arr
+    return wave_array
 
 
-def gasRelativeVelocityProcessingFunction(args):
-    def preheatZoneFunction():
+def gasVelocityProcessingFunction(args):
+    def preheatZoneFunction(data, ray_sort):
         # Step 1: Determine the reaction zone through temperature values
-        [flame_index, _] = waveTrackingFunction(slice, ray_sort, "Temp", 2000, "Flame")
+        [flame_index, _] = waveTrackingFunction(data, ray_sort, "Temp", 2000, "Flame")
         # Step 2: Determine the leading shock location through the pressure gradient
-        [shock_index, _] = waveTrackingFunction(slice, ray_sort, "pressure", None, "Shock")
+        [shock_index, _] = waveTrackingFunction(data, ray_sort, "pressure", None, "Shock")
         # Step 3: Using temperature data, truncate the data and determine where the temperature gradients go to near zero
-        temp_data = slice["boxlib", str("Temp")][ray_sort].to_value()
+        temp_data = data["boxlib", str("Temp")][ray_sort].to_value()
         temp_index = np.argwhere(temp_data <= temp_data[flame_index] - 1000)[0][0]
         # Step 4:
-        vel_data = slice["boxlib", str("x_velocity")][ray_sort].to_value() / 100
+        vel_data = data["boxlib", str("x_velocity")][ray_sort].to_value() / 100
         return vel_data[temp_index]
 
     #####
@@ -198,7 +178,7 @@ def gasRelativeVelocityProcessingFunction(args):
     #####
     # Step 0: Unpack the parallelization arguments
     current_file = args[0]
-    domain_sizing = args[1][0]
+    domain_sizing = args[1]
 
     domain_size = domain_sizing[0][1]
     # Step 1:
@@ -208,37 +188,27 @@ def gasRelativeVelocityProcessingFunction(args):
     ray_sort = np.argsort(slice["x"])
     time = raw_data.current_time.to_value()
     # Step 2:
-    gas_vel = preheatZoneFunction()
+    gas_vel = preheatZoneFunction(slice, ray_sort)
     return gas_vel
 
 
-def thermodynamicStateProcessingFunction(args):
-    def canteraGasObject(data, ray_sort, tracking_str, tracking_val, wave_type):
+def thermodynamicProcessingFunction(args):
+    def thermodynamicParameters(data, ray_sort, input_params, thermo_type):
+        # Step 0: Determine the location of the desired wave provided by the thermo_type
+        if thermo_type == "flame":
+            [wave_index, _] = waveTrackingFunction(data, ray_sort, "Temp", 2000, "Flame")
+            temp_array = data["boxlib", str('x')][ray_sort].to_value()
+            temp_position = temp_array[wave_index]
+            probe_index = np.argwhere(temp_array >= temp_position + (0.25 / 10))[0][0]
+        elif thermo_type == "pre_shock" or thermo_type == "post_shock":
+            [wave_index, _] = waveTrackingFunction(data, ray_sort, "pressure", None, "Shock")
+            temp_array = data["boxlib", str('x')][ray_sort].to_value()
+            temp_position = temp_array[wave_index]
+            if thermo_type == "pre_shock":
+                probe_index = np.argwhere(temp_array >= temp_position + (5 / 10))
+            elif thermo_type == "post_shock":
+                probe_index = np.argwhere(temp_array >= temp_position - (5 / 10))
         # Step 1:
-        [wave_index, _] = waveTrackingFunction(data, ray_sort, tracking_str, tracking_val, wave_type)
-        temp_pos = data["boxlib", str('x')][ray_sort].to_value()[wave_index]
-        if wave_type == "Flame Processing":
-            probe_index = np.argwhere(data["boxlib", str('x')][ray_sort].to_value() >= temp_pos + (0.25 / 10))[0][0]
-        elif wave_type == "Pre-Shock Processing" or wave_type == "Post-Shock Processing":
-            if wave_type == "Pre-Shock Processing":
-                try:
-                    probe_index = np.argwhere(data["boxlib", str('x')][ray_sort].to_value() >= temp_pos + (5 / 10))[0][
-                        0]
-                except:
-                    probe_index = len(data["boxlib", str('x')][ray_sort]) - 1
-            elif wave_type == "Post-Shock Processing":
-                try:
-                    probe_index = np.argwhere(data["boxlib", str('x')][ray_sort].to_value() >= temp_pos - (5 / 10))[0][
-                        0]
-                except:
-                    probe_index = len(data["boxlib", str('x')][ray_sort]) - 1
-        elif wave_type == "Maximum Pressure Processing":
-            try:
-                probe_index = np.argwhere(data["boxlib", str('x')][ray_sort].to_value() >= temp_pos)[0][0]
-            except:
-                probe_index = len(data["boxlib", str('x')][ray_sort]) - 1
-
-        # Step 2:
         temp_temp = data["boxlib", "Temp"][ray_sort].to_value()
         temp_pres = data["boxlib", "pressure"][ray_sort].to_value()
 
@@ -249,52 +219,41 @@ def thermodynamicStateProcessingFunction(args):
         mixture_comp = {}
         for i in range(len(input_params.result_species)):
             mixture_comp.update({str(input_params.result_species[i]): temp_comp[i][probe_index]})
-        # Step 3:
-        result_array = np.zeros(4, dtype=float)
-        gas_obj = ct.Solution(input_params.mech)
-        gas_obj.TPY = (temp_temp[probe_index],
-                       temp_pres[probe_index] / 10,
-                       mixture_comp)
-        result_array[0] = gas_obj.T
-        result_array[1] = gas_obj.P
-        result_array[2] = gas_obj.density_mass
-        result_array[3] = soundspeed_fr(gas_obj)
-        del gas_obj
-        return result_array.tolist()
 
+        # Step 0: Allocate the space for all thermodynamic parameters (reactant temperature, pressure, density, soundspeed
+        # and the coresponding product values)
+        result_array = np.empty(4, dtype=float)
+        # Step 1: Using the input parameter class, create a cantera gas object
+        gas_temp = ct.Solution(input_params.mech)
+        gas_temp.TPY = (temp_temp[probe_index],
+                        temp_pres[probe_index] / 10,
+                        mixture_comp)
+        result_array[0] = gas_temp.T
+        result_array[1] = gas_temp.P
+        result_array[2] = gas_temp.density_mass
+        result_array[3] = soundspeed_fr(gas_temp)
+        del gas_temp
+        return result_array
+
+    #####
+    #
+    #####
     # Step 1:
     current_file = args[0]
-    domain_sizing = args[1][0]
-    input_params = args[1][1]
-    tracking_obj = args[1][2]
-    # Step 2:
+    domain_sizing = args[1]
+    input_params = args[2]
+    thermo_type = args[3]
+
     domain_size = domain_sizing[0][1]
-    # Step 3:
+    # Step 2: Determine the file path for the highest level
     raw_data = yt.load(current_file)
-    slice = raw_data.ray(np.array([0.0, domain_size[1], 0.0]), np.array([domain_size[0], domain_size[1], 0.0]))
+    slice = raw_data.ray(np.array([0.0, domain_size[1], 0.0]), np.array([domain_size[0], domain_size[1],
+                                                                         0.0]))  # 1 corresponds to the y-axis, y_location is the physical position (in meters)
     ray_sort = np.argsort(slice["x"])
-    #
-    if len(tracking_obj) > 1:
-        result_arr = []
-        for i, wave_type in enumerate(tracking_obj):
-            if wave_type == "Flame Processing":
-                tracking_str = "Temp"
-                tracking_val = 2000
-            else:
-                tracking_str = "pressure"
-                tracking_val = None
-            # Now determine the wave position at the given time
-            temp_arr = canteraGasObject(slice, ray_sort, tracking_str, tracking_val, wave_type)
-            result_arr.append(temp_arr[:])
-    else:
-        if tracking_obj == "Flame Processing":
-            tracking_str = "Temp"
-            tracking_val = 2000
-        else:
-            tracking_str = "pressure"
-            tracking_val = None
-        result_arr = canteraGasObject(slice, ray_sort, tracking_str, tracking_val, tracking_obj)
-    return result_arr
+    time = raw_data.current_time.to_value()
+    # Step 4:
+    thermo_results = thermodynamicParameters(slice, ray_sort, input_params, thermo_type)
+    return thermo_results
 
 
 def flameAreaContourFunction(args):
@@ -392,7 +351,242 @@ def flameAreaContourFunction(args):
     plt.title('2D Iso-contours, Surface Length = {0:<10f} cm'.format(surface_length))
     plt.show()
 
-    return surface_length
+    return
+
+
+def waveProcessingFunction(data_dir, row_index, input_params, check_flag=None,
+                           output_dir=None):
+    def parallelWaveProcessingFunction(paralellizationList, y_location, predicate, nProcs):
+        """
+            Call the function ``predicate`` on ``nProcs`` processors for ``nTemps``
+            different temperatures.
+        """
+        # Perform the multiprocessing
+        with multiprocessing.Pool(
+                processes=nProcs, initargs=()
+        ) as pool:
+            y = pool.map(predicate,
+                         zip(paralellizationList,
+                             itertools.repeat(y_location)))
+        return y
+
+    def parallelRelativeProcessingFunction(paralellizationList, y_location, predicate, nProcs):
+        """
+                    Call the function ``predicate`` on ``nProcs`` processors for ``nTemps``
+                    different temperatures.
+                """
+        # Perform the multiprocessing
+        with multiprocessing.Pool(
+                processes=nProcs, initargs=()
+        ) as pool:
+            y = pool.map(predicate,
+                         zip(paralellizationList,
+                             itertools.repeat(y_location)))
+        return y
+
+    def parallelThermodynamicProcessingFunction(paralellizationList, y_location, input_parameters, thermo_type,
+                                                predicate, nProcs):
+        """
+                    Call the function ``predicate`` on ``nProcs`` processors for ``nTemps``
+                    different temperatures.
+                """
+        # Perform the multiprocessing
+        with multiprocessing.Pool(
+                processes=nProcs, initargs=()
+        ) as pool:
+            y = pool.map(predicate,
+                         zip(paralellizationList,
+                             itertools.repeat(y_location),
+                             itertools.repeat(input_parameters),
+                             itertools.repeat(thermo_type)))
+        return y
+
+    def parallelFlameAreaProcessingFunction(paralellizationList, y_location, predicate, nProcs):
+        """
+                    Call the function ``predicate`` on ``nProcs`` processors for ``nTemps``
+                    different temperatures.
+                """
+        # Perform the multiprocessing
+        with multiprocessing.Pool(
+                processes=nProcs, initargs=()
+        ) as pool:
+            y = pool.map(predicate,
+                         zip(paralellizationList,
+                             itertools.repeat(y_location)))
+        return y
+
+    def writeWaveResults(file_path, smooth_check, check_flag, position_data, lab_ref_vel, rel_ref_vel,
+                         flame_thermo_data, pre_shock_thermo_data,
+                         post_shock_thermo_data):
+        # Step 0:
+        header_data = ["Time [s]"]
+        if check_flag.get('Position Flag', False):
+            header_data.extend(["Flame Position [m]", "Shock Position [m]", "Max Pressure Position [m]"])
+        if check_flag.get('Lab Velocity Flag', False):
+            header_data.extend(["Flame Lab Velocity [m]", "Shock Lab Velocity [m]"])
+        if check_flag.get('Relative Velocity Flag', False):
+            header_data.extend(["Gas Velocity [m/s]", "Flame Ref Velocity [m]", "Shock Ref Velocity [m]"])
+        if check_flag.get('Flame Thermodynamic State', False):
+            header_data.extend(["Flame Temperature [K]", "Flame Pressure [Pa]", "Flame Density [kg/m^3]",
+                                "Flame Soundspeed [m/s]"])
+        if check_flag.get('Pre-Shock Thermodynamic State', False):
+            header_data.extend(["Pre-Shock Temperature [K]", "Pre-Shock Pressure [Pa]", "Pre-Shock Density [kg/m^3]",
+                                "Pre-Shock Soundspeed [m/s]"])
+        if check_flag.get('Post-Shock Thermodynamic State', False):
+            header_data.extend(["Post-Shock Temperature [K]", "Post-Shock Pressure [Pa]", "Post-Shock Density [kg/m^3]",
+                                "Post-Shock Soundspeed [m/s]"])
+        if check_flag.get('Flame Surface Length', False):
+            header_data.extend(["Flame Surface Length [m]"])
+        # Step 1: Write the header portion of the results file
+        if smooth_check:
+            file_name = "Wave-Tracking-Smooth-Results.txt"
+        else:
+            file_name = "Wave-Tracking-Results.txt"
+
+        with open(os.path.join(file_path, file_name), "w") as outfile:
+            outfile.write("#")
+            for i in range(len(header_data)):
+                outfile.write("{0:<55s} ".format(header_data[i]))
+            outfile.write("\n")
+            # Step 2:
+            for i in range(len(position_data)):  # Number of Time indices
+                outfile.write(" {0:<55e}".format(position_data[i][0]))
+                if check_flag.get('Position Flag', False):
+                    outfile.write(" {0:<55e} {1:<55e} {2:<55e}".format(position_data[i][1],
+                                                                       position_data[i][2],
+                                                                       position_data[i][3]))
+                if check_flag.get('Lab Velocity Flag', False):
+                    outfile.write(" {0:<55e} {1:<55e}".format(lab_ref_vel[0][i],
+                                                              lab_ref_vel[1][i]))
+                if check_flag.get('Relative Velocity Flag', False):
+                    outfile.write(" {0:<55e} {1:<55e} {1:<55e}".format(rel_ref_vel[i],
+                                                                       lab_ref_vel[0][i] - rel_ref_vel[i],
+                                                                       lab_ref_vel[1][i] - rel_ref_vel[i]))
+                if check_flag.get('Flame Thermodynamic State', False):
+                    outfile.write(" {0:<55e} {1:<55e} {2:<55e} {3:<55e}".format(flame_thermo_data[i][0],
+                                                                                flame_thermo_data[i][1],
+                                                                                flame_thermo_data[i][2],
+                                                                                flame_thermo_data[i][3]))
+                if check_flag.get('Pre-Shock Thermodynamic State', False):
+                    outfile.write(" {0:<55e} {1:<55e} {2:<55e} {3:<55e}".format(pre_shock_thermo_data[i][0],
+                                                                                pre_shock_thermo_data[i][1],
+                                                                                pre_shock_thermo_data[i][2],
+                                                                                pre_shock_thermo_data[i][3]))
+                if check_flag.get('Post-Shock Thermodynamic State', False):
+                    outfile.write(" {0:<55e} {1:<55e} {2:<55e} {3:<55e}".format(post_shock_thermo_data[i][0],
+                                                                                post_shock_thermo_data[i][1],
+                                                                                post_shock_thermo_data[i][2],
+                                                                                post_shock_thermo_data[i][3]))
+                if check_flag.get('Flame Surface Length', False):
+                    outfile.write(" {0:<55e}".format(position_data[i][0]))
+                outfile.write("\n")
+            outfile.close()
+        return
+
+    ####################################################################################################################
+    #
+    ####################################################################################################################
+    # Script Processing Constants
+    poly_fit_bin_size = 51
+    poly_fit_order = 2
+
+    # Step 0:
+
+    # Step 0:
+    temp_location_evolution = []
+    raw_wave_velocity = []
+    smooth_wave_velocity = []
+    raw_gas_velocity_evolution = []
+    smooth_gas_velocity_evolution = []
+    raw_flame_thermo_data = []
+    raw_pre_shock_thermo_data = []
+    raw_post_shock_thermo_data = []
+    smooth_thermodynamic_data = []
+    raw_flame_area = []
+    # Step 1: Determine the wave positions and velocities in the laboratory frame of reference
+    if check_flag.get('Position Flag', False):
+        temp_location_evolution = parallelWaveProcessingFunction(data_dir,
+                                                                 row_index,
+                                                                 wavePositionProcessingFunction, 16)
+        # Separate out the individual wave position arrays
+        raw_temp_array = np.empty((len(temp_location_evolution), 4), dtype=float)
+        for i in range(len(temp_location_evolution)):
+            raw_temp_array[i, 0] = temp_location_evolution[i][0]
+            raw_temp_array[i, 1] = temp_location_evolution[i][1]
+            raw_temp_array[i, 2] = temp_location_evolution[i][2]
+            raw_temp_array[i, 3] = temp_location_evolution[i][3]
+        # Get indices that would sort the first array
+        sorted_indices = np.argsort(raw_temp_array[:, 0])
+        # Apply sorting to all columns of raw_temp_array
+        sorted_raw_temp_array = raw_temp_array[sorted_indices]
+
+        # Evaluate the polynomial at a given point within a certain bin
+        [time_array, flame_position, smooth_flame_vel] = polynomial_fit_over_array(sorted_raw_temp_array[:, 0],
+                                                                                   sorted_raw_temp_array[:, 1],
+                                                                                   poly_fit_bin_size, poly_fit_order)
+        [_, shock_position, smooth_shock_vel] = polynomial_fit_over_array(sorted_raw_temp_array[:, 0],
+                                                                          sorted_raw_temp_array[:, 2],
+                                                                          poly_fit_bin_size, poly_fit_order)
+        [_, max_position_position, _] = polynomial_fit_over_array(sorted_raw_temp_array[:, 0],
+                                                                  sorted_raw_temp_array[:, 3],
+                                                                  poly_fit_bin_size, poly_fit_order)
+
+        smooth_possition_array = np.empty((len(time_array), 4), dtype=float)
+        for i in range(len(time_array)):
+            smooth_possition_array[i, 0] = time_array[i]
+            smooth_possition_array[i, 1] = flame_position[i]
+            smooth_possition_array[i, 2] = shock_position[i]
+            smooth_possition_array[i, 3] = max_position_position[i]
+    if check_flag.get('Lab Velocity Flag', False):
+        raw_wave_velocity = np.empty(2, dtype=object)
+        raw_wave_velocity[0] = np.gradient(sorted_raw_temp_array[:, 1]) / np.gradient(sorted_raw_temp_array[:, 0])
+        raw_wave_velocity[1] = np.gradient(sorted_raw_temp_array[:, 2]) / np.gradient(sorted_raw_temp_array[:, 0])
+
+        smooth_wave_velocity = np.empty(2, dtype=object)
+        smooth_wave_velocity[0] = smooth_flame_vel
+        smooth_wave_velocity[1] = smooth_shock_vel
+    # Step 2: Determine the gas velocity and thermodynamic state from the simulation results
+    if check_flag.get('Relative Velocity Flag', False):
+        raw_gas_velocity_evolution = parallelRelativeProcessingFunction(data_dir,
+                                                                        row_index,
+                                                                        gasVelocityProcessingFunction, 6)
+        [_, smooth_gas_velocity_evolution, _] = polynomial_fit_over_array(sorted_raw_temp_array[:, 0],
+                                                                          raw_gas_velocity_evolution,
+                                                                          poly_fit_bin_size, poly_fit_order)
+    # Step 3:
+    if check_flag.get('Flame Thermodynamic State', False):
+        raw_flame_thermo_data = parallelThermodynamicProcessingFunction(data_dir,
+                                                                        row_index,
+                                                                        input_params,
+                                                                        "flame",
+                                                                        thermodynamicProcessingFunction, 6)
+    if check_flag.get('Pre-Shock Thermodynamic State', False):
+        raw_pre_shock_thermo_data = parallelThermodynamicProcessingFunction(data_dir,
+                                                                            row_index,
+                                                                            input_params,
+                                                                            "pre-shock",
+                                                                            thermodynamicProcessingFunction, 6)
+    if check_flag.get('Post-Shock Thermodynamic State', False):
+        raw_post_shock_thermo_data = parallelThermodynamicProcessingFunction(data_dir,
+                                                                             row_index,
+                                                                             input_params,
+                                                                             "post-shock",
+                                                                             thermodynamicProcessingFunction, 6)
+    if check_flag.get('Flame Surface Length', False):
+        raw_flame_area = parallelFlameAreaProcessingFunction(data_dir,
+                                                             row_index,
+                                                             flameAreaContourFunction,
+                                                             6)
+    # Step 4:
+
+    writeWaveResults(output_dir, False, check_flag, sorted_raw_temp_array, raw_wave_velocity,
+                     raw_gas_velocity_evolution,
+                     raw_flame_thermo_data, raw_pre_shock_thermo_data, raw_post_shock_thermo_data)
+
+    writeWaveResults(output_dir, True, check_flag, smooth_temp_array, smooth_wave_velocity,
+                     smooth_gas_velocity_evolution,
+                     smooth_thermodynamic_data)
+    return
 
 
 def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, output_dir=None):
@@ -414,47 +608,31 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
                              itertools.repeat(const_list)))
         return y
 
-    def writeTextFile(file_path, smoothing_check):
+    def writeTextFile(file_path):
         """
 
         :param file_path:
         :return:
         """
         # Step 1: Dynamically create the text file header depending on the assigned flags
-        header_pos_flag = False
         header_data = ["Time [s]"]
-        # Position
-        if check_flags['Flame Processing'].get('Position', False):
-            header_data.extend(["Flame Position [m]"])
-        if check_flags['Leading Shock Processing'].get('Position', False):
-            header_data.extend(["Leading Shock Position [m]"])
-        if check_flags['Maximum Pressure Processing'].get('Position', False):
-            header_data.extend(["Max Pressure Position [m]"])
-        # Velocity
-        if check_flags['Flame Processing'].get('Velocity', False):
-            header_data.extend(["Flame Velocity [m/s]"])
-        if check_flags['Leading Shock Processing'].get('Velocity', False):
-            header_data.extend(["Leading Shock Velocity [m/s]"])
-        # Relative Velocity
-        if check_flags['Flame Processing'].get('Relative Velocity', False):
-            header_data.extend(["Relative Flame Velocity [m/s]"])
-        # Thermodynamic State
-        if check_flags['Flame Processing'].get('Thermodynamic State', False):
+        if check_flags.get('Position Flag', False):
+            header_data.extend(["Flame Position [m]", "Shock Position [m]", "Max Pressure Position [m]"])
+        if check_flags.get('Lab Velocity Flag', False):
+            header_data.extend(["Flame Lab Velocity [m]", "Shock Lab Velocity [m]"])
+        if check_flags.get('Relative Velocity Flag', False):
+            header_data.extend(["Gas Velocity [m/s]", "Flame Ref Velocity [m]", "Shock Ref Velocity [m]"])
+        if check_flags.get('Flame Thermodynamic State', False):
             header_data.extend(["Flame Temperature [K]", "Flame Pressure [Pa]", "Flame Density [kg/m^3]",
                                 "Flame Soundspeed [m/s]"])
-        if check_flags['Maximum Pressure Processing'].get('Thermodynamic State', False):
-            header_data.extend(["Max Pressure Temperature [K]", "Max Pressure Pressure [Pa]",
-                                "Max Pressure Density [kg/m^3]", "Max Pressure Soundspeed [m/s]"])
-        if check_flags['Pre-Shock Processing'].get('Thermodynamic State', False):
-            header_data.extend(["Pre-Shock Temperature [K]", "Pre-Shock Pressure [Pa]",
-                                "Pre-Shock Density [kg/m^3]", "Pre-Shock Soundspeed [m/s]"])
-        if check_flags['Post-Shock Processing'].get('Thermodynamic State', False):
-            header_data.extend(["Post-Shock Temperature [K]", "Post-Shock Pressure [Pa]",
-                                "Post-Shock Density [kg/m^3]", "Post-Shock Soundspeed [m/s]"])
-        # Flame Surface Length
-        if check_flags['Flame Processing'].get('Surface Length', False):
+        if check_flags.get('Pre-Shock Thermodynamic State', False):
+            header_data.extend(["Pre-Shock Temperature [K]", "Pre-Shock Pressure [Pa]", "Pre-Shock Density [kg/m^3]",
+                                "Pre-Shock Soundspeed [m/s]"])
+        if check_flags.get('Post-Shock Thermodynamic State', False):
+            header_data.extend(["Post-Shock Temperature [K]", "Post-Shock Pressure [Pa]", "Post-Shock Density [kg/m^3]",
+                                "Post-Shock Soundspeed [m/s]"])
+        if check_flags.get('Flame Surface Length', False):
             header_data.extend(["Flame Surface Length [m]"])
-
         # Step 2:
         with open(file_path, "w") as outfile:
             outfile.write("#")
@@ -462,155 +640,39 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
                 outfile.write("{0:<55s} ".format(header_data[i]))
             outfile.write("\n")
             # Step 2:
-            # Step 2.1:
-            if not smoothing_check:
-                for i in range(len(time_arr)):
-                    # Time
-                    outfile.write(" {0:<55e}".format(time_arr[i]))
-
-                    # Position
-                    if check_flags['Flame Processing'].get('Position', False) and not compound_position_processing:
-                        outfile.write(" {0:<55e}".format(flame_pos_arr[i]))
-
-                    elif check_flags['Flame Processing'].get('Position', False) and compound_position_processing:
-                        outfile.write(" {0:<55e}".format(comp_pos_arr[i, 0]))
-
-                    if check_flags['Maximum Pressure Processing'].get('Position',
-                                                                      False) and not compound_position_processing:
-                        outfile.write(" {0:<55e}".format(max_pres_pos_arr[i]))
-
-                    elif check_flags['Maximum Pressure Processing'].get('Position',
-                                                                        False) and compound_position_processing:
-                        outfile.write(" {0:<55e}".format(comp_pos_arr[i, 1]))
-
-                    if check_flags['Leading Shock Processing'].get('Position',
-                                                                   False) and not compound_position_processing:
-                        outfile.write(" {0:<55e}".format(lead_shock_pos_arr[i, 1]))
-
-                    elif check_flags['Leading Shock Processing'].get('Position',
-                                                                     False) and compound_position_processing:
-                        outfile.write(" {0:<55e}".format(comp_pos_arr[i, 2]))
-
-                    # Velocity
-                    if check_flags['Flame Processing'].get('Velocity', False):
-                        outfile.write(" {0:<55e}".format(flame_vel_arr[i]))
-
-                    if check_flags['Maximum Pressure Processing'].get('Velocity', False):
-                        outfile.write(" {0:<55e}".format(lead_shock_vel_arr[i]))
-
-                    # Relative Velocity
-                    if check_flags['Flame Processing'].get('Relative Velocity', False):
-                        outfile.write(" {0:<55e}".format(flame_rel_vel_arr[i]))
-
-                    # Thermodynamic State
-                    if check_flags['Flame Processing'].get('Thermodynamic State',
-                                                           False) and not compound_thermodynamic_processing:
-                        for j in range(len(flame_thermo_arr[0, :])):
-                            outfile.write(" {0:<55e}".format(flame_thermo_arr[i, j]))
-
-                    elif check_flags['Flame Processing'].get('Thermodynamic State',
-                                                             False) and compound_thermodynamic_processing:
-                        for j in range(len(comp_thermo_arr[0][0])):
-                            outfile.write(" {0:<55e}".format(comp_thermo_arr[
-                                                                 i, get_index_of_string(sub_dicts_with_position,
-                                                                                        'Flame Processing'), j]))
-
-                    if check_flags['Maximum Pressure Processing'].get('Thermodynamic State',
-                                                                      False) and not compound_thermodynamic_processing:
-                        for j in range(len(max_pres_thermo_arr[0, :])):
-                            outfile.write(" {0:<55e}".format(max_pres_thermo_arr[i, j]))
-
-                    elif check_flags['Maximum Pressure Processing'].get('Thermodynamic State',
-                                                                        False) and compound_thermodynamic_processing:
-                        for j in range(len(comp_thermo_arr[0][0])):
-                            outfile.write(" {0:<55e}".format(comp_thermo_arr[
-                                                                 i, get_index_of_string(sub_dicts_with_position,
-                                                                                        'Maximum Pressure Processing'), j]))
-
-                    if check_flags['Pre-Shock Processing'].get('Thermodynamic State',
-                                                               False) and not compound_thermodynamic_processing:
-                        for j in range(len(pre_shock_thermo_arr[0, :])):
-                            outfile.write(" {0:<55e}".format(pre_shock_thermo_arr[i, j]))
-
-                    elif check_flags['Pre-Shock Processing'].get('Thermodynamic State',
-                                                                 False) and compound_thermodynamic_processing:
-                        for j in range(len(comp_thermo_arr[0][0])):
-                            outfile.write(" {0:<55e}".format(comp_thermo_arr[
-                                                                 i, get_index_of_string(sub_dicts_with_position,
-                                                                                        'Pre-Shock Processing'), j]))
-
-                    if check_flags['Post-Shock Processing'].get('Thermodynamic State',
-                                                                False) and not compound_thermodynamic_processing:
-                        for j in range(len(post_shock_thermo_arr[0, :])):
-                            outfile.write(" {0:<55e}".format(post_shock_thermo_arr[i, j]))
-
-                    elif check_flags['Post-Shock Processing'].get('Thermodynamic State',
-                                                                  False) and compound_thermodynamic_processing:
-                        for j in range(len(comp_thermo_arr[0][0])):
-                            outfile.write(" {0:<55e}".format(comp_thermo_arr[
-                                                                 i, get_index_of_string(sub_dicts_with_position,
-                                                                                        'Post-Shock Processing'), j]))
-
-                    # Surface Length
-                    if check_flags['Flame Processing'].get('Surface Length', False):
-                        outfile.write(" {0:<55e}".format(flame_surf_len_arr[i]))
-                    outfile.write("\n")
-            # Step 2.2:
-            if smoothing_check:
-                for i in range(len(smooth_time_arr)):
-                    # Time
-                    outfile.write(" {0:<55e}".format(smooth_time_arr[i]))
-
-                    # Position
-                    if check_flags['Flame Processing'].get('Position', False):
-                        outfile.write(" {0:<55e}".format(smooth_flame_pos_arr[i, 1]))
-
-                    if check_flags['Maximum Pressure Processing'].get('Position', False):
-                        outfile.write(" {0:<55e}".format(smooth_lead_shock_pos_arr[i, 1]))
-
-                    if check_flags['Pre-Shock Processing'].get('Position', False):
-                        outfile.write(" {0:<55e}".format(smooth_max_pres_pos_arr[i, 1]))
-
-                    # Velocity
-                    if check_flags['Flame Processing'].get('Velocity', False):
-                        outfile.write(" {0:<55e}".format(smooth_flame_vel_arr[i]))
-
-                    if check_flags['Maximum Pressure Processing'].get('Velocity', False):
-                        outfile.write(" {0:<55e}".format(smooth_lead_shock_vel_arr[i]))
-
-                    # Relative Velocity
-                    if check_flags['Flame Processing'].get('Relative Velocity', False):
-                        outfile.write(" {0:<55e}".format(smooth_flame_rel_vel_arr[i]))
-
-                    # Thermodynamic State
-                    if check_flags['Flame Processing'].get('Thermodynamic State', False):
-                        for j in range(len(smooth_flame_thermo_arr[0, :])):
-                            outfile.write(" {0:<55e}".format(smooth_flame_thermo_arr[i, j]))
-
-                    if check_flags['Maximum Pressure Processing'].get('Thermodynamic State', False):
-                        for j in range(len(smooth_max_pres_thermo_arr[0, :])):
-                            outfile.write(" {0:<55e}".format(smooth_max_pres_thermo_arr[i, j]))
-
-                    if check_flags['Pre-Shock Processing'].get('Thermodynamic State', False):
-                        for j in range(len(smooth_pre_shock_thermo_arr[0, :])):
-                            outfile.write(" {0:<55e}".format(smooth_pre_shock_thermo_arr[i, j]))
-
-                    if check_flags['Post-Shock Processing'].get('Thermodynamic State', False):
-                        for j in range(len(smooth_post_shock_thermo_arr[0, :])):
-                            outfile.write(" {0:<55e}".format(smooth_post_shock_thermo_arr[i, j]))
-
-                    # Surface Length
-                    if check_flags['Flame Processing'].get('Surface Length', False):
-                        outfile.write(" {0:<55e}".format(smooth_flame_surf_len_arr[i]))
-                    outfile.write("\n")
+            for i in range(len(position_data)):  # Number of Time indices
+                outfile.write(" {0:<55e}".format(position_data[i][0]))
+                if check_flags.get('Position Flag', False):
+                    outfile.write(" {0:<55e} {1:<55e} {2:<55e}".format(position_data[i][1],
+                                                                       position_data[i][2],
+                                                                       position_data[i][3]))
+                if check_flags.get('Lab Velocity Flag', False):
+                    outfile.write(" {0:<55e} {1:<55e}".format(lab_ref_vel[0][i],
+                                                              lab_ref_vel[1][i]))
+                if check_flags.get('Relative Velocity Flag', False):
+                    outfile.write(" {0:<55e} {1:<55e} {1:<55e}".format(rel_ref_vel[i],
+                                                                       lab_ref_vel[0][i] - rel_ref_vel[i],
+                                                                       lab_ref_vel[1][i] - rel_ref_vel[i]))
+                if check_flags.get('Flame Thermodynamic State', False):
+                    outfile.write(" {0:<55e} {1:<55e} {2:<55e} {3:<55e}".format(flame_thermo_data[i][0],
+                                                                                flame_thermo_data[i][1],
+                                                                                flame_thermo_data[i][2],
+                                                                                flame_thermo_data[i][3]))
+                if check_flags.get('Pre-Shock Thermodynamic State', False):
+                    outfile.write(" {0:<55e} {1:<55e} {2:<55e} {3:<55e}".format(pre_shock_thermo_data[i][0],
+                                                                                pre_shock_thermo_data[i][1],
+                                                                                pre_shock_thermo_data[i][2],
+                                                                                pre_shock_thermo_data[i][3]))
+                if check_flags.get('Post-Shock Thermodynamic State', False):
+                    outfile.write(" {0:<55e} {1:<55e} {2:<55e} {3:<55e}".format(post_shock_thermo_data[i][0],
+                                                                                post_shock_thermo_data[i][1],
+                                                                                post_shock_thermo_data[i][2],
+                                                                                post_shock_thermo_data[i][3]))
+                if check_flags.get('Flame Surface Length', False):
+                    outfile.write(" {0:<55e}".format(position_data[i][0]))
+                outfile.write("\n")
             outfile.close()
         return
-
-    def get_index_of_string(array, string):
-        try:
-            return array.index(string)
-        except ValueError:
-            return -1  # Or any other indication that the string was not found
 
     """
 
@@ -619,234 +681,26 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
 
     # Step 1:
 
-    # Step 2: Compound processing to reduce the number of data calls
-    # Step 2.1: Position
-    compound_position_processing = False
-    sub_dicts_with_position = [sub_dict_name for sub_dict_name, sub_dict in check_flags.items() if
-                               sub_dict.get('Position', False)]
-    if len(sub_dicts_with_position) > 1:
-        compound_position_processing = True
-        temp_arr = parallelProcessingFunction(data_dir, (domain_info, sub_dicts_with_position),
-                                              wavePositionProcessingFunction, 12)
-        comp_pos_arr = np.array(temp_arr)
-        del temp_arr
-    # Step 2.2: Thermodynamic State
-    compound_thermodynamic_processing = False
-    sub_dicts_with_thermo = [sub_dict_name for sub_dict_name, sub_dict in check_flags.items() if
-                             sub_dict.get('Thermodynamic State', False)]
-    if len(sub_dicts_with_thermo) > 1:
-        compound_thermodynamic_processing = True
-        temp_arr = parallelProcessingFunction(data_dir, (domain_info, input_params, sub_dicts_with_thermo),
-                                              thermodynamicStateProcessingFunction, 12)
-        comp_thermo_arr = np.array(temp_arr)
-        del temp_arr
-
-    # Step 3:
-    # Step 3.1: Flame Processing
+    # Step 2:
+    # Step 2.1: Flame Processing
     if 'Flame Processing' in check_flags:
-        # Position
-        if check_flags['Flame Processing'].get('Position', False) and not compound_position_processing:
-            temp_arr = parallelProcessingFunction(data_dir, (domain_info, ['Flame Processing'],),
-                                                  wavePositionProcessingFunction, 12)
-            flame_pos_arr = np.array(temp_arr)[:, 1]
-            time_arr = temp_arr[:, 0]
-            del temp_arr
-        elif check_flags['Flame Processing'].get('Position', False) and compound_position_processing:
-            flame_pos_arr = comp_pos_arr[:, get_index_of_string(sub_dicts_with_position, 'Flame Processing')]
-            time_arr = comp_pos_arr[:, 0]
+        if check_flags['Flame Processing'].get('Position', False):
 
-        # Velocity
         if check_flags['Flame Processing'].get('Velocity', False):
             if check_flags['Flame Processing'].get('Position', True):
-                print('Error: Must determine position in order to calculate velocity')
-            else:
-                flame_vel_arr = np.gradient(flame_pos_arr[:, 1]) / np.gradient(flame_pos_arr[:, 0])
+                print('Error: Must '
 
-        # Relative Velocity
-        if check_flags['Flame Processing'].get('Relative Velocity', False):
-            temp_arr = parallelProcessingFunction(data_dir, (domain_info,),
-                                                  gasRelativeVelocityProcessingFunction, 12)
-            flame_rel_vel_arr = np.array(temp_arr)
-            del temp_arr
+                if check_flags['Flame Processing'].get('Relative Velocity', False):
+                    if
+                check_flags['Flame Processing'].get('Thermodynamic State', False):
 
-        # Thermodynamic State
-        if check_flags['Flame Processing'].get('Thermodynamic State', False) and not compound_thermodynamic_processing:
-            temp_arr = parallelProcessingFunction(data_dir, (domain_info, input_params, ['Flame Processing'],),
-                                                  thermodynamicStateProcessingFunction, 12)
-            flame_thermo_arr = np.array(temp_arr)
-            del temp_arr
-        elif check_flags['Flame Processing'].get('Thermodynamic State', False) and compound_thermodynamic_processing:
-            temp_arr = comp_thermo_arr[:, get_index_of_string(sub_dicts_with_thermo, 'Flame Processing')]
-            flame_thermo_arr = np.array(temp_arr)
-            del temp_arr
+                if check_flags['Flame Processing'].get('Surface Length', False):
 
-        # Surface Length
-        if check_flags['Flame Processing'].get('Surface Length', False):
-            temp_arr = parallelProcessingFunction(data_dir, (), flameAreaContourFunction, 12)
-            flame_surf_len_arr = np.array(temp_arr)
-            del temp_arr
+                # Step 2.2: Maximum Pressure Processing
 
-        # Smoothing
-        if check_flags['Flame Processing'].get('Smoothing', False):
-            # Position
-            if check_flags['Flame Processing'].get('Position', False):
-                [smooth_time_arr, smooth_flame_pos_arr, _] = polynomial_fit_over_array(time_arr, flame_pos_arr)
-            # Velocity
-            if check_flags['Flame Processing'].get('Velocity', False):
-                [_, smooth_flame_vel_arr, _] = polynomial_fit_over_array(time_arr, flame_vel_arr)
-            # Relative Velocity
-            if check_flags['Flame Processing'].get('Relative Velocity', False):
-                [_, smooth_flame_rel_vel_arr, _] = polynomial_fit_over_array(time_arr, flame_rel_vel_arr)
-            # Thermodynamic State
-            if check_flags['Flame Processing'].get('Thermodynamic State', False):
-                smooth_flame_thermo_arr = np.zeros((len(smooth_time_arr), 4))
-                for i in range(0, 3):
-                    [_, temp_arr, _] = polynomial_fit_over_array(time_arr, flame_thermo_arr[:, i])
-                    smooth_flame_thermo_arr[:, i] = temp_arr
-            # Surface Length
-            if check_flags['Flame Processing'].get('Surface Length', False):
-                [_, smooth_flame_surf_len_arr, _] = polynomial_fit_over_array(time_arr, flame_surf_len_arr)
+                # Step 2.3: Pre-Shock Processing
 
-    # Step 3.2: Leading Shock Wave Processing
-    if 'Leading Shock Processing' in check_flags:
-        # Position
-        if check_flags['Leading Shock Processing'].get('Position', False) and not compound_position_processing:
-            temp_arr = parallelProcessingFunction(data_dir, (domain_info, ['Leading Shock Processing'],),
-                                                  wavePositionProcessingFunction, 12)
-            lead_shock_pos_arr = np.array(temp_arr)[:, 1]
-            if 'time_arr' not in locals():
-                time_arr = temp_arr[:, 0]
-            del temp_arr
-        elif check_flags['Leading Shock Processing'].get('Position', False) and compound_position_processing:
-            lead_shock_pos_arr = comp_pos_arr[:,
-                                 get_index_of_string(sub_dicts_with_position, 'Leading Shock Processing')]
-            if 'time_arr' not in locals():
-                time_arr = comp_pos_arr[:, 0]
-
-        # Velocity
-        if check_flags['Leading Shock Processing'].get('Velocity', False):
-            if check_flags['Leading Shock Processing'].get('Position', True):
-                print('Error: Must determine position in order to calculate velocity')
-            else:
-                lead_shock_vel_arr = np.gradient(lead_shock_pos_arr[:, 0]) / np.gradient(time_arr)
-
-        # Smoothing
-        if check_flags['Leading Shock Processing'].get('Smoothing', False):
-            # Position
-            if check_flags['Leading Shock Processing'].get('Position', False):
-                [temp_time_arr, smooth_lead_shock_pos_arr, _] = polynomial_fit_over_array(time_arr, lead_shock_pos_arr)
-                if 'smooth_time_arr' not in locals():
-                    smooth_time_arr = temp_time_arr
-                del temp_time_arr
-
-            # Velocity
-            if check_flags['Leading Shock Processing'].get('Velocity', False):
-                [_, smooth_lead_shock_vel_arr, _] = polynomial_fit_over_array(time_arr, lead_shock_vel_arr)
-                if 'smooth_time_arr' not in locals():
-                    smooth_time_arr = temp_time_arr
-                del temp_time_arr
-
-    # Step 3.2: Maximum Pressure Processing
-    if 'Maximum Pressure Processing' in check_flags:
-        # Position
-        if check_flags['Maximum Pressure Processing'].get('Position', False) and not compound_position_processing:
-            temp_arr = parallelProcessingFunction(data_dir, (domain_info, ['Maximum Pressure Processing'],),
-                                                  wavePositionProcessingFunction, 12)
-            max_pres_pos_arr = np.array(temp_arr)[:, 1]
-            if 'time_arr' not in locals():
-                time_arr = temp_arr[:, 0]
-            del temp_arr
-        elif check_flags['Maximum Pressure Processing'].get('Position', False) and compound_position_processing:
-            max_pres_pos_arr = comp_pos_arr[:,
-                               get_index_of_string(sub_dicts_with_position, 'Maximum Pressure Processing')]
-            if 'time_arr' not in locals():
-                time_arr = comp_pos_arr[:, 0]
-
-        # Thermodynamic State
-        if check_flags['Maximum Pressure Processing'].get('Thermodynamic State',
-                                                          False) and not compound_thermodynamic_processing:
-            temp_arr = parallelProcessingFunction(data_dir,
-                                                  (domain_info, input_params, ['Maximum Pressure Processing'],),
-                                                  thermodynamicStateProcessingFunction, 12)
-            max_pres_thermo_arr = np.array(temp_arr)
-            del temp_arr
-        elif check_flags['Maximum Pressure Processing'].get('Thermodynamic State',
-                                                            False) and compound_thermodynamic_processing:
-            temp_arr = comp_thermo_arr[:, get_index_of_string(sub_dicts_with_thermo, 'Maximum Pressure Processing')]
-            max_pres_thermo_arr = np.array(temp_arr)
-            del temp_arr
-
-        # Smoothing
-        if check_flags['Maximum Pressure Processing'].get('Smoothing', False):
-            # Position
-            if check_flags['Maximum Pressure Processing'].get('Position', False):
-                [temp_time_arr, smooth_max_pres_pos_arr, _] = polynomial_fit_over_array(time_arr, max_pres_pos_arr)
-                if 'smooth_time_arr' not in locals():
-                    smooth_time_arr = temp_time_arr
-                del temp_time_arr
-            # Thermodynamic State
-            if check_flags['Maximum Pressure Processing'].get('Thermodynamic State', False):
-                smooth_max_pres_thermo_arr = np.zeros((len(smooth_time_arr), 4))
-                for i in range(0, 3):
-                    [_, temp_arr, _] = polynomial_fit_over_array(time_arr, max_pres_thermo_arr)
-                    smooth_max_pres_thermo_arr[:, i] = temp_arr
-
-    # Step 3.3: Pre-Shock Processing
-    if 'Pre-Shock Processing' in check_flags:
-        # Thermodynamic State
-        if check_flags['Pre-Shock Processing'].get('Thermodynamic State',
-                                                   False) and not compound_thermodynamic_processing:
-            temp_arr = parallelProcessingFunction(data_dir, (domain_info, input_params, ['Pre-Shock Processing'],),
-                                                  thermodynamicStateProcessingFunction, 12)
-            pre_shock_thermo_arr = np.array(temp_arr)
-            del temp_arr
-        elif check_flags['Pre-Shock Processing'].get('Thermodynamic State',
-                                                     False) and compound_thermodynamic_processing:
-            temp_arr = comp_thermo_arr[:, get_index_of_string(sub_dicts_with_thermo, 'Pre-Shock Processing')]
-            pre_shock_thermo_arr = np.array(temp_arr)
-            del temp_arr
-
-        # Smoothing
-        if check_flags['Pre-Shock Processing'].get('Smoothing', False):
-            if check_flags['Pre-Shock Processing'].get('Thermodynamic State', False):
-                # Thermodynamic State
-                smooth_pre_shock_thermo_arr = np.zeros((len(smooth_time_arr), 4))
-                for i in range(0, 3):
-                    [_, temp_arr, _] = polynomial_fit_over_array(time_arr, pre_shock_thermo_arr)
-                    smooth_pre_shock_thermo_arr[:, i] = temp_arr
-
-    # Step 3.4: Post-Shock Processing
-    if 'Post-Shock Processing' in check_flags:
-        # Thermodynamic State
-        if check_flags['Post-Shock Processing'].get('Thermodynamic State',
-                                                    False) and not compound_thermodynamic_processing:
-            temp_arr = parallelProcessingFunction(data_dir, (domain_info, input_params, ['Post-Shock Processing'],),
-                                                  thermodynamicStateProcessingFunction, 12)
-            post_shock_thermo_arr = np.array(temp_arr)
-            del temp_arr
-        elif check_flags['Post-Shock Processing'].get('Thermodynamic State',
-                                                      False) and compound_thermodynamic_processing:
-            temp_arr = comp_thermo_arr[:, get_index_of_string(sub_dicts_with_thermo, 'Post-Shock Processing')]
-            post_shock_thermo_arr = np.array(temp_arr)
-            del temp_arr
-
-        # Smoothing
-        if check_flags['Post-Shock Processing'].get('Smoothing', False):
-            # Thermodynamic State
-            if check_flags['Post-Shock Processing'].get('Thermodynamic State', False):
-                smooth_post_shock_thermo_arr = np.zeros((len(smooth_time_arr), 4))
-                for i in range(0, 3):
-                    [_, temp_arr, _] = polynomial_fit_over_array(time_arr, post_shock_thermo_arr)
-                    smooth_post_shock_thermo_arr[:, i] = temp_arr
-
-    # Step 4:
-
-    # Step 5:
-    # Step 5.1:
-    writeTextFile(os.path.join(output_dir, 'Wave-Tracking-Results.txt'), False)
-    # Step 5.2:
-    if check_flags['Flame Processing'].get('Smoothing', False):
-        writeTextFile(os.path.join(output_dir, 'Wave-Tracking-Smooth-Results.txt'), True)
+                # Step 2.4: Post-Shock Processing
 
     return
 
@@ -863,29 +717,26 @@ def main():
 
     check_flag_dict = {
         'Flame Processing': {
-            'Position': True,
+            'Position': False,
             'Velocity': False,
             'Relative Velocity': False,
-            'Thermodynamic State': True,
-            'Surface Length': True,
-            'Smoothing': True
-        },
-        'Leading Shock Processing': {
-            'Position': True,
-            'Velocity': False,
+            'Thermodynamic State': False,
+            'Surface Length': True
         },
         'Maximum Pressure Processing': {
             'Position': False,
-            'Thermodynamic State': False,
-            'Smoothing': False
+            'Velocity': False,
+            'Thermodynamic State': False
         },
         'Pre-Shock Processing': {
-            'Thermodynamic State': True,
-            'Smoothing': False
+            'Position': False,
+            'Velocity': False,
+            'Thermodynamic State': False
         },
         'Post-Shock Processing': {
-            'Thermodynamic State': False,
-            'Smoothing': False
+            'Position': False,
+            'Velocity': False,
+            'Thermodynamic State': False
         }
     }
 
@@ -936,7 +787,8 @@ def main():
     domain_sizing = domain_size_parameters(updated_data_list[0], row_index)
 
     # Step 6:
-    pelecProcessingFunction(updated_data_list, domain_sizing, input_params, check_flag_dict, output_dir=output_dir_path)
+    waveProcessingFunction(updated_data_list, domain_sizing, input_params, check_flag=check_flag_dict,
+                           output_dir=output_dir_path)
 
     return
 
