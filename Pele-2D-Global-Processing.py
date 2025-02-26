@@ -1,4 +1,4 @@
-import os, yt, itertools, multiprocessing, textwrap
+import os, yt, itertools, multiprocessing, textwrap, re
 import numpy as np
 import cantera as ct
 import matplotlib.pyplot as plt
@@ -46,6 +46,17 @@ def reload_prior_processed_data(raw_file_list, restart_file, check=False):
         return updated_file_list
     else:
         return raw_file_list
+
+
+def sort_files(file_list):
+    def extract_number(file_name):
+        # This regex assumes the number is at the end of the file name
+        match = re.search(r'plt(\d+)$', file_name)
+        return int(match.group(1)) if match else float('inf')
+
+    # Sort the list based on the extracted number
+    sorted_list = sorted(file_list, key=extract_number)
+    return sorted_list
 
 
 def domain_size_parameters(directory_path, desired_y_location):
@@ -120,6 +131,7 @@ def polynomial_fit_over_array(x, y, bin_size=51, degree=1):
             # Fit a polynomial to the data within the bin
             x_bin = np.array(x[start_index:end_index], dtype=float)
             y_bin = np.array(y[start_index:end_index], dtype=float)
+
             coefficients = np.polyfit(x_bin, y_bin, degree)
 
             # Evaluate the polynomial at the given point
@@ -435,6 +447,7 @@ def flameAreaContourFunction(args):
     surface_length = sum(np.sum(distances) for distances in contour_lines)
     print('Flame Surface Length: ', surface_length, 'cm')
     # Plot the 2D contours
+    """
     plt.figure(figsize=(8, 6))
     for contour in contour_segments:
         plt.plot(contour[:, 0], contour[:, 1], linestyle='-')
@@ -442,6 +455,7 @@ def flameAreaContourFunction(args):
     plt.ylabel('y')
     plt.title('2D Iso-contours, Surface Length = {0:<10f} cm'.format(surface_length))
     plt.show()
+    """
 
     return surface_length
 
@@ -470,23 +484,26 @@ def createVariablePltFrame(args):
             ax1.set_xlabel('Position [cm]')
             ax1.set_ylabel(str(tracking_obj[0]))
             ax1.grid(True, axis='x')  # Only x-axis grid lines
-            ax1.set_ylim(0, y_limit_max[0])
+            ax1.set_ylim(y_limit_min[0], y_limit_max[0])
 
             # Create a second Y-axis
             ax2 = ax1.twinx()
             ax2.plot(slice["boxlib", str('x')][ray_sort], slice["boxlib", str(tracking_obj[1])][ray_sort],
                      label=tracking_obj[1], linestyle='--', color='r')
+            if tracking_obj[1] == "pressure":
+                plt.yscale('log')
             ax2.set_ylabel(str(tracking_obj[1]))
-            ax2.set_ylim(0, y_limit_max[1])
+            ax2.set_ylim(y_limit_min[1], y_limit_max[1])
 
             wrapped_title = "\n".join(textwrap.wrap(
                 f"{tracking_obj[0]} and {tracking_obj[1]} Variation at y = {domain_size[1]} and t = {time}", width=55))
         else:
             ax1.plot(slice["boxlib", str('x')][ray_sort], slice["boxlib", str(tracking_obj)][ray_sort],
                      label=tracking_obj, linestyle='-', color='k')
-
+            if tracking_obj == "pressure":
+                plt.yscale('log')
             ax1.set_ylabel(str(tracking_obj))
-            ax1.set_ylim(0, y_limit_max)
+            ax1.set_ylim(y_limit_min, y_limit_max)
 
             wrapped_title = "\n".join(
                 textwrap.wrap(f"{tracking_obj} Variation at y = {domain_size[1]} and t = {time}", width=55))
@@ -516,11 +533,14 @@ def createVariablePltFrame(args):
     input_params = args[1][1]
     tracking_obj = args[1][2]
     if isinstance(tracking_obj, (np.ndarray, list)):
+        y_limit_min = np.zeros(len(tracking_obj))
         y_limit_max = np.zeros(len(tracking_obj))
         for i in range(len(tracking_obj)):
-            y_limit_max[i] = args[1][3][i] + (0.1 * args[1][3][i])
+            y_limit_min[i] = args[1][3][i]
+            y_limit_max[i] = args[1][4][i] + (0.1 * args[1][4][i])
     else:
-        y_limit_max = args[1][3] + (0.1 * args[1][3])
+        y_limit_min = args[1][3]
+        y_limit_max = args[1][4] + (0.1 * args[1][4])
     # Step 2:
     domain_size = domain_sizing[0][1]
     # Step 3: Check/Create directory to store animation frmaes
@@ -905,7 +925,7 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
             temp_arr = comp_thermo_arr[:, get_index_of_string(sub_dicts_with_thermo, 'Flame Processing')]
             flame_thermo_arr = temp_arr[:, 1::]
             if 'time_arr' not in locals():
-                time_arr = temp_arr[:, 0, 0]
+                time_arr = temp_arr[:, 0]
             del temp_arr
 
         # Surface Length
@@ -922,13 +942,14 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
             # Velocity
             if check_flags['Flame Processing'].get('Velocity', False):
                 [_, smooth_flame_vel_arr, _] = polynomial_fit_over_array(time_arr, flame_vel_arr)
+                print("Check Velocitye")
             # Relative Velocity
             if check_flags['Flame Processing'].get('Relative Velocity', False):
                 [_, smooth_flame_rel_vel_arr, _] = polynomial_fit_over_array(time_arr, flame_rel_vel_arr)
             # Thermodynamic State
             if check_flags['Flame Processing'].get('Thermodynamic State', False):
                 smooth_flame_thermo_arr = np.zeros((len(smooth_time_arr), 4))
-                for i in range(0, 3):
+                for i in range(0, 4):
                     [_, temp_arr, _] = polynomial_fit_over_array(time_arr, flame_thermo_arr[:, i])
                     smooth_flame_thermo_arr[:, i] = temp_arr
             # Surface Length
@@ -1029,7 +1050,7 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
             # Thermodynamic State
             if check_flags['Maximum Pressure Processing'].get('Thermodynamic State', False):
                 smooth_max_pres_thermo_arr = np.zeros((len(smooth_time_arr), 4))
-                for i in range(0, 3):
+                for i in range(0, 4):
                     [_, temp_arr, _] = polynomial_fit_over_array(time_arr, max_pres_thermo_arr[:, i])
                     smooth_max_pres_thermo_arr[:, i] = temp_arr
                     if 'smooth_time_arr' not in locals():
@@ -1062,9 +1083,9 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
         if check_flags['Pre-Shock Processing'].get('Smoothing', False):
             if check_flags['Pre-Shock Processing'].get('Thermodynamic State', False):
                 # Thermodynamic State
-                smooth_pre_shock_thermo_arr = np.zeros((len(smooth_time_arr), 3))
-                for i in range(0, 3):
-                    [_, temp_arr, _] = polynomial_fit_over_array(time_arr, pre_shock_thermo_arr[:, i + 1])
+                smooth_pre_shock_thermo_arr = np.zeros((len(smooth_time_arr), 4))
+                for i in range(0, 4):
+                    [_, temp_arr, _] = polynomial_fit_over_array(time_arr, pre_shock_thermo_arr[:, i])
                     smooth_pre_shock_thermo_arr[:, i] = temp_arr
 
     # Step 3.4: Post-Shock Processing
@@ -1091,14 +1112,35 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
         if check_flags['Post-Shock Processing'].get('Smoothing', False):
             # Thermodynamic State
             if check_flags['Post-Shock Processing'].get('Thermodynamic State', False):
-                smooth_post_shock_thermo_arr = np.zeros((len(smooth_time_arr), 3))
-                for i in range(0, 3):
-                    [_, temp_arr, _] = polynomial_fit_over_array(time_arr, post_shock_thermo_arr[:, i + 1])
+                smooth_post_shock_thermo_arr = np.zeros((len(smooth_time_arr), 4))
+                for i in range(0, 4):
+                    [_, temp_arr, _] = polynomial_fit_over_array(time_arr, post_shock_thermo_arr[:, i])
                     smooth_post_shock_thermo_arr[:, i] = temp_arr
 
     # Step 3.5: State Variation Animation
     if 'Domain State Animations' in check_flags:
         # Step 3.5.1: Get last time step maximum parameters
+        raw_data = yt.load(data_dir[0])
+        slice = raw_data.ray(np.array([0.0, domain_info[0][1][1], 0.0]),
+                             np.array([domain_info[0][1][0], domain_info[0][1][1], 0.0]))
+
+        min_val_marker = np.empty(3 + len(input_params.result_species), dtype=object)
+        min_val_arr = np.zeros(3 + len(input_params.result_species))
+        for i in range(len(min_val_arr)):
+            if i == 0:
+                min_val_marker[i] = str('Temp')
+                min_val_arr[i] = np.min(slice["boxlib", str('Temp')])
+            elif i == 1:
+                min_val_marker[i] = 'pressure'
+                min_val_arr[i] = np.min(slice["boxlib", str('pressure')])
+            elif i == 2:
+                min_val_marker[i] = 'x_velocity'
+                min_val_arr[i] = np.min(slice["boxlib", str('x_velocity')])
+            else:
+                min_val_marker[i] = str("Y(" + input_params.result_species[i - 3] + ")")
+                min_val_arr[i] = np.min(slice["boxlib", str("Y(" + input_params.result_species[i - 3] + ")")])
+
+        # Step 3.5.2: Get last time step maximum parameters
         raw_data = yt.load(data_dir[-1])
         slice = raw_data.ray(np.array([0.0, domain_info[0][1][1], 0.0]),
                              np.array([domain_info[0][1][0], domain_info[0][1][1], 0.0]))
@@ -1119,7 +1161,7 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
                 max_val_marker[i] = str("Y(" + input_params.result_species[i - 3] + ")")
                 max_val_arr[i] = np.max(slice["boxlib", str("Y(" + input_params.result_species[i - 3] + ")")])
 
-        # Step 3.5.2: Create plot and animation files
+        # Step 3.5.3: Create plot and animation files
         if check_flags['Domain State Animations'].get('Temperature', False):
             # Create directory for plt files
             temp_plt_dir = ensure_long_path_prefix(
@@ -1131,7 +1173,7 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
             if os.path.exists(temp_plt_dir) is False:
                 os.makedirs(temp_plt_dir, exist_ok=True)
             # Create all the plt files in parallel
-            parallelProcessingFunction(data_dir, (domain_info, input_params, 'Temp', max_val_arr[0],),
+            parallelProcessingFunction(data_dir, (domain_info, input_params, 'Temp', min_val_arr[0], max_val_arr[0],),
                                        createVariablePltFrame, 16)
             # Create the animation file
             createVariableAnimation(temp_plt_dir,
@@ -1148,7 +1190,8 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
             if os.path.exists(temp_plt_dir) is False:
                 os.makedirs(temp_plt_dir, exist_ok=True)
             # Create all the plt files in parallel
-            parallelProcessingFunction(data_dir, (domain_info, input_params, 'pressure', max_val_arr[1],),
+            parallelProcessingFunction(data_dir,
+                                       (domain_info, input_params, 'pressure', min_val_arr[1], max_val_arr[1],),
                                        createVariablePltFrame, 16)
             # Create the animation file
             createVariableAnimation(temp_plt_dir, os.path.join(temp_animation_dir, 'Pressure-Evolution-Animation.mp4'),
@@ -1165,7 +1208,8 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
             if os.path.exists(temp_plt_dir) is False:
                 os.makedirs(temp_plt_dir, exist_ok=True)
             # Create all the plt files in parallel
-            parallelProcessingFunction(data_dir, (domain_info, input_params, 'x_velocity', max_val_arr[2],),
+            parallelProcessingFunction(data_dir,
+                                       (domain_info, input_params, 'x_velocity', min_val_arr[2], max_val_arr[2],),
                                        createVariablePltFrame, 16)
             # Create the animation file
             createVariableAnimation(temp_plt_dir,
@@ -1176,7 +1220,7 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
                 # Create directory for plt files
                 temp_plt_dir = ensure_long_path_prefix(
                     os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
-                                 f"Animation-Frames", f"{str("Y(" + input_params.result_species[i] + ")")}-Plt-Files"))
+                                 f"Animation-Frames", f"Y({str(input_params.result_species[i])})-Plt-Files"))
                 temp_animation_dir = ensure_long_path_prefix(
                     os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results"))
 
@@ -1185,11 +1229,12 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
                 # Create all the plt files in parallel
                 parallelProcessingFunction(data_dir, (domain_info, input_params,
                                                       str("Y(" + input_params.result_species[i] + ")"),
+                                                      min_val_arr[i + 3],
                                                       max_val_arr[i + 3],),
                                            createVariablePltFrame, 16)
                 # Create the animation file
                 createVariableAnimation(temp_plt_dir, os.path.join(temp_animation_dir,
-                                                                   f"{str("Y(" + input_params.result_species[i] + ")")}-Evolution-Animation.mp4"),
+                                                                   f"Y({str(input_params.result_species[i])})-Evolution-Animation.mp4"),
                                         fps=15)
 
         if check_flags['Domain State Animations'].get('Combined', False):
@@ -1208,6 +1253,12 @@ def pelecProcessingFunction(data_dir, domain_info, input_params, check_flags, ou
             parallelProcessingFunction(data_dir, (domain_info, input_params,
                                                   [check_flags['Domain State Animations']['Combined'][0],
                                                    check_flags['Domain State Animations']['Combined'][1]],
+                                                  [min_val_arr[np.argwhere(min_val_marker ==
+                                                                           check_flags['Domain State Animations'][
+                                                                               'Combined'][0])][0][0],
+                                                   min_val_arr[np.argwhere(min_val_marker ==
+                                                                           check_flags['Domain State Animations'][
+                                                                               'Combined'][1])][0][0]],
                                                   [max_val_arr[np.argwhere(max_val_marker ==
                                                                            check_flags['Domain State Animations'][
                                                                                'Combined'][0])][0][0],
@@ -1259,9 +1310,9 @@ def main():
             'Smoothing': True
         },
         'Maximum Pressure Processing': {
-            'Position': True,
+            'Position': False,
             'Thermodynamic State': False,
-            'Smoothing': True
+            'Smoothing': False
         },
         'Pre-Shock Processing': {
             'Thermodynamic State': True,
@@ -1276,7 +1327,7 @@ def main():
             'Pressure': False,
             'Velocity': False,
             'Species': False,
-            'Combined': ('Temp', 'pressure')
+            # 'Combined':('Temp','pressure')
         }
     }
 
@@ -1320,6 +1371,7 @@ def main():
     updated_data_list = reload_prior_processed_data(time_data_dir,
                                                     os.path.join(output_dir_path, f"Wave-Tracking-Results.txt"),
                                                     check=reload_data)
+    updated_data_list = sort_files(updated_data_list)
     # Step 5: Truncate the raw data list if skip loading is enabled
     if skip_load > 0:
         updated_data_list = updated_data_list[0::skip_load]
