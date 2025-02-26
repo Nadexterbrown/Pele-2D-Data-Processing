@@ -1,7 +1,9 @@
-import os, yt, multiprocessing, re, time, textwrap, itertools
+import os, yt, multiprocessing, re, time, textwrap, itertools, traceback, sys
 from scipy.interpolate import RegularGridInterpolator, griddata
 from sklearn.neighbors import NearestNeighbors
 from scipy.spatial import cKDTree
+from scipy.stats import linregress
+from scipy.signal import savgol_filter
 from sdtoolbox.thermo import soundspeed_fr
 from matplotlib.ticker import ScalarFormatter
 import matplotlib.animation as animation
@@ -17,15 +19,14 @@ yt.set_log_level(0)
 ########################################################################################################################
 # Global Program Setting Variables
 ########################################################################################################################
-version = 31
+version = 34
 
 flame_thickness_bin_size = 11
 flame_temp = 2500
-plotting_bnds_bin = 5
-n_procs = 18
+plotting_bnds_bin = 0
+n_procs = 24
 
 data_set = 'PeleC'
-
 
 ########################################################################################################################
 # Global Classes
@@ -72,10 +73,8 @@ class MyClass():
         except Exception as e:
             raise RuntimeError(f"Failed to load mechanism file: {e}")
 
-
 # Global instance of MyClass
 input_params = MyClass()
-
 
 def initialize_parameters(T, P, Phi, Fuel, mech, nitrogenAmount=0):
     """Initialize the parameters with provided values."""
@@ -85,12 +84,11 @@ def initialize_parameters(T, P, Phi, Fuel, mech, nitrogenAmount=0):
     input_params.Fuel = Fuel
     input_params.mech = mech
     input_params.nitrogenAmount = nitrogenAmount
-    input_params.update_composition()  # Update oxygen amount and composition
+    input_params.update_composition()   # Update oxygen amount and composition
     input_params.load_mechanism_species()  # Load species from the mechanism file
 
-
 ########################################################################################################################
-# Function Scripts
+# Function Scripts - Data Handeling
 ########################################################################################################################
 def worker_function(args):
     """Worker function to process data and return the result."""
@@ -99,7 +97,6 @@ def worker_function(args):
     input_params = shared_input_params
     result = predicate((iter_var, const_list, kwargs))
     return result
-
 
 def parallel_processing_function(iter_arr, const_list, predicate, **kwargs):
     if n_procs > 1:
@@ -128,12 +125,10 @@ def parallel_processing_function(iter_arr, const_list, predicate, **kwargs):
 
     return results
 
-
 def init_pool(global_params):
     """Initializer function to set the global variable."""
     global input_params
     input_params = global_params
-
 
 def ensure_long_path_prefix(path):
     """
@@ -150,7 +145,6 @@ def ensure_long_path_prefix(path):
     else:
         return r"\\?\\" + path  # Regular path prefix
 
-
 def sort_files(file_list):
     """
     Args:
@@ -159,7 +153,6 @@ def sort_files(file_list):
     Returns:
         sorted_list: A list of sorted file paths
     """
-
     def extract_number(file_path):
         # Get the base folder name from the full path
         folder_name = os.path.basename(file_path)
@@ -169,12 +162,15 @@ def sort_files(file_list):
 
     return sorted(file_list, key=extract_number)
 
+########################################################################################################################
+# Function Scripts - Data Smoothing
+########################################################################################################################
 
 def data_smoothing_function(data_version, bin_size=51):
     ###########################################
     # Internal Functions
     ###########################################
-    def load_data(file_path):
+    def load_smoothing_data(file_path):
         """
         Load data from the specified file and extract headers from the second commented line.
 
@@ -341,7 +337,7 @@ def data_smoothing_function(data_version, bin_size=51):
     )
 
     # Step 2:
-    raw_data = load_data(
+    raw_data = load_smoothing_data(
         ensure_long_path_prefix(os.path.join(data_dir_path, f"Wave-Tracking-Results-V{data_version}.txt")))
 
     # Step 3: Smooth the data
@@ -354,25 +350,9 @@ def data_smoothing_function(data_version, bin_size=51):
 
     return
 
-
-def convert_units(value, type: str):
-    if type == 'Position' or type == 'x' or type == 'y' or type == 'Flame Thickness' or type == 'Surface Length':
-        return value / 100
-    elif type == 'Temperature' or type == 'Temp':
-        return value
-    elif type == 'Pressure' or type == 'pressure':
-        return value / 10
-    elif type == 'Density' or type == 'density':
-        return value * 1000
-    elif type == 'Velocity' or type == 'Relative Velocity' or type == 'x_velocity' or type == 'y_velocity':
-        return value / 100
-    elif type == 'Heat Release Rate Cantera':
-        return value
-    elif type == 'Heat Release Rate PeleC':
-        return value
-    else:
-        return value
-
+########################################################################################################################
+# Function Scripts - Data Extraction
+########################################################################################################################
 
 def domain_size_parameters(directory_path, desired_y_location):
     """
@@ -394,12 +374,22 @@ def domain_size_parameters(directory_path, desired_y_location):
                             # fields=desired_varables
                             )
 
+
+
     # Create a covering grid at the maximum level present
     x_coords = np.arange(ds.domain_left_edge[0].to_value(), ds.domain_right_edge[0].to_value(), data.dds[0].to_value())
     y_coords = np.arange(ds.domain_left_edge[1].to_value(), ds.domain_right_edge[1].to_value(), data.dds[1].to_value())
     grid_arr = np.array([x_coords, y_coords], dtype=object)
 
-    # Determine the y-slice index and location based on the desired y-location
+    # Access the grid for the highest level
+    highest_level_grids = [grid for grid in ds.index.grids if grid.Level == max_level]
+    # Extract y values from these grids
+    y_values = []
+    for grid in highest_level_grids:
+        y_values.extend(grid['boxlib', 'y'].to_value().flatten())
+    # Get unique y values and store them in an array
+    y_arr = np.unique(y_values)
+
     if isinstance(desired_y_location, str):
         if desired_y_location == "Bottom":
             y_slice_index = 0
@@ -408,20 +398,349 @@ def domain_size_parameters(directory_path, desired_y_location):
             y_slice_index = data.ActiveDimensions[1] - 1
             y_slice_loc = data.RightEdge[1].to_value()
         elif desired_y_location == "DDT":
-            y_slice_index = np.unravel_index(np.argmax(data['boxlib', 'pressure'].to_value(), axis=None),
-                                             data['boxlib', 'pressure'].to_value().shape)[1]
+            y_slice_index = np.unravel_index(np.argmax(data['boxlib', 'Temp'].to_value(), axis=None),
+                                             data['boxlib', 'Temp'].to_value().shape)[1]
             y_slice_loc = data['boxlib', 'y'][0][y_slice_index].to_value()[0]
         else:
             y_slice_index = data.ActiveDimensions[1] // 2 - 1
-            y_slice_loc = data['boxlib', 'y'][0][y_slice_index].to_value()[0]
+            y_slice_loc = y_arr[y_slice_index]
     else:
-        y_slice_index = np.argwhere(data["boxlib", 'y'][0][:].to_value() <= desired_y_location)[-1][0]
-        y_slice_loc = data['boxlib', 'y'][0][y_slice_index].to_value()[0]
+        y_slice_index = np.argmin(abs(y_arr - desired_y_location))
+        y_slice_loc = y_arr[y_slice_index]
 
     return (np.array([[0, y_slice_index], [data.ActiveDimensions[0], y_slice_index]]),
             np.array([[data.LeftEdge[0].to_value(), y_slice_loc], [data.RightEdge[0].to_value(), y_slice_loc]]),
             grid_arr)
 
+def local_data_refinement(raw_data, domain_info, required_vars, preloaded_grids=None):
+    """
+    Extracts refined data for multiple required variables.
+
+    Parameters:
+        raw_data: The full simulation dataset.
+        domain_info: Information about the domain (e.g., y-level for extraction).
+        required_vars: A list of variable names that need to be loaded.
+        preloaded_grids: Optional dictionary of preloaded grids for each refinement level.
+
+    Returns:
+        A dictionary of {mapped_variable_name: (x_sorted, var_sorted)}
+    """
+    VAR_NAME_MAP = {
+        'Temp': 'Temperature',
+        'pressure': 'Pressure',
+        'density': 'Density',
+        'soundspeed': 'Sound Speed',
+        'x_velocity': 'Velocity',
+        'heatRelease': 'Heat Release Rate',
+        'viscosity': 'Viscosity',
+    }
+
+    # Get the maximum refinement level and smallest grid spacing
+    max_level = raw_data.index.max_level
+    dx_min = raw_data.index.get_smallest_dx()
+    # Dictionary to store refined data per level
+    level_data = {level: {var: {} for var in required_vars} for level in range(max_level + 1)}
+    used_grids = {} if preloaded_grids is None else preloaded_grids
+    # If grids are preloaded, process only those levels
+    levels_to_process = reversed(preloaded_grids.keys()) if preloaded_grids else range(max_level, -1, -1)
+    for level in levels_to_process:
+        dx = dx_min.to_value() * 2 ** (max_level - level)  # Grid spacing at this level
+        # If preloaded_grids is provided, only use those specific grids
+        if preloaded_grids:
+            grids = [
+                grid for grid in raw_data.index.grids
+                if any(grid.id == g.id for g in preloaded_grids[level])
+            ]
+        else:
+            grids = [grid for grid in raw_data.index.grids if grid.Level == level]
+        for grid in grids:
+            x = grid["boxlib", "x"].to_value().flatten()
+            y = grid["boxlib", "y"].to_value().flatten()
+            # Find points that match the target y-level
+            mask = np.isclose(y, domain_info[1][0][1], atol=dx)  # Allow small tolerance
+            if np.any(mask) and not preloaded_grids:
+                used_grids.setdefault(level, []).append(grid)  # Store grids only if not preloaded
+            # Process each required variable
+            for var in required_vars:
+                try:
+                    temp_var = grid["boxlib", var].flatten()
+                    for xi, vi in zip(x[mask], temp_var[mask]):
+                        level_data[level][var][xi] = vi  # Higher levels overwrite lower ones
+                except:
+                    continue
+    # Convert to sorted NumPy arrays and apply variable name mapping for each level
+    final_data = {
+        level: {
+            VAR_NAME_MAP.get(var, var): (
+                np.array(sorted(level_data[level][var].keys())),
+                np.array([level_data[level][var][xi] for xi in sorted(level_data[level][var].keys())])
+            )
+            for var in required_vars
+        }
+        for level in range(max_level + 1)
+    }
+
+    # Merge the data from all levels into a single dataset
+    merged_data = {}
+    # Iterate over each variable in final_data
+    for var in final_data[0].keys():
+        # Initialize merged x and y arrays with the data from level 0
+        merged_x = np.array(sorted(final_data[0][var][0]))
+        merged_y = np.array([final_data[0][var][1][np.argmin(np.abs(final_data[0][var][0] - x))] for x in merged_x])
+        # Process levels starting from level 1 upwards
+        for level in range(1, len(final_data)):
+            dx = dx_min.to_value() * 2 ** (max_level - level)  # Grid spacing at this level
+
+            x_next_level, y_next_level = final_data[level][var]
+            # Skip if x_next_level or y_next_level are empty
+            if x_next_level.size == 0 or y_next_level.size == 0:
+                # print(f"Warning: Skipping level {level} for variable {var} due to empty data.")
+                continue
+            # Break up the next level into chunks based on the grid spacing
+            split_indices = np.where(np.diff(x_next_level) > 2 * dx)[0] + 1
+            x_chunks = np.array_split(x_next_level, split_indices)
+            y_chunks = np.array_split(y_next_level, split_indices)
+            # Iterate over x_next_level to insert each value into merged_x
+            for i in range(len(x_chunks)):
+                x_min = x_chunks[i][0]
+                x_max = x_chunks[i][-1]
+                # Check where x_min fits in merged_x and find the nearest value
+                insert_index_min = np.searchsorted(merged_x, x_min)
+                # Check where x_max fits in merged_x and find the nearest value
+                insert_index_max = np.searchsorted(merged_x, x_max)
+                # Remove any overlapping section in merged_x around x_min and x_max
+                merged_x = np.delete(merged_x, np.s_[insert_index_min:insert_index_max])
+                merged_y = np.delete(merged_y, np.s_[insert_index_min:insert_index_max])
+                # Insert the full array of x_chunks[i] and corresponding y_chunks[i] values
+                merged_x = np.insert(merged_x, insert_index_min, x_chunks[i])
+                merged_y = np.insert(merged_y, insert_index_min, y_chunks[i])
+
+        # Store the merged data for the variable
+        merged_data[var] = (merged_x, merged_y)
+
+        plt_check = False
+        if plt_check:
+            plt.figure(figsize=(8, 6))
+            #plt.plot(final_data[6]['Temperature'][0], final_data[6]['Temperature'][1], 'k-', label='Level 6')
+            #plt.plot(final_data[5]['Temperature'][0], final_data[5]['Temperature'][1], 'b.', label='Level 5')
+            #plt.plot(final_data[4]['Temperature'][0], final_data[4]['Temperature'][1], 'g.', label='Level 4')
+            plt.plot(final_data[3]['Temperature'][0], final_data[3]['Temperature'][1], 'y.', label='Level 3')
+            plt.plot(final_data[3]['Temperature'][0], final_data[2]['Temperature'][1], 'y.', label='Level 2')
+            plt.plot(final_data[3]['Temperature'][0], final_data[1]['Temperature'][1], 'y.', label='Level 1')
+            plt.plot(final_data[3]['Temperature'][0], final_data[0]['Temperature'][1], 'y.', label='Level 0')
+            plt.plot(merged_data['Temperature'][0], merged_data['Temperature'][1], 'r--', label='Merged')
+            plt.xlabel('X Values')
+            plt.xlim(140, 220)
+            plt.legend()
+            plt.grid(True)
+            plt.show()
+
+    return merged_data, used_grids
+
+def load_plt_data(file_path, domain_info, CHECK_FLAGS):
+    # Step 1: Load the data using yt
+    raw_data = yt.load(file_path)
+
+    # Step 2:
+    CATEGORY_LOAD_MAP = {
+        'Flame': 'Temp',
+        'Leading Shock': 'pressure',
+        'Maximum Pressure': 'pressure',
+        'Pre-Shock': 'pressure',
+        'Post-Shock': 'pressure',
+    }
+
+    SUB_CATEGORY_MAP = {
+        'Temperature': 'Temp',
+        'Pressure': 'pressure',
+        'Velocity': 'x_velocity',
+        'Relative Velocity': 'x_velocity',
+        'Thermodynamic State': ('Temp', 'pressure', 'density', 'soundspeed'),
+        'Heat Release Rate PeleC': 'heatRelease',
+        'Reynolds Number': 'viscosity',
+    }
+
+    # Dictionary to store values that need to be loaded
+    values_to_load = set()
+
+    # Step 1: Check each category
+    for category, sub_dict in CHECK_FLAGS.items():
+        if isinstance(sub_dict, dict):  # Ensure it's a dictionary
+            has_true_value = any(
+                (isinstance(value, dict) and value.get('Flag', False)) or value is True
+                for value in sub_dict.values()
+            )
+
+            if has_true_value:
+                # Check if category has a mapped variable
+                if category in CATEGORY_LOAD_MAP:
+                    values_to_load.add(CATEGORY_LOAD_MAP[category])
+
+                # Step 2: Check subcategories
+                for sub_key in sub_dict.keys():
+                    if sub_key in SUB_CATEGORY_MAP:
+                        sub_value = SUB_CATEGORY_MAP[sub_key]
+                        if isinstance(sub_value, tuple):  # Handle multiple variables
+                            for sub_sub_value in sub_value:
+                                if ("boxlib", sub_sub_value) in raw_data.field_list:
+                                    values_to_load.add(sub_sub_value)
+                        else:
+                            if ("boxlib", sub_value) in raw_data.field_list:
+                                values_to_load.add(sub_value)
+
+    # Step 3: Extract the required variables
+    data, grids = local_data_refinement(raw_data, domain_info, values_to_load)
+
+    return data, grids
+
+
+def preload_value_check(var_str, preloaded_values, raw_data, domain_info, grid_arr, position_flag=False):
+    ###########################################
+    # Internal Functions
+    ###########################################
+    def get_var_name(value):
+        for key, val in VAR_NAME_MAP.items():
+            if val == value:
+                return key  # Return the corresponding key
+        return value  # Return None if value is not found
+
+    ###########################################
+    # Main Function
+    ###########################################
+    """
+    Checks if a variable or list of variables is present in preloaded_values.
+    If found, returns the corresponding value(s); otherwise, calls local_data_refinement().
+
+    :param var_str: A single string or a list/tuple of strings to check.
+    :param preloaded_values: The dictionary or list structure containing preloaded values.
+    :param not_found_value: The value to return if a variable is not found (default: None).
+    :param raw_data: Data needed for local_data_refinement() if a value is missing.
+    :param domain_info: Domain info for local_data_refinement().
+    :param load_arr: Load array for local_data_refinement().
+    :param grid_arr: Preloaded grids for local_data_refinement().
+    :return: A single value if var_str is a string, or a dictionary mapping each variable to its value/not_found_value.
+    """
+    # Step 1:
+    VAR_NAME_MAP = {
+        'Temperature': 'Temp',
+        'Pressure': 'pressure',
+        'Density': 'density',
+        'Sound Speed': 'soundspeed',
+        'Velocity': 'x_velocity',
+        'Heat Release Rate': 'heatRelease',
+        'Viscosity': 'viscosity',
+    }
+
+    # Step 2:
+    results = {}
+    missing_var = []
+    if isinstance(var_str, (tuple, list)):
+        # Step 3: Check each variable in the list
+        for var in var_str:
+            if preloaded_values is not None and var in preloaded_values[0]:
+                results[var] = preloaded_values[preloaded_values[0].index(var) + 1]
+
+            elif var in VAR_NAME_MAP.keys() and ("boxlib", VAR_NAME_MAP.get(var)) in raw_data.field_list:
+                missing_var.append(VAR_NAME_MAP.get(var))
+
+            elif ("boxlib", var) in raw_data.field_list:
+                missing_var.append(var)
+
+            else:
+                results[var] = None
+
+        # Step 4:
+        if missing_var:
+            if 'Position' in missing_var:
+                missing_var.remove('Position')
+                position_flag = True
+
+            tmp_arr, _ = local_data_refinement(raw_data, domain_info, missing_var, preloaded_grids=grid_arr)
+            for var in missing_var:
+                if var in VAR_NAME_MAP.values():
+                    results[get_var_name(var)] = tmp_arr[get_var_name(var)][1]
+                else:
+                    results[var] = tmp_arr[var][1]
+
+            if position_flag:
+                if missing_var:
+                    return tmp_arr[var_str[0]][0], results
+                else:
+                    return preloaded_values[1], results
+            else:
+                return results
+
+        else:
+            if position_flag:
+                if preloaded_values is not None:
+                    return preloaded_values[1], results
+                else:
+                    tmp_arr, _ = local_data_refinement(raw_data, domain_info, missing_var, preloaded_grids=grid_arr)
+                    return tmp_arr[var_str[0]][0], results
+            else:
+                return results
+
+    # Step 2: Check if the variable is in preloaded_values
+    elif isinstance(var_str, str):
+        if preloaded_values is not None and var_str in preloaded_values[0]:
+            results[var_str] = preloaded_values[preloaded_values[0].index(var_str) + 1]
+            return results
+
+        elif var_str in VAR_NAME_MAP.keys() and ("boxlib", VAR_NAME_MAP.get(var_str)) in raw_data.field_list:
+            missing_var = VAR_NAME_MAP.get(var_str)
+
+        elif ("boxlib", var_str) in raw_data.field_list:
+            missing_var = var_str
+
+        else:
+            results[var_str] = None
+
+        # Step 4:
+        if missing_var:
+            if 'Position' in missing_var:
+                missing_var.remove('Position')
+                position_flag = True
+
+            tmp_arr, _ = local_data_refinement(raw_data, domain_info, missing_var, preloaded_grids=grid_arr)
+            if var_str in VAR_NAME_MAP.values():
+                results[get_var_name(var_str)] = tmp_arr[var_str][1]
+            else:
+                results[var_str] = tmp_arr[var_str][1]
+
+            if position_flag:
+                if missing_var:
+                    return tmp_arr[var_str][0], results
+                else:
+                    return preloaded_values[1], results
+            else:
+                return results
+
+    else:
+        raise TypeError("var_str must be a string, list, or tuple")
+
+def convert_units(value, type: str):
+    if type == 'Position' or type == 'x' or type == 'y' or type == 'Flame Thickness' or type == 'Surface Length':
+        return value / 100
+    elif type == 'Temperature' or type == 'Temp':
+        return value
+    elif type == 'Pressure' or type == 'pressure':
+        return value / 10
+    elif type == 'Density' or type == 'density':
+        return value * 1000
+    elif type == 'Velocity' or type == 'Relative Velocity' or type == 'x_velocity' or type == 'y_velocity':
+        return value / 100
+    elif type == 'Heat Release Rate Cantera':
+        return value
+    elif type == 'Heat Release Rate PeleC':
+        return value
+    elif value is None:
+        return np.nan
+    else:
+        return value
+
+########################################################################################################################
+# Function Scripts - Data Plotting
+########################################################################################################################
 
 def plt_var_bnds(args):
     ###########################################
@@ -447,39 +766,36 @@ def plt_var_bnds(args):
 
     # Step 2: Load data from the plot files using yt
     raw_data = yt.load(temp_plt_files)
-    slice = raw_data.ray(
-        np.array([domain_info[1][0][0], domain_info[1][0][1], 0.0]),
-        np.array([domain_info[1][1][0], domain_info[1][1][1], 0.0])
-    )
+    processed_data, grids = load_plt_data(temp_plt_files, domain_info, CHECK_FLAGS)
 
     # Step 3: Loop through each variable and determine bounds
     for i, key in enumerate(keys_with_true_values):
         try:
             if key == 'Temperature':
-                temp_arr = slice['boxlib', 'Temp'].to_value()
+                temp_arr = processed_data['Temperature'][1]
                 value_arr = convert_units(temp_arr, 'Temperature')
             elif key == 'Pressure':
-                temp_arr = slice['boxlib', 'pressure'].to_value()
+                temp_arr = processed_data['Pressure'][1]
                 value_arr = convert_units(temp_arr, 'Pressure')
             elif key == 'Velocity':
-                temp_arr = slice['boxlib', 'x_velocity'].to_value()
+                temp_arr = processed_data['Velocity'][1]
                 value_arr = convert_units(temp_arr, 'x_velocity')
             elif key == 'Species':
                 print('Max Value Determination for Species is W.I.P.')
                 continue
             elif key == 'Heat Release Rate Cantera':
-                temp_arr, _ = heat_release_rate_extractor('Cantera', plt_data=slice,
-                                                          sort_arr=np.argsort(slice['boxlib', 'x']))
+                temp_arr, _ = heat_release_rate_extractor('Cantera', raw_data=raw_data, grid_arr=grids, domain_info=domain_info)
                 value_arr = convert_units(temp_arr, 'Heat Release Rate Cantera')
             elif key == 'Heat Release Rate PeleC':
                 try:
-                    temp_arr, _ = heat_release_rate_extractor('PeleC', plt_data=slice,
-                                                              sort_arr=np.argsort(slice['boxlib', 'x']))
+                    temp_arr = processed_data['Heat Release Rate'][1]
                     value_arr = convert_units(temp_arr, 'Heat Release Rate PeleC')
                 except:
-                    temp_arr, _ = heat_release_rate_extractor('Cantera', plt_data=slice,
-                                                              sort_arr=np.argsort(slice['boxlib', 'x']))
+                    temp_arr, _ = heat_release_rate_extractor('Cantera', raw_data=raw_data, grid_arr=grids, domain_info=domain_info)
                     value_arr = convert_units(temp_arr, 'Heat Release Rate Cantera')
+            elif key == 'Reynolds Number':
+                temp_arr = reynolds_number_extractor('Flame', raw_data=raw_data, grid_arr=grids, domain_info=domain_info)
+                value_arr = convert_units(temp_arr, 'Reynolds Number')
             else:
                 continue  # Skip if key is not recognized
 
@@ -497,7 +813,6 @@ def plt_var_bnds(args):
 
     return temp_bounds_arr
 
-
 def animation_axis(plt_dirs, ddt_dir, ddt_plt_file, domain_info, CHECK_FLAGS):
     ###########################################
     # Main Function
@@ -505,18 +820,15 @@ def animation_axis(plt_dirs, ddt_dir, ddt_plt_file, domain_info, CHECK_FLAGS):
     print('Begin Individual Variable Bounds')
 
     try:
-        ddt_idx = plt_dirs.index(os.path.abspath(
-            os.path.join(os.path.dirname(os.path.realpath(__file__)), ddt_dir, f'Raw-{data_set}-Data', ddt_plt_file)))
+        ddt_idx = plt_dirs.index(os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), ddt_dir, f'Raw-{data_set}-Data', ddt_plt_file)))
     except:
         print('DDT Folder not in current directory, finding appropriate files.')
         temp_dir_path = os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), ddt_dir))
         plt_dirs = [os.path.join(temp_dir_path, raw_data_folder, time_step)
-                    for raw_data_folder in os.listdir(temp_dir_path)
-                    if os.path.isdir(os.path.join(temp_dir_path, raw_data_folder)) and raw_data_folder.startswith(
-                f'Raw-{data_set}')
-                    for time_step in os.listdir(os.path.join(temp_dir_path, raw_data_folder))
-                    if os.path.isdir(os.path.join(temp_dir_path, raw_data_folder, time_step)) and time_step.startswith(
-                'plt')]
+                     for raw_data_folder in os.listdir(temp_dir_path)
+                     if os.path.isdir(os.path.join(temp_dir_path, raw_data_folder)) and raw_data_folder.startswith(f'Raw-{data_set}')
+                     for time_step in os.listdir(os.path.join(temp_dir_path, raw_data_folder))
+                     if os.path.isdir(os.path.join(temp_dir_path, raw_data_folder, time_step)) and time_step.startswith('plt')]
         ddt_idx = plt_dirs.index(os.path.abspath(
             os.path.join(os.path.dirname(os.path.realpath(__file__)), ddt_dir, f'Raw-{data_set}-Data', ddt_plt_file)))
 
@@ -538,12 +850,10 @@ def animation_axis(plt_dirs, ddt_dir, ddt_plt_file, domain_info, CHECK_FLAGS):
         min_index_2nd_col = row_values_2nd_col.index(min(row_values_2nd_col))
         max_index_3rd_col = row_values_3rd_col.index(max(row_values_3rd_col))
 
-        final_results.append([row_texts[min_index_2nd_col], row_values_2nd_col[min_index_2nd_col],
-                              row_values_3rd_col[max_index_3rd_col]])
+        final_results.append([row_texts[min_index_2nd_col], row_values_2nd_col[min_index_2nd_col], row_values_3rd_col[max_index_3rd_col]])
 
     print('Completed Individual Variable Bounds')
     return np.array(final_results, dtype=object)
-
 
 def state_animation(method, **kwargs):
     ###########################################
@@ -741,16 +1051,55 @@ def state_animation(method, **kwargs):
     else:
         print('Error: Did not define viable method argument (Plot or Animate)')
 
+########################################################################################################################
+# Function Scripts - Data Processing
+########################################################################################################################
+
+############################################################
+# Wave Processing Functions
+############################################################
 
 def wave_tracking(wave_type, **kwargs):
-    plt_data = kwargs.get('plt_data')
-    sort_arr = kwargs.get('sort_arr')
+    ###########################################
+    # Internal Functions
+    ###########################################
+    def find_wave_index(wave_type, data_str):
+        if wave_type == 'Flame':
+            tmp_arr = np.zeros(len(data_str), dtype=int)
+            try:
+                tmp_arr[0] = np.argwhere(data_arr['Temperature'] >= flame_temp)[-1]
+                tmp_arr[1] = np.argmax(data_arr['Y(HO2)'])
+
+                if abs(tmp_arr[0] - tmp_arr[1]) > 10:
+                    print('Warning: Flame Location differs by more than 10 cells!\n'
+                            'Flame Temperature Location', x_arr[tmp_arr[0]],
+                            '\nFlame Species Location', x_arr[tmp_arr[1]])
+                return tmp_arr[1]
+            except:
+                print('Error: Could not find Y_H to determine Flame Location!')
+                tmp_arr[0] = np.argwhere(data_arr['Temperature'] >= flame_temp)[-1]
+                return tmp_arr[0]
+        elif wave_type == 'Maximum Pressure':
+            return np.argmax(data_arr['Pressure'])
+        elif wave_type == 'Leading Shock':
+            return np.argwhere(data_arr['Pressure'] >= 1.01 * data_arr['Pressure'][-1])[-1][0]
+        else:
+            raise ValueError('Invalid Wave Type! Must be Flame, Maximum Pressure, or Leading Shock')
+
+    ###########################################
+    # Main Function
+    ###########################################
+    # Step 1: Parse input arguments
+    raw_data = kwargs.get('raw_data')
+    grid_arr = kwargs.get('grid_arr')
+    domain_info = kwargs.get('domain_info')
     pre_loaded_data = kwargs.get('pre_loaded_data')
 
-    wave_type_to_pelec_str = {
+    # Step 2: Define wave type and data string relations
+    WAVE_TYPE_MAP = {
         'Flame': {
-            'PeleC': 'temp',
-            'Pre Loaded': 'Temperature'
+            'PeleC': ('Temp', 'Y(HO2)'),
+            'Pre Loaded': ('Temperature', 'Y(HO2)')
         },
         'Maximum Pressure': {
             'PeleC': 'pressure',
@@ -762,37 +1111,29 @@ def wave_tracking(wave_type, **kwargs):
         }
     }
 
-    def find_wave_idx(data, wave_type):
-        if wave_type == 'Flame':
-            return np.argwhere(data >= flame_temp)[-1][0]
-        elif wave_type == 'Maximum Pressure':
-            return np.argmax(data)
-        elif wave_type == 'Leading Shock':
-            return np.argwhere(data >= 1.01 * data[-1])[-1][0]
-        else:
-            raise ValueError('Invalid Wave Type! Must be Flame, Maximum Pressure, or Leading Shock')
+    data_str = WAVE_TYPE_MAP[wave_type]['Pre Loaded'] if pre_loaded_data is not None else WAVE_TYPE_MAP[wave_type]['PeleC']
 
-    data_str = wave_type_to_pelec_str[wave_type]['Pre Loaded'] if pre_loaded_data is not None else \
-    wave_type_to_pelec_str[wave_type]['PeleC']
-
+    # Step 3: Extract the data for the wave type
     if pre_loaded_data is not None:
-        x_arr = pre_loaded_data[np.argwhere(pre_loaded_data[0] == 'Position')[0][0]]
-        wave_idx = find_wave_idx(pre_loaded_data[np.argwhere(pre_loaded_data[0] == data_str)[0][0]], wave_type)
+        x_arr = pre_loaded_data[pre_loaded_data[0].index('Position') + 1]
+        data_arr = preload_value_check(data_str, pre_loaded_data, raw_data, domain_info, grid_arr)
     else:
-        x_arr = plt_data['boxlib', 'x'][sort_arr].to_value()
-        wave_idx = find_wave_idx(plt_data['boxlib', data_str][sort_arr].to_value(), wave_type)
+        x_arr, data_arr = preload_value_check(data_str, pre_loaded_data, raw_data, domain_info, grid_arr, position_flag=True)
+
+    # Step 4: Find the index of the wave
+    wave_idx = find_wave_index(wave_type, data_str)
 
     return wave_idx, x_arr[wave_idx]
 
+############################################################
+# Thermodynamic Processing Functions
+############################################################
 
 def thermodynamic_state_extractor(wave_type, **kwargs):
     ###########################################
     # Internal Functions
     ###########################################
-    def probe_array(wave_type):
-        position_data = pre_loaded_data[
-            np.argwhere(pre_loaded_data[0] == 'Position')[0][0]] if pre_loaded_data is not None else \
-        plt_data['boxlib', 'x'][sort_arr].to_value()
+    def probe_array():
         wave_loc_adjustments = {
             'Flame': 1e-3,
             'Burned Gas': -1e-3,
@@ -800,62 +1141,68 @@ def thermodynamic_state_extractor(wave_type, **kwargs):
             'Pre-Shock': 1e-3,
             'Post-Shock': -1e-3
         }
+
         if wave_type not in wave_loc_adjustments:
             raise ValueError('Invalid Wave Type!')
-        adjustment = wave_loc_adjustments[wave_type]
-        probe_idx = np.argwhere(position_data >= (wave_loc + adjustment))[0][0]
-        return probe_idx
 
-    def cantera_soundspeed():
-        species_comp = {
-            input_params.species[i]: plt_data["boxlib", f"Y({input_params.species[i]})"][sort_arr][probe_idx].to_value()
-            for i in range(len(input_params.species))}
+        return np.argwhere(x_arr >= (wave_loc + wave_loc_adjustments[wave_type]))[0][0]
+
+    def cantera_soundspeed(data_arr):
+        # Step 1: Set Gas Object and Species Composition
         gas_obj = ct.Solution(input_params.mech)
-        gas_obj.TPY = (
-            pre_loaded_data[np.argwhere(pre_loaded_data[0] == 'Temperature')[0][0]][
-                probe_idx] if pre_loaded_data is not None else plt_data['boxlib', 'Temp'][sort_arr][
-                probe_idx].to_value(),
-            pre_loaded_data[np.argwhere(pre_loaded_data[0] == 'Pressure')[0][0]][
-                probe_idx] if pre_loaded_data is not None else plt_data['boxlib', 'pressure'][sort_arr][
-                                                                   probe_idx].to_value() / 10,
-            species_comp
+
+        species_name_list = [f"Y({species})" for species in input_params.species]
+        tmp_arr, _ = local_data_refinement(raw_data, domain_info, species_name_list, preloaded_grids=grid_arr)
+        species_comp = {input_params.species[i]: tmp_arr[f"Y({input_params.species[i]})"][1][probe_idx] for i in range(len(input_params.species))}
+
+        species_values = {key: arr for key, arr in species_comp.items()}
+
+        gas_obj.TPY = (data_arr[0],
+                       data_arr[1] / 10,
+                       species_values
         )
+
         return soundspeed_fr(gas_obj)
 
     ###########################################
     # Main Function
     ###########################################
+    # Step 1: Parse input arguments
     wave_loc = kwargs.get('wave_loc')
-    plt_data = kwargs.get('plt_data')
-    sort_arr = kwargs.get('sort_arr')
+    raw_data = kwargs.get('raw_data')
+    grid_arr = kwargs.get('grid_arr')
+    domain_info = kwargs.get('domain_info')
     pre_loaded_data = kwargs.get('pre_loaded_data')
 
+    # Step 2: Extract the thermodynamic state
+    if pre_loaded_data is not None:
+        x_arr = pre_loaded_data[pre_loaded_data[0].index('Position') + 1]
+        tmp_arr = preload_value_check(['Temperature', 'Pressure', 'Density', 'Sound Speed'], pre_loaded_data,
+                                       raw_data, domain_info, grid_arr)
+    else:
+        x_arr, tmp_arr = preload_value_check(['Temperature', 'Pressure', 'Density', 'Sound Speed'],
+                                              pre_loaded_data, raw_data, domain_info, grid_arr, position_flag=True)
+
+    # Step 3: Determine the location of the wave
     try:
-        probe_idx = probe_array(wave_type)
+        probe_idx = probe_array()
     except Exception as e:
         print(f"Error Could not find thermodynamic location: {e}")
         probe_idx = -1
 
-    try:
-        sound_speed = plt_data['boxlib', 'soundspeed'][sort_arr][probe_idx].to_value() / 100
-    except:
-        sound_speed = cantera_soundspeed()
+    # Step 4: Return the thermodynamic state
+    data_arr = np.empty(4, dtype=object)
+    data_arr[0] = tmp_arr['Temperature'][probe_idx]
+    data_arr[1] = tmp_arr['Pressure'][probe_idx]
+    data_arr[2] = tmp_arr['Density'][probe_idx]
 
-    if pre_loaded_data is not None:
-        return (
-            pre_loaded_data[np.argwhere(pre_loaded_data[0] == 'Temperature')[0][0]][probe_idx],
-            pre_loaded_data[np.argwhere(pre_loaded_data[0] == 'Pressure')[0][0]][probe_idx],
-            pre_loaded_data[np.argwhere(pre_loaded_data[0] == 'Density')[0][0]][probe_idx],
-            sound_speed
-        )
+    # Step 5: Check if sound speed is missing
+    if data_arr[3] is None:
+        data_arr[3] = cantera_soundspeed(data_arr)
     else:
-        return (
-            plt_data['boxlib', 'Temp'][sort_arr][probe_idx].to_value(),
-            plt_data['boxlib', 'pressure'][sort_arr][probe_idx].to_value() / 10,
-            plt_data['boxlib', 'density'][sort_arr][probe_idx].to_value() * 1000,
-            sound_speed
-        )
+        data_arr[3] = tmp_arr['Sound Speed'][probe_idx]
 
+    return data_arr
 
 def heat_release_rate_extractor(method, **kwargs):
     ###########################################
@@ -863,57 +1210,130 @@ def heat_release_rate_extractor(method, **kwargs):
     ###########################################
     def cantera_hrr():
         # Step 1: Initialize Cantera solution object
-        temp_obj = ct.Solution(input_params.mech)
-        # Step 2: Extract x_values and species names
-        x_values = plt_data['boxlib', 'x'][sort_arr].to_value()
-        species_names = input_params.species
+        tmp_obj = ct.Solution(input_params.mech)
+        # Step 2: Extract the species composition
+        species_name_list = [f"Y({species})" for species in input_params.species]
+        tmp_arr, _ = local_data_refinement(raw_data, domain_info, species_name_list, preloaded_grids=grid_arr)
+        species_comp = {input_params.species[i]: tmp_arr[f"Y({input_params.species[i]})"][1] for i in range(len(input_params.species))}
 
-        # Step 3: Initialize an empty list to store the heat release rates
-        heat_release_rates = []
+        # Step 3: Extract data from preloaded data or from data files
+        x_arr, tmp_arr = preload_value_check(['Temperature', 'Pressure'], pre_loaded_data, raw_data, domain_info,
+                                             grid_arr, position_flag=True)
 
-        # Step 4: Iterate over each x_value
-        for i in range(len(x_values)):
-            # Extract the species composition for the current x_value
-            single_species_comp = {species: plt_data['boxlib', f'Y({species})'][sort_arr][i].to_value() for species in
-                                   species_names}
+        temperature = tmp_arr['Temperature']
+        pressure = tmp_arr['Pressure']
 
-            # Extract the TPY values for the current x_value
-            if pre_loaded_data is not None:
-                temp_obj.TPY = (
-                    pre_loaded_data[np.argwhere(pre_loaded_data[0] == 'Temperature')[0][0]][i],
-                    pre_loaded_data[np.argwhere(pre_loaded_data[0] == 'Pressure')[0][0]][i],
-                    single_species_comp
-                )
-            else:
-                temp_obj.TPY = (
-                    plt_data['boxlib', 'Temp'][sort_arr][i].to_value(),
-                    plt_data['boxlib', 'pressure'][sort_arr][i].to_value() / 10,
-                    single_species_comp
-                )
+        # Step 3: Extract the heat release rate
+        tmp_arr = []
+        for i in range(len(x_arr)):
+            species_values = {key: arr[i] for key, arr in species_comp.items() if len(arr) > i}
 
-            # Calculate the heat release rate for the current x_value
-            heat_release_rates.append(temp_obj.heat_release_rate)
+            tmp_obj.TPY = (temperature[i],
+                           pressure[i],
+                           species_values
+                           )
 
-        return np.array(heat_release_rates)
+            tmp_arr.append(tmp_obj.heat_release_rate)
+
+        return tmp_arr, np.max(tmp_arr)
 
     ###########################################
     # Main Function
     ###########################################
-    # Step 1:
-    plt_data = kwargs.get('plt_data', None)
-    sort_arr = kwargs.get('sort_arr', None)
+    # Step 1: Parse input arguments
+    raw_data = kwargs.get('raw_data', None)
+    grid_arr = kwargs.get('grid_arr', None)
+    domain_info = kwargs.get('domain_info', None)
     pre_loaded_data = kwargs.get('pre_loaded_data', None)
 
     # Step 2:
     if method == 'Cantera':
-        heat_release_rate = cantera_hrr()
+        return cantera_hrr()
     elif method == 'PeleC':
-        heat_release_rate = plt_data['boxlib', 'heatRelease'][sort_arr].to_value()
+        x_arr, tmp_arr = preload_value_check(['heatRelease'], pre_loaded_data, raw_data, domain_info,
+                                             grid_arr, position_flag=True)
+        if tmp_arr['heatRelease'] is None:
+            hrr_arr, _ = cantera_hrr()
+        else:
+            hrr_arr = tmp_arr['heatRelease']
+
+        return hrr_arr, np.max(hrr_arr)
     else:
-        print('Invalid method to determine Heat Release Rate!')
+        raise ValueError('Invalid Method! Must be Cantera or PeleC')
 
-    return heat_release_rate, np.max(heat_release_rate)
+def reynolds_number_extractor(wave_type, **kwargs):
+    ###########################################
+    # Internal Functions
+    ###########################################
+    def probe_array():
+        wave_loc_adjustments = {
+            'Flame': 1e-3,
+            'Burned Gas': -1e-3,
+            'Maximum Pressure': 0,
+            'Pre-Shock': 1e-3,
+            'Post-Shock': -1e-3
+        }
 
+        if wave_type not in wave_loc_adjustments:
+            raise ValueError('Invalid Wave Type!')
+
+        return np.argwhere(x_arr >= (wave_loc + wave_loc_adjustments[wave_type]))[0][0]
+
+    # Step 1: Parse input arguments
+    wave_loc = kwargs.get('wave_loc', None)
+    raw_data = kwargs.get('raw_data', None)
+    grid_arr = kwargs.get('grid_arr', None)
+    domain_info = kwargs.get('domain_info', None)
+    pre_loaded_data = kwargs.get('pre_loaded_data', None)
+
+    # Step 2: Extract the parameters to calculate reynolds number
+    x_arr, tmp_arr = preload_value_check(['Temperature', 'Pressure', 'Density', 'Viscosity', 'Velocity'],
+                                         pre_loaded_data, raw_data, domain_info, grid_arr, position_flag=True)
+
+    temperature = tmp_arr['Temperature']
+    pressure = tmp_arr['Pressure']
+    density = tmp_arr['Density']
+    viscosity = tmp_arr['Viscosity']
+    velocity = tmp_arr['Velocity']
+
+    # Step 3: Calculate viscosity is nessisary
+    if viscosity is None:
+        # Step 3.1: Extract the species composition
+        species_name_list = [f"Y({species})" for species in input_params.species]
+        tmp_arr, _ = local_data_refinement(raw_data, domain_info, species_name_list, preloaded_grids=grid_arr)
+        species_comp = {input_params.species[i]: tmp_arr[f"Y({input_params.species[i]})"][1] for i in
+                        range(len(input_params.species))}
+
+        tmp_obj = ct.Solution(input_params.mech)
+        viscosity = []
+        for i in range(len(x_arr)):
+            species_values = {key: arr[i] for key, arr in species_comp.items() if len(arr) > i}
+
+            tmp_obj.TPY = (temperature[i],
+                           pressure[i],
+                           species_values
+                           )
+
+            viscosity.append(tmp_obj.viscosity)
+
+    # Step 4: Determine the location of the wave
+    try:
+        probe_idx = probe_array()
+    except Exception as e:
+        print(f"Error Could not find thermodynamic location: {e}")
+        probe_idx = -1
+
+    # Step 4: Calculate the Reynolds Number
+    reynolds_number = ((density * (100 ** 3) / 1000) * (velocity / 100) * (raw_data.domain_width[1].to_value() / 100)) / viscosity
+
+    if wave_loc is not None:
+        return reynolds_number[probe_idx], reynolds_number
+    else:
+        return reynolds_number
+
+############################################################
+# Flame Geometry Processing Functions
+############################################################
 
 def flame_geometry_function(raw_data, domain_info, output_dir, CHECK_FLAGS):
     ###########################################
@@ -938,8 +1358,7 @@ def flame_geometry_function(raw_data, domain_info, output_dir, CHECK_FLAGS):
         plt.grid(True, linestyle='--', alpha=0.5)
         plt.legend()
         filename = os.path.join(output_dir_path,
-                                f"Flame-Length-Animation-Time-{raw_data.current_time.to_value():.16f}".rstrip(
-                                    '0').rstrip('.') + '.png')
+                                f"Flame-Length-Animation-{raw_data.basename}.png")
         plt.savefig(filename, format='png')
         plt.close()
 
@@ -963,8 +1382,7 @@ def flame_geometry_function(raw_data, domain_info, output_dir, CHECK_FLAGS):
 
         plt.title(f'Flame Normal: {raw_data.current_time.to_value()}')
         filename = os.path.join(output_dir_path,
-                                f"Flame-Thickness-Animation-Time-{raw_data.current_time.to_value():.16f}".rstrip(
-                                    '0').rstrip('.') + '.png')
+                                f"Flame-Thickness-Animation-{raw_data.basename}.png")
         plt.savefig(filename, format='png')
         plt.close()
 
@@ -1303,7 +1721,7 @@ def flame_geometry_function(raw_data, domain_info, output_dir, CHECK_FLAGS):
                 temp_grad)
 
             temp_plt_dir = ensure_long_path_prefix(
-                os.path.join(output_dir_path, "Animation-Frames", "Flame Thickness-Plt-Files"))
+                os.path.join(output_dir_path, "Animation-Frames", "Flame-Thickness-Plt-Files"))
             os.makedirs(temp_plt_dir, exist_ok=True)
             plot_flame_thickness_and_contour(region_grid, region_temperature, contour_arr, normal_line,
                                              interpolator, temp_plt_dir)
@@ -1313,6 +1731,212 @@ def flame_geometry_function(raw_data, domain_info, output_dir, CHECK_FLAGS):
 
         return flame_thickness_val
 
+    def wavelength(output_dir):
+        def distance_along_curve(x, y):
+            """Compute the distance along the curve."""
+            dx = np.gradient(x)
+            dy = np.gradient(y)
+            ds = np.sqrt(dx ** 2 + dy ** 2)
+            s = np.cumsum(ds)
+            return s
+
+        def fractal_analysis(s, x, y, scales=128):
+            def count_steps(points, caliper_size):
+                steps = 0
+                i = 0
+                while i < len(points) - 1:
+                    dist = 0
+                    j = i + 1
+                    while j < len(points) - 1 and dist < caliper_size:
+                        dist = np.linalg.norm(points[j] - points[i])
+                        j += 1
+                    steps += 1
+                    i = j
+                return steps
+
+            ###########################################
+            # Calculates the fractal dimension of a curve using an overlapping box counting method
+            #
+            # Args:
+            #   x: x-coordinates of the curve
+            #   y: y-coordinates of the curve
+            #   fractal_bin_size: Size of the bin for the fractal analysis
+            #
+            # Returns:
+            #   fractal_dimension: The fractal dimension of the curve
+            ###########################################
+
+            # Convert to numpy arrays
+            s = np.array(s)
+            x = np.array(x)
+            y = np.array(y)
+
+            # Step 1: Determine the bounds on the flame contour
+            min_caliper = np.min(np.abs(np.diff(s))[np.abs(np.diff(s)) > 0]) / 2
+            max_caliper = s[-1] * 10
+
+            # Step 2: Determine the number of bins in the x and y directions
+            """
+            # Compute log-space parameters
+            mean_log_caliper = (np.log(min_caliper) + np.log(max_caliper)) / 2  # Mean in log space
+            std_log_caliper = (np.log(max_caliper) - np.log(min_caliper)) / 4  # Spread in log space
+            # Generate log-normal distributed values
+            caliper_size = np.random.lognormal(mean=mean_log_caliper, sigma=std_log_caliper, size=10 * scales)
+            # Filter values within bounds
+            caliper_size = np.sort(caliper_size[(caliper_size >= min_caliper) & (caliper_size <= max_caliper)])
+            """
+            caliper_size = np.logspace(np.log10(min_caliper), np.log10(max_caliper), scales)
+
+            N_pts = []
+            for i in range(len(caliper_size)):
+                N_pts.append(count_steps(np.column_stack((x, y)), caliper_size[i]))
+            N_pts = np.array(N_pts)
+
+            # Step 3: Determine the inner and outer cuttoff bounds from a smoothed curve
+
+            # Smooth Data
+            N_pts_smooth = savgol_filter(N_pts, 10, 1)
+
+            # Step 4:
+            window_size = 3
+            log_caliper_size = np.log(caliper_size)
+            log_N_smooth_pts = np.log(N_pts_smooth)
+            log_N_pts = np.log(N_pts)
+
+            left_slope, _, _, _, _ = linregress(log_caliper_size[0:window_size], log_N_smooth_pts[0:window_size])
+            right_slope, _, _, _, _ = linregress(log_caliper_size[len(log_caliper_size) - window_size - 1:-1],
+                                                 log_N_smooth_pts[len(log_N_smooth_pts) - window_size - 1:-1])
+
+            window_size = 10
+            frac_dim_slopes = []
+            frac_dim_r_values = []
+            slopes_smooth = []
+            for i in range(window_size // 2, len(log_caliper_size) - window_size // 2):
+                # Select a window of points around the current index 'i'
+                x_window = log_caliper_size[i - window_size // 2:i + window_size // 2 + 1]
+                y_window = log_N_smooth_pts[i - window_size // 2:i + window_size // 2 + 1]
+
+                # Fit a line (linear regression)
+                slope, intercept, r_value, _, _ = linregress(x_window, y_window)
+                slopes_smooth.append(slope)
+
+                # Select a window of points around the current index 'i'
+                x_window = log_caliper_size[i - window_size // 2:i + window_size // 2 + 1]
+                y_window = log_N_pts[i - window_size // 2:i + window_size // 2 + 1]
+
+                # Fit a line (linear regression)
+                frac_dim_slope, intercept, r_value, _, _ = linregress(x_window, y_window)
+                frac_dim_slopes.append(frac_dim_slope)
+                frac_dim_r_values.append(r_value)
+
+            # Step 5: Determine the fractal dimension
+            idx = None
+            best_r2 = -np.inf  # Start with a very low r²
+            best_slope = None
+
+            for i in range(len(frac_dim_slopes)):
+                abs_slope = abs(frac_dim_slopes[i])
+                if 1 <= abs_slope <= 2:  # Check if the slope is in the expected range
+                    current_r2 = frac_dim_r_values[i] ** 2
+
+                    # Ensure it's a stable region by comparing neighboring slopes
+                    if i > 0 and i < len(frac_dim_slopes) - 1:
+                        slope_variation_pre = abs(frac_dim_slopes[i] - frac_dim_slopes[i - window_size // 2])
+                        slope_variation_post = abs(frac_dim_slopes[i] - frac_dim_slopes[i + window_size // 2])
+                        if slope_variation_pre > 0.1 and slope_variation_post > 0.1:  # Too much variation indicates instability
+                            continue
+
+                    if current_r2 > best_r2:
+                        idx = i
+                        best_r2 = current_r2
+                        best_slope = frac_dim_slopes[i]
+
+            # If no valid slope is found, fall back to the max r² approach
+            if idx is None:
+                print('No valid slope found. Using the maximum r**2 value.')
+                idx = np.argmax(np.array(frac_dim_r_values) ** 2)
+                best_slope = frac_dim_slopes[idx]
+
+            # Step 5: Determine the intersection points (inner and outer cutoffs)
+            inner_cutoff_line = np.exp(left_slope * log_caliper_size + log_N_smooth_pts[0]) / N_pts[0]
+            outer_cutoff_line = np.exp(right_slope * log_caliper_size + log_N_smooth_pts[-1]) / N_pts[0]
+            frac_dim_line = np.exp(best_slope * (log_caliper_size - log_caliper_size[idx]) + log_N_smooth_pts[idx]) / \
+                            N_pts[
+                                0]
+
+            inner_cutoff = caliper_size[np.argmin(abs(inner_cutoff_line - frac_dim_line))]
+            outer_cutoff = caliper_size[np.argmin(abs(outer_cutoff_line - frac_dim_line))]
+
+            # Plot the results
+            temp_plt_dir = ensure_long_path_prefix(
+                os.path.join(output_dir, f"Animation-Frames", f"Wavelength-Plt-Files"))
+
+            if os.path.exists(temp_plt_dir) is False:
+                os.makedirs(temp_plt_dir, exist_ok=True)
+
+            fig, axs = plt.subplots(2, 1, figsize=(8, 8))
+            # Adjust space between subplots
+            fig.subplots_adjust(hspace=0.5)  # Increase spacing between plots
+
+            # Original Data Plot
+            axs[0].plot(x, y, 'k-', label="Original Data")
+            axs[0].set_xlabel("X (cm)")
+            axs[0].set_ylabel("Y (cm)")
+
+            # Fractal Analysis Curve
+            axs[1].plot(caliper_size, N_pts / N_pts[0], 'ko', label="Original Data")
+            axs[1].plot(caliper_size, N_pts_smooth / N_pts_smooth[0], 'b-', label="Smoothed Data (Savitzky-Golay)")
+            axs[1].plot(caliper_size, inner_cutoff_line, 'k--', label="Left Boundary")
+            axs[1].plot(caliper_size, outer_cutoff_line, 'k--', label="Right Boundary")
+            axs[1].plot(caliper_size, frac_dim_line, 'r-', label="Max Slope")
+
+            # Title with error handling
+            try:
+                axs[1].set_title(f"Fractal Analysis:\n"
+                                 f"Inner Cutoff: {inner_cutoff}, Outer Cutoff: {outer_cutoff}\n"
+                                 f"Fractal Dimension (Slope): {abs(best_slope)}",
+                                 multialignment='center')
+            except Exception as e:
+                print(f"Error setting title: {e}")
+
+            axs[1].set_xscale('log')
+            axs[1].set_yscale('log')
+            axs[1].set_xlabel("Caliper Size")
+            axs[1].set_ylabel("N(Caliper Size)")
+            axs[1].legend(loc="lower left")
+
+            # Corrected ylim setting
+            min_outer = min(outer_cutoff_line)
+            max_inner = max(inner_cutoff_line)
+            axs[1].set_ylim(min_outer - 0.25 * min_outer, max_inner + 0.25 * max_inner)
+
+            filename = os.path.join(temp_plt_dir, f"Fractal-Animation-{raw_data.basename}.png")
+            plt.savefig(filename, format='png')
+            plt.close()
+
+            return abs(best_slope)
+
+        # Step 1: Process only the longest segment
+        temp_list = []
+        for i in range(len(sorted_segments)):
+            temp_list.append(len(sorted_segments[i]))
+
+        idx = np.argmax(temp_list)
+
+        # Step 2: Select the points consisting of the flame tip
+        x_loc_bnds = np.max(sorted_segments[idx][:, 0]) - 0.25 * (
+                    np.max(sorted_segments[idx][:, 0]) - np.min(sorted_segments[idx][:, 0]))
+
+        x_filterd = sorted_segments[idx][:, 0][sorted_segments[idx][:, 0] >= x_loc_bnds]
+        y_filterd = sorted_segments[idx][:, 1][sorted_segments[idx][:, 0] >= x_loc_bnds]
+
+        # Step 2: Perform curvature analysis on the longest segment
+        curve_dist = distance_along_curve(x_filterd, y_filterd)
+        # curvature_analysis(curve_dist, sorted_segments[idx][:, 0], sorted_segments[idx][:, 1])
+        fractal_dimension = fractal_analysis(curve_dist, x_filterd, y_filterd, 96)
+
+        return fractal_dimension
+
     ###########################################
     # Main Function
     ###########################################
@@ -1320,17 +1944,22 @@ def flame_geometry_function(raw_data, domain_info, output_dir, CHECK_FLAGS):
     domain_grid = domain_info[-1]
     center_val = domain_info[1]
 
-    results = np.empty(2, dtype=object)
+    results = np.empty(3, dtype=object)
     # Step 1: Extract the flame contour and sort the points by nearest neighbors
     raw_data.force_periodicity()
     try:
-        contour_verts = manually_aquire_flame_contour(raw_data)
+        try:
+            contour_verts = manually_aquire_flame_contour(raw_data)
+        except Exception as e:
+            contour_verts = raw_data.all_data().extract_isocontours("Temp", flame_temp)
+            print(f"Error: Unable to manually extract flame contour: {e}")
+
         sorted_points, sorted_segments, contour_length = sort_by_nearest_neighbors(contour_verts, domain_grid)
 
         if 'Domain State Animations' in CHECK_FLAGS:
             if CHECK_FLAGS['Domain State Animations'].get('Surface Contour', False):
                 temp_plt_dir = ensure_long_path_prefix(
-                    os.path.join(output_dir, f"Animation-Frames", f"Surface Contour-Plt-Files"))
+                    os.path.join(output_dir, f"Animation-Frames", f"Surface-Contour-Plt-Files"))
 
                 if os.path.exists(temp_plt_dir) is False:
                     os.makedirs(temp_plt_dir, exist_ok=True)
@@ -1354,8 +1983,26 @@ def flame_geometry_function(raw_data, domain_info, output_dir, CHECK_FLAGS):
         else:
             results[1] = np.nan
 
+    if CHECK_FLAGS['Flame'].get('Wavelength', False):
+        if contour_length != 0:
+            try:
+                results[2] = wavelength(output_dir)
+            except Exception as e:
+                # Get the traceback as a string
+                exc_type, exc_value, exc_tb = sys.exc_info()
+                traceback_details = traceback.format_exception(exc_type, exc_value, exc_tb)
+
+                # Print the error message with the specific line
+                print("".join(traceback_details))
+
+                print(f"Error: Unable to extract flame wavelength: {e}")
+                results[2] = np.nan
+
     return results
 
+########################################################################################################################
+# Parallelization Scripts
+########################################################################################################################
 
 def single_file_processing(args):
     ###########################################
@@ -1365,20 +2012,21 @@ def single_file_processing(args):
         # Step 1: Load and sort the pelec plot file data
         raw_data = yt.load(pltFile_dir)
         time = raw_data.current_time.to_value()
-        slice = raw_data.ray(np.array([domain_info[1][0][0], domain_info[1][0][1], 0.0]),
-                             np.array([domain_info[1][1][0], domain_info[1][1][1], 0.0]))
-        ray_sort = np.argsort(slice['boxlib', 'x'])
 
         # Step 2: Depending on the desired pre-loaded variables
-        identifier = np.array(['Identifier', 'Position', 'Temperature', 'Pressure', 'Density'])
-        position = slice['boxlib', 'x'][ray_sort].to_value()
-        temperature = slice['boxlib', 'Temp'][ray_sort].to_value()
-        pressure = slice['boxlib', 'pressure'][ray_sort].to_value()
-        density = slice['boxlib', 'density'][ray_sort].to_value()
+        data, grids = load_plt_data(pltFile_dir, domain_info, CHECK_FLAGS)
 
-        pre_loaded_data = np.array([identifier, position, temperature, pressure, density], dtype=object)
+        pre_loaded_data = np.empty(len(data) + 2, dtype=object)
 
-        return time, raw_data, slice, ray_sort, pre_loaded_data
+        # Initialize the first element as a list
+        pre_loaded_data[0] = ['Position']
+        pre_loaded_data[1] = data[next(iter(data))][0]
+
+        for i, key in enumerate(data.keys()):
+            pre_loaded_data[0].append(key)  # Append the key name
+            pre_loaded_data[i + 2] = data[key][1]  # Store corresponding data
+
+        return time, raw_data, pre_loaded_data, grids
 
     ###########################################
     # Main Function
@@ -1393,7 +2041,7 @@ def single_file_processing(args):
     CHECK_FLAGS = kwargs.get('CHECK_FLAGS', [])
 
     # Step 1: Load the PeleC data from the desired plot file
-    time, raw_data, plt_data, sort_arr, pre_loaded_data = load_data()
+    time, raw_data, pre_loaded_data, grids = load_data()
 
     # Step 2: Process the data, extracting the desired parameters for the stated wave types
     result_dict = {'Time': {'Value': time}}
@@ -1403,14 +2051,15 @@ def single_file_processing(args):
         result_dict[result_key] = {}
         if CHECK_FLAGS[result_key].get('Position', False):
             if result_key in ['Pre-Shock', 'Post-Shock']:
-                result_dict[result_key]['Index'], result_dict[result_key]['Position'] = result_dict['Leading Shock'][
-                    'Index'], result_dict['Leading Shock']['Position']
+                result_dict[result_key]['Index'], result_dict[result_key]['Position'] = result_dict['Leading Shock']['Index'], result_dict['Leading Shock']['Position']
             elif result_key in ['Burned Gas']:
-                result_dict[result_key]['Index'], result_dict[result_key]['Position'] = result_dict['Flame']['Index'], \
-                result_dict['Flame']['Position']
+                result_dict[result_key]['Index'], result_dict[result_key]['Position'] = result_dict['Flame']['Index'], result_dict['Flame']['Position']
             else:
                 try:
                     result_dict[result_key]['Index'], result_dict[result_key]['Position'] = wave_tracking(wave_type,
+                                                                                                          raw_data=raw_data,
+                                                                                                          grid_arr=grids,
+                                                                                                          domain_info=domain_info,
                                                                                                           pre_loaded_data=pre_loaded_data)
                 except Exception as e:
                     print(f"Error: Unable to determine {pltFile_dir} {result_key} position: {e}")
@@ -1420,53 +2069,53 @@ def single_file_processing(args):
         if CHECK_FLAGS[result_key].get('Thermodynamic State', False):
             if 'Position' not in result_dict[result_key]:
                 if result_key in ['Pre-Shock', 'Post-Shock']:
-                    result_dict[result_key]['Index'], result_dict[result_key]['Position'] = \
-                    result_dict['Leading Shock']['Index'], result_dict['Leading Shock']['Position']
+                    result_dict[result_key]['Index'], result_dict[result_key]['Position'] = result_dict['Leading Shock']['Index'], result_dict['Leading Shock']['Position']
                 elif result_key in ['Burned Gas']:
-                    result_dict[result_key]['Index'], result_dict[result_key]['Position'] = result_dict['Flame'][
-                        'Index'], result_dict['Flame']['Position']
+                    result_dict[result_key]['Index'], result_dict[result_key]['Position'] = result_dict['Flame']['Index'], result_dict['Flame']['Position']
                 else:
                     result_dict[result_key]['Index'], result_dict[result_key]['Position'] = wave_tracking(wave_type,
+                                                                                                          raw_data=raw_data,
+                                                                                                          grid_arr=grids,
+                                                                                                          domain_info=domain_info,
                                                                                                           pre_loaded_data=pre_loaded_data)
 
             result_dict[result_key]['Thermodynamic State'] = thermodynamic_state_extractor(wave_type,
-                                                                                           plt_data=plt_data,
-                                                                                           sort_arr=sort_arr,
+                                                                                           raw_data=raw_data,
+                                                                                           grid_arr=grids,
+                                                                                           domain_info=domain_info,
                                                                                            pre_loaded_data=pre_loaded_data,
                                                                                            wave_loc=
                                                                                            result_dict[result_key][
                                                                                                'Position'])
+        if CHECK_FLAGS[result_key].get('Reynolds Number', False):
+            result_dict[result_key]['Reynolds Number'],  result_dict[result_key]['Reynolds Number Array']= reynolds_number_extractor(wave_type,
+                                                                                                                                     raw_data=raw_data,
+                                                                                                                                     grid_arr=grids,
+                                                                                                                                     domain_info=domain_info,
+                                                                                                                                     pre_loaded_data=pre_loaded_data,
+                                                                                                                                     wave_loc=result_dict[result_key]['Position'])
 
     # Step 3: Flame Processing
     if 'Flame' in CHECK_FLAGS:
         process_wave('Flame', 'Flame')
         if CHECK_FLAGS['Flame'].get('Relative Velocity', False):
-            result_dict['Flame']['Gas Velocity'] = plt_data["boxlib", "x_velocity"][sort_arr][
-                result_dict['Flame']['Index'] + 10].to_value()
+            temp_var =  next(iter(local_data_refinement(raw_data, domain_info, ['x_velocity'], preloaded_grids=grids)[0].values()))[1]
+            result_dict['Flame']['Gas Velocity'] = temp_var[result_dict['Flame']['Index'] + 10]
         if CHECK_FLAGS['Flame'].get('Heat Release Rate Cantera', False):
-            result_dict['Flame']['Heat Release Rate Cantera Array'], result_dict['Flame'][
-                'Heat Release Rate Cantera'] = heat_release_rate_extractor('Cantera', plt_data=plt_data,
-                                                                           sort_arr=np.argsort(plt_data['boxlib', 'x']))
+            result_dict['Flame']['Heat Release Rate Cantera Array'], result_dict['Flame']['Heat Release Rate Cantera'] = heat_release_rate_extractor('Cantera', raw_data=raw_data, grid_arr=grids, domain_info=domain_info)
         if CHECK_FLAGS['Flame'].get('Heat Release Rate PeleC', False):
             try:
-                result_dict['Flame']['Heat Release Rate PeleC Array'], result_dict['Flame'][
-                    'Heat Release Rate PeleC'] = heat_release_rate_extractor('PeleC', plt_data=plt_data,
-                                                                             sort_arr=np.argsort(
-                                                                                 plt_data['boxlib', 'x']))
+                result_dict['Flame']['Heat Release Rate PeleC Array'], result_dict['Flame']['Heat Release Rate PeleC'] = heat_release_rate_extractor('PeleC', raw_data=raw_data, grid_arr=grids, domain_info=domain_info)
             except:
-                result_dict['Flame']['Heat Release Rate PeleC Array'], result_dict['Flame'][
-                    'Heat Release Rate PeleC'] = heat_release_rate_extractor('Cantera', plt_data=plt_data,
-                                                                             sort_arr=np.argsort(
-                                                                                 plt_data['boxlib', 'x']))
-        if CHECK_FLAGS['Flame'].get('Flame Thickness', False) or CHECK_FLAGS['Flame'].get('Surface Length', False):
-            result_dict['Flame']['Surface Length'], result_dict['Flame']['Flame Thickness'] = flame_geometry_function(
-                raw_data, domain_info, output_dir, CHECK_FLAGS)
+                result_dict['Flame']['Heat Release Rate PeleC Array'], result_dict['Flame']['Heat Release Rate PeleC'] = heat_release_rate_extractor('Cantera', raw_data=raw_data, grid_arr=grids, domain_info=domain_info)
+        if CHECK_FLAGS['Flame'].get('Flame Thickness', False) or CHECK_FLAGS['Flame'].get('Surface Length', False) or CHECK_FLAGS['Flame'].get('Wavelength', False):
+            result_dict['Flame']['Surface Length'], result_dict['Flame']['Flame Thickness'],  result_dict['Flame']['Wavelength'] = flame_geometry_function(raw_data, domain_info, output_dir, CHECK_FLAGS)
 
     if 'Burned Gas' in CHECK_FLAGS:
         process_wave('Burned Gas', 'Burned Gas')
         if CHECK_FLAGS['Burned Gas'].get('Velocity', False):
-            result_dict['Burned Gas']['Velocity'] = plt_data["boxlib", "x_velocity"][sort_arr][
-                result_dict['Flame']['Index'] - 10].to_value()
+            temp_var = next(iter(local_data_refinement(raw_data, domain_info, ['x_velocity'], preloaded_grids=grids)[0].values()))[1]
+            result_dict['Burned Gas']['Velocity'] = temp_var[result_dict['Flame']['Index'] - 10]
 
     # Step 4: Maximum Pressure Processing
     if 'Maximum Pressure' in CHECK_FLAGS:
@@ -1488,7 +2137,7 @@ def single_file_processing(args):
     if 'Domain State Animations' in CHECK_FLAGS:
         for key, value in CHECK_FLAGS.get('Domain State Animations', {}).items():
             # Skip specific keys
-            if key in ['Surface Contour', 'Flame Thickness']:
+            if key in ['Surface Contour', 'Flame Thickness', 'Wavelength']:
                 continue
 
             # Check if value is a dictionary and extract relevant flags
@@ -1500,18 +2149,12 @@ def single_file_processing(args):
 
             if bool_check:
                 # Handle x_data_arr
-                if pre_loaded_data is not None and len(pre_loaded_data) > 0 and 'Position' in pre_loaded_data[0]:
-                    x_data_arr = pre_loaded_data[np.argwhere(pre_loaded_data[0] == 'Position')[0][0]]
-                else:
-                    x_data_arr = plt_data['boxlib', 'x'][sort_arr].to_value()
-
-                # Handle y_data_arr
-                if pre_loaded_data is not None and len(pre_loaded_data) > 0 and key in pre_loaded_data[0]:
-                    y_data_arr = pre_loaded_data[np.argwhere(pre_loaded_data[0] == key)[0][0]]
-                elif key in ['Heat Release Rate Cantera', 'Heat Release Rate PeleC']:
+                x_data_arr, tmp_arr = preload_value_check([key], pre_loaded_data, raw_data, domain_info, grids,
+                                                          position_flag=True)
+                if key in ['Heat Release Rate Cantera', 'Heat Release Rate PeleC', 'Reynolds Number']:
                     y_data_arr = result_dict['Flame'].get(f'{key} Array', None)
                 else:
-                    y_data_arr = plt_data['boxlib', pele_name][sort_arr].to_value()
+                    y_data_arr = tmp_arr[key]
 
                 # Determine bounds
                 bnd_arr_index = [item[0] for item in animation_bnds].index(key)
@@ -1523,8 +2166,7 @@ def single_file_processing(args):
                 else:
                     animation_str = key  # If no space, keep the original string
 
-                temp_plt_dir = ensure_long_path_prefix(
-                    os.path.join(output_dir, "Animation-Frames", f"{animation_str}-Plt-Files"))
+                temp_plt_dir = ensure_long_path_prefix(os.path.join(output_dir, "Animation-Frames", f"{animation_str}-Plt-Files"))
                 os.makedirs(temp_plt_dir, exist_ok=True)
 
                 # Call state_animation
@@ -1553,16 +2195,25 @@ def single_file_processing(args):
             else:
                 animation_str.append(name)  # If no space, keep the original string
         # Step 2: Extract the pelec strings of the enabled subdictionaries
-        pelec_values = [
-            value['PeleC']
-            for value in CHECK_FLAGS.get('Combined State Animations', {}).values()
-            if isinstance(value, dict) and value.get('Flag', False)
-        ]
 
-        # Step 3: Create a temporary array to store the plot data for each enabled subdictionary
-        temp_plot_data = np.empty(len(pelec_values), dtype=object)
-        for i, pelec_str in enumerate(pelec_values):
-            temp_plot_data[i] = plt_data['boxlib', pelec_str][sort_arr].to_value()
+        state_animations = CHECK_FLAGS.get('Combined State Animations', {})
+        valid_keys = {
+            key: value for key, value in state_animations.items()
+            if isinstance(value, dict) and value.get('Flag', False)
+        }
+
+        i = 0
+        y_data_arr = np.empty(len(valid_keys.keys()), dtype=object)
+        for key, value in valid_keys.items():
+            # Handle x_data_arr
+            x_data_arr, tmp_arr = preload_value_check([key], pre_loaded_data, raw_data, domain_info, grids,
+                                                      position_flag=True)
+            if key in ['Heat Release Rate Cantera', 'Heat Release Rate PeleC', 'Reynolds Number']:
+                y_data_arr[i] = result_dict['Flame'].get(f'{key} Array', None)
+            else:
+                y_data_arr[i] = tmp_arr[key]
+
+            i += 1
 
         # Step 4: Find the corresponding bounds for each subdictionary
         bnd_arr_indices = [
@@ -1571,14 +2222,13 @@ def single_file_processing(args):
         y_lims = [[animation_bnds[idx][1], animation_bnds[idx][2]] for idx in bnd_arr_indices]
 
         # Step 5: Create the output directory for the combined state animations
-        temp_plt_dir = ensure_long_path_prefix(
-            os.path.join(output_dir, f"Animation-Frames", f"{'-'.join(animation_str)}-Plt-Files"))
+        temp_plt_dir = ensure_long_path_prefix(os.path.join(output_dir, f"Animation-Frames", f"{'-'.join(animation_str)}-Plt-Files"))
         os.makedirs(temp_plt_dir, exist_ok=True)
 
         state_animation(method='Plot',
                         time=time,
-                        x_data_arr=plt_data['boxlib', 'x'][sort_arr].to_value(),
-                        y_data_arr=temp_plot_data,
+                        x_data_arr=x_data_arr,
+                        y_data_arr=y_data_arr,
                         y_bounds=y_lims,
                         domain_size=domain_info,
                         var_name=subdict_names,
@@ -1599,17 +2249,26 @@ def single_file_processing(args):
             else:
                 animation_str.append(name)  # If no space, keep the original string
 
-        # Step 2: Extract the pelec strings of the enabled subdictionaries
-        pelec_values = [
-            value['PeleC']
-            for value in CHECK_FLAGS.get('Local State Animations', {}).values()
+        # Step 2: Extract the strings of the enabled subdictionaries
+        state_animations = CHECK_FLAGS.get('Combined State Animations', {})
+        valid_keys = {
+            key: value for key, value in state_animations.items()
             if isinstance(value, dict) and value.get('Flag', False)
-        ]
+        }
 
         # Step 3: Create a temporary array to store the plot data for each enabled subdictionary
-        temp_plot_data = np.empty(len(pelec_values), dtype=object)
-        for i, pelec_str in enumerate(pelec_values):
-            temp_plot_data[i] = plt_data['boxlib', pelec_str][sort_arr].to_value()
+        i = 0
+        y_data_arr = np.empty(len(valid_keys.keys()), dtype=object)
+        for key, value in valid_keys.items():
+            # Handle x_data_arr
+            x_data_arr, tmp_arr = preload_value_check([key], pre_loaded_data, raw_data, domain_info, grids,
+                                                      position_flag=True)
+            if key in ['Heat Release Rate Cantera', 'Heat Release Rate PeleC', 'Reynolds Number']:
+                y_data_arr[i] = result_dict['Flame'].get(f'{key} Array', None)
+            else:
+                y_data_arr[i] = tmp_arr[key]
+
+            i += 1
 
         # Step 4: Find the corresponding bounds for each subdictionary
         bnd_arr_indices = [
@@ -1617,17 +2276,11 @@ def single_file_processing(args):
         ]
 
         local_physical_window = CHECK_FLAGS['Local State Animations']['Physical Window']
-        wave_loc = result_dict[f'{CHECK_FLAGS['Local State Animations']['Wave of Interest']}'][
-            'Position'] if 'Position' in result_dict[
-            f'{CHECK_FLAGS['Local State Animations']['Wave of Interest']}'] else wave_tracking(plt_data, sort_arr,
-                                                                                               pre_loaded_data=pre_loaded_data)
+        wave_loc = result_dict[f'{CHECK_FLAGS['Local State Animations']['Wave of Interest']}']['Position'] if 'Position' in result_dict[f'{CHECK_FLAGS['Local State Animations']['Wave of Interest']}'] else wave_tracking(raw_data=raw_data, grid_arr=grids, domain_info=domain_info, pre_loaded_data=pre_loaded_data)
 
-        x_idx = [np.searchsorted(plt_data['boxlib', 'x'][sort_arr].to_value(), wave_loc - local_physical_window,
-                                 side='left'),
-                 np.searchsorted(plt_data['boxlib', 'x'][sort_arr].to_value(), wave_loc + local_physical_window,
-                                 side='right')]
-        x_lim = [plt_data['boxlib', 'x'][sort_arr][x_idx[0]].to_value(),
-                 plt_data['boxlib', 'x'][sort_arr][x_idx[1]].to_value()]
+        x_idx = [np.searchsorted(x_data_arr, wave_loc - local_physical_window, side='left'),
+                 np.searchsorted(x_data_arr, wave_loc + local_physical_window, side='right')]
+        x_lim = [x_data_arr[x_idx[0]], x_data_arr[x_idx[1]]]
         y_lims = [[animation_bnds[idx][1], animation_bnds[idx][2]] for idx in bnd_arr_indices]
 
         # Step 5: Create the output directory for the combined state animations
@@ -1637,8 +2290,8 @@ def single_file_processing(args):
 
         state_animation(method='Plot',
                         time=time,
-                        x_data_arr=plt_data['boxlib', 'x'][sort_arr].to_value(),
-                        y_data_arr=temp_plot_data,
+                        x_data_arr=x_data_arr,
+                        y_data_arr=y_data_arr,
                         x_bounds=x_lim,
                         y_bounds=None,
                         domain_size=domain_info,
@@ -1647,7 +2300,6 @@ def single_file_processing(args):
                         output_dir_path=temp_plt_dir)
 
     return result_dict
-
 
 def pelec_processing(pelec_dirs, domain_info, animation_bnds, output_dir, CHECK_FLAGS, SMOOTHING_FLAG):
     ###########################################
@@ -1710,21 +2362,17 @@ def pelec_processing(pelec_dirs, domain_info, animation_bnds, output_dir, CHECK_
                                               output_dir=output_dir)
 
     # Step 2: Re-organize the processed data for ease of manipulation
-    collective_results = {
-        master_key: {slave_key: [pelec_data[i][master_key][slave_key] for i in range(len(pelec_data))] for slave_key in
-                     pelec_data[0][master_key]} for master_key in pelec_data[0]}
+    collective_results = {master_key: {slave_key: [pelec_data[i][master_key][slave_key] for i in range(len(pelec_data))] for slave_key in pelec_data[0][master_key]} for master_key in pelec_data[0]}
 
     # Step 3: Process each key in CHECK_FLAGS
     def process_key(key):
         if key in CHECK_FLAGS:
             print(f'Starting {key} Processing')
             if CHECK_FLAGS[key].get('Velocity', False):
-                collective_results[key]['Velocity'] = np.gradient(collective_results[key]['Position']) / np.gradient(
-                    collective_results['Time']['Value'])
+                collective_results[key]['Velocity'] = np.gradient(collective_results[key]['Position']) / np.gradient(collective_results['Time']['Value'])
             if CHECK_FLAGS[key].get('Relative Velocity', False):
                 if 'Velocity' in collective_results[key]:
-                    collective_results[key]['Relative Velocity'] = collective_results[key]['Velocity'] - \
-                                                                   collective_results[key]['Gas Velocity']
+                    collective_results[key]['Relative Velocity'] = collective_results[key]['Velocity'] - collective_results[key]['Gas Velocity']
                 else:
                     print('ERROR: Must Enable Velocity Flag to compute the relative velocity')
             print(f'Completed {key} Processing')
@@ -1734,8 +2382,7 @@ def pelec_processing(pelec_dirs, domain_info, animation_bnds, output_dir, CHECK_
 
     # Step 8: Write to file, if any of the sub-dictionary values except 'Domain State Animations' are true
     print('Start Output File Writing')
-    write_to_file = any(
-        any(sub_dict.values()) for key, sub_dict in CHECK_FLAGS.items() if key != 'Domain State Animations')
+    write_to_file = any(any(sub_dict.values()) for key, sub_dict in CHECK_FLAGS.items() if key != 'Domain State Animations')
 
     if write_to_file:
         file_output(ensure_long_path_prefix(os.path.join(output_dir, f'Wave-Tracking-Results-V{version}.txt')), False)
@@ -1745,7 +2392,6 @@ def pelec_processing(pelec_dirs, domain_info, animation_bnds, output_dir, CHECK_
 
     # Step 7: Create Variable Evolution
     print('Starting Animation Processing')
-
     def process_animations(animation_type, prefix=None):
         subdict_names = [
             key for key, value in CHECK_FLAGS.get(animation_type, {}).items()
@@ -1759,10 +2405,8 @@ def pelec_processing(pelec_dirs, domain_info, animation_bnds, output_dir, CHECK_
                 else:
                     animation_str = name  # If no space, keep the original string
 
-                temp_plt_dir = ensure_long_path_prefix(
-                    os.path.join(output_dir, f"Animation-Frames", f"{animation_str}-Plt-Files"))
-                animation_filename = ensure_long_path_prefix(
-                    os.path.join(output_dir, f"{animation_str}-Evolution-Animation.mp4"))
+                temp_plt_dir = ensure_long_path_prefix(os.path.join(output_dir, f"Animation-Frames", f"{animation_str}-Plt-Files"))
+                animation_filename = ensure_long_path_prefix(os.path.join(output_dir, f"{animation_str}-Evolution-Animation.mp4"))
 
                 try:
                     state_animation(
@@ -1783,15 +2427,11 @@ def pelec_processing(pelec_dirs, domain_info, animation_bnds, output_dir, CHECK_
             animation_str = '-'.join(animation_str)
 
             if prefix is None:
-                temp_plt_dir = ensure_long_path_prefix(
-                    os.path.join(output_dir, f"Animation-Frames", f"{animation_str}-Plt-Files"))
-                animation_filename = ensure_long_path_prefix(
-                    os.path.join(output_dir, f"{animation_str}-Evolution-Animation.mp4"))
+                temp_plt_dir = ensure_long_path_prefix(os.path.join(output_dir, f"Animation-Frames", f"{animation_str}-Plt-Files"))
+                animation_filename = ensure_long_path_prefix(os.path.join(output_dir, f"{animation_str}-Evolution-Animation.mp4"))
             else:
-                temp_plt_dir = ensure_long_path_prefix(
-                    os.path.join(output_dir, f"Animation-Frames", f"{prefix}-{animation_str}-Plt-Files"))
-                animation_filename = ensure_long_path_prefix(
-                    os.path.join(output_dir, f"{prefix}-{animation_str}-Evolution-Animation.mp4"))
+                temp_plt_dir = ensure_long_path_prefix(os.path.join(output_dir, f"Animation-Frames", f"{prefix}-{animation_str}-Plt-Files"))
+                animation_filename = ensure_long_path_prefix(os.path.join(output_dir, f"{prefix}-{animation_str}-Evolution-Animation.mp4"))
 
             try:
                 state_animation(
@@ -1809,10 +2449,10 @@ def pelec_processing(pelec_dirs, domain_info, animation_bnds, output_dir, CHECK_
     print('Completed Animation Processing')
     return
 
-
 ########################################################################################################################
 # Main Script
 ########################################################################################################################
+
 def main():
     start_time = time.time()
     ####################################################################################################################
@@ -1822,9 +2462,10 @@ def main():
     # All functions are configured for a 2 dimensional space
     ####################################################################################################################
     # Step 1: Set all the desired tasks to be performed by the python script
-    row_idx = 'DDT'
+    #row_idx = 'DDT'
+    row_idx = 0.0462731
     ddt_dir = '../../../Domain-Length-284cm/0.09cm-Complete-Domain/Planar-Kernel-Level-6-Part-3'
-    ddt_plt_file = 'plt332200'
+    ddt_plt_file = 'plt332330'
 
     SMOOTHING_FLAG = True
     CHECK_FLAGS = {
@@ -1836,7 +2477,9 @@ def main():
             'Heat Release Rate Cantera': True,
             'Heat Release Rate PeleC': True,
             'Flame Thickness': True,
-            'Surface Length': True
+            'Surface Length': True,
+            'Wavelength': True,
+            'Reynolds Number': True
         },
         'Burned Gas': {
             'Velocity': True,
@@ -1857,32 +2500,34 @@ def main():
             'Thermodynamic State': True
         },
         'Domain State Animations': {
-            'Temperature': {'PeleC': 'Temp', 'Flag': True},
-            'Pressure': {'PeleC': 'pressure', 'Flag': True},
-            'Velocity': {'PeleC': 'x_velocity', 'Flag': True},
-            'Species': {'PeleC': None, 'Flag': None},
-            'Heat Release Rate Cantera': {'PeleC': None, 'Flag': True},
-            'Heat Release Rate PeleC': {'PeleC': 'heatRelease', 'Flag': True},
-            'Surface Contour': {'PeleC': None, 'Flag': True},
-            'Flame Thickness': {'PeleC': None, 'Flag': True},
+            'Temperature': {'PeleC':'Temp', 'Preload': 'Temperature', 'Flag':True},
+            'Pressure': {'PeleC':'pressure', 'Preload': 'Pressure', 'Flag':True},
+            'Velocity': {'PeleC':'x_velocity', 'Preload': 'Velocity', 'Flag':True},
+            'Species': {'PeleC':None, 'Preload': None, 'Flag':None},
+            'Heat Release Rate Cantera': {'PeleC':None, 'Preload': None, 'Flag':True},
+            'Heat Release Rate PeleC':   {'PeleC':'heatRelease', 'Preload': 'Heat Release Rate', 'Flag':True},
+            'Surface Contour': {'PeleC':None, 'Preload': None, 'Flag':True},
+            'Flame Thickness': {'PeleC':None, 'Preload': None, 'Flag':True},
+            'Wavelength': {'PeleC':None, 'Preload': None, 'Flag':True},
+            'Reynolds Number': {'PeleC': None, 'Preload': None, 'Flag': True}
         },
         'Combined State Animations': {
-            'Temperature': {'PeleC': 'Temp', 'Flag': True, 'Local': False},
-            'Pressure': {'PeleC': 'pressure', 'Flag': True, 'Local': False},
-            'Velocity': {'PeleC': 'x_velocity', 'Flag': False, 'Local': False},
+            'Temperature': {'PeleC':'Temp', 'Preload': 'Temperature', 'Flag':True, 'Local': False},
+            'Pressure': {'PeleC':'pressure', 'Preload': 'Pressure', 'Flag':True, 'Local': False},
+            'Velocity': {'PeleC':'x_velocity', 'Preload': 'Velocity', 'Flag':False, 'Local': False},
             'Species': False,
             'Heat Release Rate Cantera': False,
-            'Heat Release Rate PeleC': {'PeleC': 'heatRelease', 'Flag': True, 'Local': False}
+            'Heat Release Rate PeleC': {'PeleC':'heatRelease', 'Preload': 'Heat Release Rate', 'Flag':True, 'Local': False}
         },
-        'Local State Animations': {
+        'Local State Animations':{
             'Wave of Interest': 'Flame',
             'Physical Window': 0.01,
-            'Temperature': {'PeleC': 'Temp', 'Flag': True},
-            'Pressure': {'PeleC': 'pressure', 'Flag': True},
-            'Velocity': {'PeleC': 'x_velocity', 'Flag': False},
+            'Temperature': {'PeleC': 'Temp', 'Preload': 'Temperature', 'Flag': True},
+            'Pressure': {'PeleC': 'pressure', 'Preload': 'Pressure', 'Flag': True},
+            'Velocity': {'PeleC': 'x_velocity', 'Preload': 'Velocity', 'Flag': False},
             'Species': False,
             'Heat Release Rate Cantera': False,
-            'Heat Release Rate PeleC': {'PeleC': 'heatRelease', 'Flag': True}
+            'Heat Release Rate PeleC': {'PeleC': 'heatRelease', 'Preload': 'Heat Release Rate', 'Flag': True}
         }
     }
 
@@ -1900,23 +2545,19 @@ def main():
 
     time_data_dir = [os.path.join(dir_path, raw_data_folder, time_step)
                      for raw_data_folder in os.listdir(dir_path)
-                     if os.path.isdir(os.path.join(dir_path, raw_data_folder)) and raw_data_folder.startswith(
-            f'Raw-{data_set}')
+                     if os.path.isdir(os.path.join(dir_path, raw_data_folder)) and raw_data_folder.startswith(f'Raw-{data_set}')
                      for time_step in os.listdir(os.path.join(dir_path, raw_data_folder))
-                     if
-                     os.path.isdir(os.path.join(dir_path, raw_data_folder, time_step)) and time_step.startswith('plt')]
+                     if os.path.isdir(os.path.join(dir_path, raw_data_folder, time_step)) and time_step.startswith('plt')]
 
     # Step 4: Chronologically order the pltFiles and truncate the raw data list if skip loading is enabled
     updated_data_list = sort_files(time_data_dir)
 
     # Step 5: Determine the domain sizing parameters (size, # of cells)
     domain_info = domain_size_parameters(
-        os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), ddt_dir, f'Raw-{data_set}-Data',
-                                     ddt_plt_file)) if row_idx == 'DDT' else updated_data_list[0], row_idx)
+        os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), ddt_dir, f'Raw-{data_set}-Data', ddt_plt_file)) if row_idx == 'DDT' else updated_data_list[0], row_idx)
 
     # Step 6: Create the result directories
-    os.makedirs(os.path.join(dir_path, f"Processed-Global-Results-V{version}", f"y-{domain_info[1][0][1]:.3g}cm"),
-                exist_ok=True)
+    os.makedirs(os.path.join(dir_path, f"Processed-Global-Results-V{version}", f"y-{domain_info[1][0][1]:.3g}cm"), exist_ok=True)
     output_dir_path = os.path.join(dir_path, f"Processed-Global-Results-V{version}", f"y-{domain_info[1][0][1]:.3g}cm")
 
     # Step 7:
@@ -1930,7 +2571,6 @@ def main():
     end_time = time.time()
     print(f"Execution time: {end_time - start_time} seconds")
     return
-
 
 if __name__ == '__main__':
     main()
