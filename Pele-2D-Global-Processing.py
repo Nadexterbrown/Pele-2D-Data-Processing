@@ -1,8 +1,6 @@
-import os, yt, itertools, multiprocessing, textwrap, re, sys
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
+import os, yt, itertools, multiprocessing, textwrap, re, time
 from sklearn.neighbors import NearestNeighbors
 from sdtoolbox.thermo import soundspeed_fr
-from threading import Timer
 import matplotlib.animation as animation
 import matplotlib.image as mpimg
 import matplotlib.pyplot as plt
@@ -14,7 +12,7 @@ yt.set_log_level(0)
 n_proc = 24
 polyfit_bin_size = 51
 plotting_bnds_bin = 3
-flame_thickness_bin_size = 11
+flame_thickness_bin_size = 21
 
 
 class MyClass():
@@ -268,22 +266,22 @@ def domain_size_parameters(directory_path, desired_y_location):
             y_slice_index = data.ActiveDimensions[1] - 1
             y_slice_loc = data.RightEdge[1].to_value()
         elif desired_y_location == "DDT":
-            y_slice_index = np.unravel_index(np.argmax(data["boxlib", 'density'].to_value(), axis=None),
-                                             data["boxlib", 'density'].to_value().shape)
-            y_slice_loc = data["boxlib", str('y')][0][y_slice_index].to_value()[0]
+            y_slice_index = np.unravel_index(np.argmax(data['boxlib', 'pressure'].to_value(), axis=None),
+                                             data['boxlib', 'pressure'].to_value().shape)
+            y_slice_loc = data['boxlib', 'y'][0][y_slice_index].to_value()[0]
         else:
             y_slice_index = int((data.ActiveDimensions[1] / 2) - 1)
-            y_slice_loc = data["boxlib", str('y')][0][y_slice_index].to_value()[0]
+            y_slice_loc = data['boxlib', str('y')][0][y_slice_index].to_value()[0]
     else:
-        y_slice_index = np.argwhere(data["boxlib", str('y')][0][:].to_value() <= desired_y_location)[-1][0]
-        y_slice_loc = data["boxlib", str('y')][0][y_slice_index].to_value()[0]
+        y_slice_index = np.argwhere(data["boxlib", 'y'][0][:].to_value() <= desired_y_location)[-1][0]
+        y_slice_loc = data['boxlib', 'y'][0][y_slice_index].to_value()[0]
 
     return (np.array([[0, int(y_slice_index)], [int(data.ActiveDimensions[0]), int(y_slice_index)]]),
             np.array([[data.LeftEdge[0].to_value(), y_slice_loc], [data.RightEdge[0].to_value(), y_slice_loc]]),
             grid_arr)
 
 
-def wave_tracking_function(raw_data, sort_arr, tracking_str, wave_type):
+def wave_tracking_function(raw_data, sort_arr, wave_type):
     """
 
     Args:
@@ -294,66 +292,56 @@ def wave_tracking_function(raw_data, sort_arr, tracking_str, wave_type):
     Returns:
 
     """
-    # Step 1: Load the desired marker and x positions
-    temp_data = raw_data["boxlib", str(tracking_str)][sort_arr].to_value()
-    temp_x_pos = raw_data["boxlib", str('x')][sort_arr].to_value()
-    # Step 2:
+    # Step 1: Load the positions array
+    temp_x_pos = raw_data['boxlib', 'x'][sort_arr].to_value()
+    # Step 2: Given the wave tracking criterion (flame, max pressure, leading shock) determine the location of said wave
     if wave_type == "Flame":
-        wave_index = np.argwhere(temp_data >= 2000)[-1][0]
+        # Determine the flame location based on the 2000 degree isotherm
+        wave_index = np.argwhere(raw_data['boxlib', 'Temp'][sort_arr].to_value() >= 2000)[-1][0]
     elif wave_type == "Maximum Pressure":
-        temp_index = temp_data
-        wave_index = np.argwhere(temp_index == np.max(temp_index))[-1][0]
+        # Determine the maximum pressure location based on the maximum value present in the pressure array
+        wave_index = np.argwhere(raw_data['boxlib', 'pressure'][sort_arr].to_value() == np.max(
+            raw_data['boxlib', 'pressure'][sort_arr].to_value()))[-1][0]
     elif wave_type == "Leading Shock":
-        # From the farthest right point in the domain, determine the leading pressure wave location by 1% increase from this value
-        pressure_baseline = temp_data[-1]
         try:
-            wave_index = np.argwhere(temp_data >= 1.01 * pressure_baseline)[-1][0]
+            # Determine the leading shock location based on the point of pressure higher than the initial pressure condition
+            wave_index = np.argwhere(raw_data['boxlib', 'pressure'][sort_arr].to_value() >= 1.01 *
+                                     raw_data['boxlib', 'pressure'][sort_arr].to_value()[-1])[-1][0]
         except:
             wave_index = 0
-    # Step 3:
-    plt_check = False
-    if plt_check:
-        plt.figure(figsize=(8, 6))
-        plt.plot(temp_x_pos, temp_data, linestyle='-', color='k')
-        plt.plot(temp_x_pos[wave_index], temp_data[wave_index], marker='.', linestyle='-', color='r')
-        plt.xlabel('x')
-        plt.ylabel('y')
-        plt.title(f"{tracking_str}")
-        plt.show()
 
     return wave_index, temp_x_pos[wave_index] / 100
 
 
 def thermodynamic_state_function(raw_data, sort_arr, wave_idx, wave_type, input_params):
     # Step 1: Collect the position of the wave
-    wave_pos = raw_data["boxlib", str('x')][sort_arr].to_value()[wave_idx]
+    wave_pos = raw_data["boxlib", 'x'][sort_arr].to_value()[wave_idx]
 
     # Step 2:
     if wave_type == "Flame":
-        probe_index = np.argwhere(raw_data["boxlib", str('x')][sort_arr].to_value() >= wave_pos + (-0.001))[0][0]
+        probe_index = np.argwhere(raw_data['boxlib', 'x'][sort_arr].to_value() >= wave_pos + (-0.001))[0][0]
     elif wave_type == "Maximum Pressure":
         try:
-            probe_index = np.argwhere(raw_data["boxlib", str('x')][sort_arr].to_value() >= wave_pos)[0][0]
+            probe_index = np.argwhere(raw_data['boxlib', 'x'][sort_arr].to_value() >= wave_pos)[0][0]
         except:
-            probe_index = len(raw_data["boxlib", str('x')][sort_arr]) - 1
+            probe_index = len(raw_data['boxlib', 'x'][sort_arr]) - 1
+
     elif wave_type == "Pre-Shock" or wave_type == "Post-Shock":
         if wave_type == "Pre-Shock":
             try:
-                probe_index = np.argwhere(raw_data["boxlib", str('x')][sort_arr].to_value() >= wave_pos + (1 / 10))[0][
-                    0]
+                probe_index = np.argwhere(raw_data['boxlib', 'x'][sort_arr].to_value() >= wave_pos + (1 / 10))[0][0]
             except:
-                probe_index = len(raw_data["boxlib", str('x')][sort_arr]) - 1
+                probe_index = len(raw_data['boxlib', 'x'][sort_arr]) - 1
 
         elif wave_type == "Post-Shock":
             try:
-                probe_index = np.argwhere(raw_data["boxlib", str('x')][sort_arr].to_value() >= wave_pos - (1 / 10))[0][
-                    0]
+                probe_index = np.argwhere(raw_data['boxlib', 'x'][sort_arr].to_value() >= wave_pos - (1 / 10))[0][0]
             except:
-                probe_index = len(raw_data["boxlib", str('x')][sort_arr]) - 1
+                probe_index = len(raw_data['boxlib', 'x'][sort_arr]) - 1
 
     # Step 3: Extract the state variables from the raw data
-    temperature = raw_data["boxlib", str('Temp')][sort_arr][probe_index].to_value()
-    pressure = raw_data["boxlib", str('pressure')][sort_arr][probe_index].to_value()
+    temperature = raw_data['boxlib', 'Temp'][sort_arr][probe_index].to_value()
+    pressure = raw_data['boxlib', 'pressure'][sort_arr][probe_index].to_value()
 
     species_comp = {}
     for i in range(len(input_params.species)):
@@ -380,33 +368,19 @@ def thermodynamic_state_function(raw_data, sort_arr, wave_idx, wave_type, input_
 
 def heat_release_rate_function(raw_data, sort_arr, input_params):
     # Step 1: Collect the partial molar enthalpies and net production rates
-    net_production_rates = np.empty(len(raw_data["boxlib", str('x')][sort_arr].to_value()), dtype=object)
-    partial_molar_enthalpies = np.empty(len(raw_data["boxlib", str('x')][sort_arr].to_value()), dtype=object)
-    for i in range(len(raw_data["boxlib", str('x')][sort_arr].to_value())):
+    heat_release_rate = np.zeros(len(raw_data['boxlib', 'x'][sort_arr].to_value()))
+    for i in range(len(raw_data['boxlib', 'x'][sort_arr].to_value())):
         species_comp = {}
         temp_obj = ct.Solution(input_params.mech)
         for j in range(len(temp_obj.species_names)):
             species_comp.update({str(temp_obj.species_names[j]):
-                                     raw_data["boxlib", str("Y(" + temp_obj.species_names[j] + ")")][sort_arr][
-                                         i].to_value()})
+                                     raw_data['boxlib', f'Y({temp_obj.species_names[j]})'][sort_arr][i].to_value()})
 
-        temp_obj.TPY = (raw_data["boxlib", str("Temp")][sort_arr][i].to_value(),
-                        raw_data["boxlib", str("pressure")][sort_arr][i].to_value() * 10,
+        temp_obj.TPY = (raw_data['boxlib', 'Temp'][sort_arr][i].to_value(),
+                        raw_data['boxlib', 'pressure'][sort_arr][i].to_value() * 10,
                         species_comp)
 
-        net_production_rates[i] = temp_obj.net_production_rates
-        partial_molar_enthalpies[i] = temp_obj.partial_molar_enthalpies
-
-        del temp_obj
-
-    # Step 3:
-    heat_release_rate = np.zeros(len(raw_data["boxlib", str('x')][sort_arr].to_value()))
-    for i in range(len(raw_data["boxlib", str('x')][sort_arr].to_value())):
-        integral = 0
-        for j in range(len(input_params.species)):
-            integral = integral + net_production_rates[i][j] * partial_molar_enthalpies[i][j]
-
-        heat_release_rate[i] = -1.0 * integral
+        heat_release_rate[i] = - temp_obj.heat_release_rate
 
     return heat_release_rate, np.max(heat_release_rate)
 
@@ -512,14 +486,12 @@ def flame_geometry_function(raw_data, center_loc, grid, output_dir_path=None, co
                               np.array([grid[0][flame_x_idx + (flame_thickness_bin_size // 2)][0],
                                         grid[1][flame_y_idx + (flame_thickness_bin_size // 2)][0], 1.0]))
 
-        region_mesh_x, region_mesh_y = np.meshgrid(np.unique(region["x"].to_value()), np.unique(region["y"].to_value()))
-
-        region_grid = np.dstack((region["x"].to_value(), region["y"].to_value()))[0]
+        region_grid = np.dstack((region['boxlib', 'x'].to_value(), region['boxlib', 'y'].to_value()))[0]
         # Determine the closes points in the region grid to the line created by the norm
         nearest_norm_idx, nearest_norm_points = closest_point_from_poly(region_grid, flame_norm)
 
         # Collect the temperature points nearest the flame surface norm
-        region_data = region['Temp'][nearest_norm_idx].to_value()
+        region_data = region['boxlib', 'Temp'][nearest_norm_idx].to_value()
 
         # Step 2: Compute the gradient of temperature with respect to position
         # temperature_gradient = abs(np.gradient(region_data) / np.gradient(np.sqrt(temp_grad_x[len()]**2 + temp_grad_y[]**2)))
@@ -561,22 +533,6 @@ def flame_geometry_function(raw_data, center_loc, grid, output_dir_path=None, co
             plt.savefig(filename, format='png')
             plt.show()
             plt.close()
-
-            """
-            plt.figure(figsize=(8, 6))
-            plt.scatter(region["x"].to_value(), region["y"].to_value(),
-                        c=region['Temp'].to_value().reshape(len(np.unique(region["x"].to_value())),
-                                                            len(np.unique(region["y"].to_value()))), cmap='gist_heat',
-                        marker='o')
-            plt.plot(np.array(contour_arr[:, 0], dtype=float), np.array(contour_arr[:, 1], dtype=float), color='r')
-            plt.quiver(grid[0][flame_x_idx][0], grid[1][flame_y_idx][0], flame_norm[0], flame_norm[1],
-                       angles='xy', scale_units='xy', scale=5, color='r', label='Normals')
-            plt.xlabel('x')
-            plt.ylabel('y')
-            plt.xlim(min(region_grid[:, 0].ravel()), max(region_grid[:, 0].ravel()))
-            plt.ylim(min(region_grid[:, 1].ravel()), max(region_grid[:, 1].ravel()))
-            plt.show()
-            """
 
         return flame_thickness_val
 
@@ -678,8 +634,8 @@ def state_animation(method, **kwargs):
             for i, obj in enumerate(pelec_key):
                 # Prepare x and y data
                 tmp_x_data = x_data_full
-                tmp_y_data = hrr_arr if plt_type[i] in ['HRR-Cantera', 'HRR-PeleC'] else plt_data["boxlib", obj][
-                    sort_arr].to_value()
+                tmp_y_data = hrr_arr if plt_type[i] in ['Heat Release Rate Cantera', 'Heat Release Rate PeleC'] else \
+                plt_data["boxlib", obj][sort_arr].to_value()
 
                 # Apply reference location filter if provided
                 if reference_loc is not None:
@@ -700,7 +656,7 @@ def state_animation(method, **kwargs):
                         linestyle='-',
                         color='k',
                         ylabel=obj,
-                        ylim=(mim_bnd_val[i], max_bnd_val[i])
+                        ylim=(min_bnd_val[i], max_bnd_val[i])
                     )
                     ax1.set_xlabel('Position [cm]')
                     ax1.grid(True, axis='x')
@@ -715,7 +671,7 @@ def state_animation(method, **kwargs):
                         linestyle='--',
                         color=f"C{i}",  # Automatically cycle colors
                         ylabel=obj,
-                        ylim=(mim_bnd_val[i], max_bnd_val[i]),
+                        ylim=(min_bnd_val[i], max_bnd_val[i]),
                         log_scale=(obj == "pressure")
                     )
                     axes.append(ax)
@@ -723,8 +679,8 @@ def state_animation(method, **kwargs):
             # Title
             title = " and ".join(plt_type) + f" Variation at y = {domain_size[1][1][1]} cm and t = {time} s"
         else:
-            tmp_y_data = hrr_arr if plt_type in ['HRR-Cantera', 'HRR-PeleC'] else plt_data["boxlib", pelec_key][
-                sort_arr].to_value()
+            tmp_y_data = hrr_arr if plt_type in ['Heat Release Rate Cantera', 'Heat Release Rate PeleC'] else \
+            plt_data["boxlib", pelec_key][sort_arr].to_value()
 
             # Apply reference location filter if provided
             if reference_loc is not None:
@@ -745,7 +701,7 @@ def state_animation(method, **kwargs):
                 linestyle='-',
                 color='k',
                 ylabel=plt_type,
-                ylim=(mim_bnd_val, max_bnd_val),
+                ylim=(min_bnd_val, max_bnd_val),
                 log_scale=(plt_type == "pressure")
             )
 
@@ -757,7 +713,10 @@ def state_animation(method, **kwargs):
         plt.suptitle(wrapped_title, ha="center")
 
         # Set x-axis limits and legend
-        ax1.set_xlim(0, domain_size[1][1][0])
+        if min_x_val is not None and max_x_val is not None:
+            ax1.set_xlim(min_x_val, max_x_val)
+        else:
+            ax1.set_xlim(0, domain_size[1][1][0])
 
         # Adjust layout to avoid overlapping with the legend
         plt.tight_layout()
@@ -816,8 +775,10 @@ def state_animation(method, **kwargs):
     """
     # Step 0: Get values from **kwargs
     plt_type = kwargs.get('plt_type', [])
-    mim_bnd_val = kwargs.get('mim_bnd_val', 0)
+    min_bnd_val = kwargs.get('min_bnd_val', 0)
     max_bnd_val = kwargs.get('max_bnd_val', 0)
+    min_x_val = kwargs.get('min_x_val', None)
+    max_x_val = kwargs.get('max_x_val', None)
 
     reference_loc = kwargs.get('reference_loc', None)  # Get reference_loc from kwargs
     time = kwargs.get('time', 0)
@@ -855,7 +816,7 @@ def animation_bounds(args):
     # Step 1: Create an array of the keys where the value is True
     keys_with_true_values = [
         key for key, value in parameter_dict['Domain State Animations'].items()
-        if isinstance(value, tuple) and value[0] is True
+        if (isinstance(value, (np.ndarray, list, tuple)) and value[0] is True) or value is True
     ]
 
     # Step 2: Initialize the temp_max_val_arr with the same length as the number of True values in the dictionary
@@ -888,8 +849,10 @@ def animation_bounds(args):
             except:
                 temp_arr = heat_release_rate_function(slice, np.argsort(slice["boxlib", "x"]), input_params)[0]
 
+        """
         if key == 'Flame Thickness':
             temp_arr = flame_geometry_function(raw_data, domain_info[1][0][1], domain_info[-1], thickness_check=True)
+        """
 
         # Step 3: Write bounds to value
         temp_bounds_arr[i, 0] = key
@@ -899,195 +862,13 @@ def animation_bounds(args):
     return temp_bounds_arr
 
 
-def createVariablePltFrame(raw_data, sort_arr, time, min_bounds, max_bounds, tracking_obj, domain_info, output_path,
-                           hrr_arr=None):
-    def pltAnimationFrame():
-        """
-            Plots the data and saves the plot as an image file.
-
-            Parameters:
-            - x: array-like, the data for the x-axis.
-            - y: array-like, the data for the y-axis.
-            - filename: str, the name of the file to save the plot.
-            - xlabel: str, label for the x-axis (default is 'X-axis').
-            - ylabel: str, label for the y-axis (default is 'Y-axis').
-            - title: str, title of the plot (default is 'Plot').
-            - format: str, the format to save the plot in (default is 'png').
-            """
-        line_styles = ['-', '--', '-.', ':']
-        style_cycle = itertools.cycle(line_styles)
-
-        fig, ax1 = plt.subplots()
-        if isinstance(tracking_obj, (np.ndarray, list)):
-            ax1.plot(raw_data["boxlib", str('x')][sort_arr].to_value(),
-                     raw_data["boxlib", str(tracking_obj[0])][sort_arr].to_value(),
-                     label=tracking_obj[0], linestyle='-', color='k')
-            ax1.set_xlabel('Position [cm]')
-            ax1.set_ylabel(str(tracking_obj[0]))
-            ax1.grid(True, axis='x')  # Only x-axis grid lines
-            ax1.set_ylim(y_limit_min[0], y_limit_max[0])
-
-            # Create a second Y-axis
-            ax2 = ax1.twinx()
-            ax2.plot(raw_data["boxlib", str('x')][sort_arr].to_value(),
-                     raw_data["boxlib", str(tracking_obj[1])][sort_arr].to_value(),
-                     label=tracking_obj[1], linestyle='--', color='r')
-            if tracking_obj[1] == "pressure":
-                plt.yscale('log')
-            ax2.set_ylabel(str(tracking_obj[1]))
-            ax2.set_ylim(y_limit_min[1], y_limit_max[1])
-
-            wrapped_title = "\n".join(textwrap.wrap(
-                f"{tracking_obj[0]} and {tracking_obj[1]} Variation at y = {domain_size[1]} and t = {time}", width=55))
-        else:
-            if tracking_obj == 'HRR-Cantera' or tracking_obj == 'HRR-PeleC':
-                ax1.plot(raw_data["boxlib", str('x')][sort_arr].to_value(), hrr_arr,
-                         label=tracking_obj, linestyle='-', color='k')
-            else:
-                ax1.plot(raw_data["boxlib", str('x')][sort_arr].to_value(),
-                         raw_data["boxlib", str(tracking_obj)][sort_arr].to_value(),
-                         label=tracking_obj, linestyle='-', color='k')
-                if tracking_obj == "pressure":
-                    plt.yscale('log')
-
-            ax1.set_ylabel(str(tracking_obj))
-            ax1.set_ylim(y_limit_min, y_limit_max)
-
-            wrapped_title = "\n".join(
-                textwrap.wrap(f"{tracking_obj} Variation at y = {domain_size[1]} and t = {time}", width=55))
-
-        plt.suptitle(wrapped_title, ha="center")
-        plt.xlim(0, domain_size[0])
-        plt.legend()
-
-        # Convert the float to a string without scientific notation
-        formatted_time = '{:.16f}'.format(time).rstrip('0').rstrip('.')
-        # Save the plot to a file
-        if isinstance(tracking_obj, (np.ndarray, list)):
-            filename = os.path.join(output_dir_path,
-                                    f"{tracking_obj[0]}-{tracking_obj[1]}-Animation-Time-{formatted_time}.png")
-        else:
-            filename = os.path.join(output_dir_path, f"{tracking_obj}-Animation-Time-{formatted_time}.png")
-        plt.savefig(filename, format='png')
-        plt.close()  # Close the figure to avoid displaying it inline if using in a Jupyter notebook
-        return
-
-    """
-
-    """
-    # Step 1:
-    if isinstance(tracking_obj, (np.ndarray, list)):
-        y_limit_min = np.zeros(len(tracking_obj))
-        y_limit_max = np.zeros(len(tracking_obj))
-        for i in range(len(tracking_obj)):
-            y_limit_min[i] = min_bounds[i] - (0.1 * min_bounds[i])
-            y_limit_max[i] = max_bounds[i] + (0.1 * max_bounds[i])
-    else:
-        y_limit_min = min_bounds - (0.1 * min_bounds)
-        y_limit_max = max_bounds + (0.1 * max_bounds)
-
-    # Step 2:
-    domain_size = domain_info[1][1]
-    # Step 3: Check/Create directory to store animation frmaes
-    if isinstance(tracking_obj, (np.ndarray, list)):
-        output_dir_path = ensure_long_path_prefix(os.path.join(output_path, f"Animation-Frames",
-                                                               f"{tracking_obj[0]}-{tracking_obj[1]}-Plt-Files"))
-    else:
-        output_dir_path = ensure_long_path_prefix(os.path.join(output_path, f"Animation-Frames",
-                                                               f"{tracking_obj}-Plt-Files"))
-
-    # Step 3:
-    pltAnimationFrame()
-
-    return
-
-
-def createVariableAnimation(folder_path, output_filename, fps=15):
-    def collect_plot_files(folder_path, file_extension='png'):
-        """
-        Collects all plot files from a given folder.
-
-        Parameters:
-        - folder_path: str, the path to the folder containing plot files.
-        - file_extension: str, the file extension of the plot files (default is 'png').
-
-        Returns:
-        - image_files: list of str, paths to the image files sorted by filename.
-        """
-        # List all files in the directory with the given extension
-        image_files = [os.path.join(folder_path, f) for f in sorted(os.listdir(folder_path)) if
-                       f.endswith(f'.{file_extension}')]
-        return image_files
-
-    def create_animation(image_files, output_filename, fps=2):
-        """
-        Creates an MP4 animation from a series of image files.
-
-        Parameters:
-        - image_files: list of str, paths to the image files.
-        - output_filename: str, the name of the output video file (e.g., 'animation.mp4').
-        - fps: int, frames per second for the animation (default is 2).
-        """
-        # Create a figure and axis
-        fig, ax = plt.subplots()
-
-        # Load the first image to get the size
-        first_image = mpimg.imread(image_files[0])
-        ax.set_xlim(0, first_image.shape[1])
-        ax.set_ylim(0, first_image.shape[0])
-
-        # Placeholder for the image
-        img_display = ax.imshow(first_image)
-
-        # Update function for animation
-        def update(frame):
-            img_display.set_array(np.flipud(mpimg.imread(image_files[frame])))
-            return img_display,
-
-        # Create animation
-        ani = animation.FuncAnimation(fig, update, frames=len(image_files), blit=True)
-
-        # Choose the writer and save the animation
-        Writer = animation.writers['ffmpeg']
-        writer = Writer(fps=fps, metadata=dict(artist='Me'), bitrate=1800)
-
-        # Save the animation as MP4
-        ani.save(output_filename, writer=writer)
-
-        plt.close()  # Close the plot
-
-    """
-        Creates an MP4 animation from plot files in a given folder.
-
-        Parameters:
-        - folder_path: str, the path to the folder containing plot files.
-        - output_filename: str, the name of the output video file (e.g., 'animation.mp4').
-        - fps: int, frames per second for the animation (default is 2).
-        - file_extension: str, the file extension of the plot files (default is 'png').
-    """
-    # Collect all plot files from the folder
-    image_files = collect_plot_files(folder_path, 'png')
-
-    # Create animation using the collected plot files
-    create_animation(image_files, output_filename, fps)
-    return
-
-
 def single_pltfile_processing(args):
     def load_data():
         raw_data = yt.load(pltFile_dir)
         slice = raw_data.ray(np.array([domain_info[1][0][0], domain_info[1][0][1], 0.0]),
                              np.array([domain_info[1][1][0], domain_info[1][1][1], 0.0]))
-        ray_sort = np.argsort(slice["boxlib", "x"])
+        ray_sort = np.argsort(slice['boxlib', 'x'])
         time = raw_data.current_time.to_value()
-
-        plt_check = False
-        if plt_check:
-            plt.figure(figsize=(8, 6))
-            plt.plot(slice["boxlib", "x"][ray_sort], slice["boxlib", "Temp"][ray_sort], linestyle='-', color='k')
-            plt.xlabel('x')
-            plt.ylabel('y')
-            plt.show()
 
         return time, raw_data, slice, ray_sort
 
@@ -1112,53 +893,54 @@ def single_pltfile_processing(args):
     result_dict['Time']['Value'] = time
 
     # Step 3.1: Flame Processing
-    if 'Flame Processing' in processing_flags:
+    if 'Flame' in processing_flags:
         result_dict['Flame'] = {}
 
         # Position
-        if processing_flags['Flame Processing'].get('Position', False):
+        if processing_flags['Flame'].get('Position', False):
             [result_dict['Flame']['Index'], result_dict['Flame']['Position']] = wave_tracking_function(plt_data,
-                                                                                                       sort_arr, "Temp",
+                                                                                                       sort_arr,
                                                                                                        "Flame")
 
         # Gas Velocity
-        if processing_flags['Flame Processing'].get('Relative Velocity', False):
+        if processing_flags['Flame'].get('Relative Velocity', False):
             result_dict['Flame']['Gas Velocity'] = plt_data["boxlib", "x_velocity"][sort_arr][
                                                        result_dict['Flame']['Index'] + 10].to_value() / 100
 
         # Thermodynamic State
-        if processing_flags['Flame Processing'].get('Thermodynamic State', False):
+        if processing_flags['Flame'].get('Thermodynamic State', False):
             result_dict['Flame']['Thermodynamic State'] = thermodynamic_state_function(plt_data, sort_arr,
                                                                                        result_dict['Flame']['Index'],
                                                                                        "Flame", input_params)
 
         # Flame Heat Release Rate
-        if processing_flags['Flame Processing'].get('Heat Release Rate Cantera', False):
-            [result_dict['Flame']['Heat Release Rate Cantera'],
-             result_dict['Flame']['Max Heat Release Rate Cantera']] = heat_release_rate_function(plt_data, sort_arr,
-                                                                                                 input_params)
+        if processing_flags['Flame'].get('Heat Release Rate Cantera', False):
+            [result_dict['Flame']['Heat Release Rate Cantera Array'],
+             result_dict['Flame']['Heat Release Rate Cantera']] = heat_release_rate_function(plt_data, sort_arr,
+                                                                                             input_params)
 
-        if processing_flags['Flame Processing'].get('Heat Release Rate PeleC', False):
+        if processing_flags['Flame'].get('Heat Release Rate PeleC', False):
             try:
-                result_dict['Flame']['Heat Release Rate PeleC'] = plt_data["boxlib", "heatRelease"][sort_arr].to_value()
-                result_dict['Flame']['Max Heat Release Rate PeleC'] = max(
-                    result_dict['Flame']['Heat Release Rate PeleC'])
+                result_dict['Flame']['Heat Release Rate PeleC Array'] = plt_data["boxlib", "heatRelease"][
+                    sort_arr].to_value()
+                result_dict['Flame']['Heat Release Rate PeleC'] = max(
+                    result_dict['Flame']['Heat Release Rate PeleC Array'])
             except:
-                [result_dict['Flame']['Heat Release Rate PeleC'],
-                 result_dict['Flame']['Max Heat Release Rate PeleC']] = heat_release_rate_function(plt_data, sort_arr,
-                                                                                                   input_params)
+                [result_dict['Flame']['Heat Release Rate PeleC Array'],
+                 result_dict['Flame']['Heat Release Rate PeleC']] = heat_release_rate_function(plt_data, sort_arr,
+                                                                                               input_params)
 
         # Surface Flame Thickness
-        if processing_flags['Flame Processing'].get('Flame Thickness', False) or processing_flags[
-            'Flame Processing'].get('Surface Length', False):
+        if processing_flags['Flame'].get('Flame Thickness', False) or processing_flags['Flame'].get('Surface Length',
+                                                                                                    False):
             temp_plt_dir = ensure_long_path_prefix(
                 os.path.join(output_path, f"Animation-Frames", f"Flame-Thickness-Plt-Files"))
 
             if os.path.exists(temp_plt_dir) is False:
                 os.makedirs(temp_plt_dir, exist_ok=True)
             try:
-                if processing_flags['Flame Processing'].get('Flame Thickness', False) and processing_flags[
-                    'Flame Processing'].get('Surface Length', False):
+                if processing_flags['Flame'].get('Flame Thickness', False) and processing_flags['Flame'].get(
+                        'Surface Length', False):
                     [result_dict['Flame']['Surface Length'],
                      result_dict['Flame']['Flame Thickness']] = flame_geometry_function(raw_data,
                                                                                         domain_info[1][0][1],
@@ -1168,16 +950,16 @@ def single_pltfile_processing(args):
                                                                                         contour_check=True)
 
                 # Flame Thickness
-                if processing_flags['Flame Processing'].get('Flame Thickness', False) and not processing_flags[
-                    'Flame Processing'].get('Surface Length', False):
+                if processing_flags['Flame'].get('Flame Thickness', False) and not processing_flags['Flame'].get(
+                        'Surface Length', False):
                     result_dict['Flame']['Flame Thickness'] = flame_geometry_function(raw_data,
                                                                                       domain_info[1][0][1],
                                                                                       domain_info[-1],
                                                                                       temp_plt_dir,
                                                                                       thickness_check=True)
 
-                if processing_flags['Flame Processing'].get('Surface Length', False) and not processing_flags[
-                    'Flame Processing'].get('Flame Thickness', False):
+                if processing_flags['Flame'].get('Surface Length', False) and not processing_flags['Flame'].get(
+                        'Flame Thickness', False):
                     result_dict['Flame']['Surface Length'] = flame_geometry_function(raw_data,
                                                                                      domain_info[1][0][1],
                                                                                      domain_info[-1],
@@ -1188,16 +970,16 @@ def single_pltfile_processing(args):
                 result_dict['Flame']['Flame Thickness'] = 0
 
     # Step 3.2: Maximum Pressure Processing
-    if 'Maximum Pressure Processing' in processing_flags:
+    if 'Maximum Pressure' in processing_flags:
         result_dict['Maximum Pressure'] = {}
 
         # Position
-        if processing_flags['Maximum Pressure Processing'].get('Position', False):
+        if processing_flags['Maximum Pressure'].get('Position', False):
             [result_dict['Max Pressure']['Index'], result_dict['Max Pressure']['Position']] = wave_tracking_function(
-                plt_data, sort_arr, "presssure", "Maximum Pressure")
+                plt_data, sort_arr, "Maximum Pressure")
 
         # Thermodynamic State
-        if processing_flags['Maximum Pressure Processing'].get('Thermodynamic State', False):
+        if processing_flags['Maximum Pressure'].get('Thermodynamic State', False):
             result_dict['Max Pressure']['Thermodynamic State'] = thermodynamic_state_function(plt_data, sort_arr,
                                                                                               result_dict[
                                                                                                   'Max Pressure'][
@@ -1206,45 +988,44 @@ def single_pltfile_processing(args):
                                                                                               input_params)
 
     # Step 3.2: Leading Shock Wave Processing
-    if 'Leading Shock Processing' in processing_flags:
-        result_dict['Lead Shock'] = {}
+    if 'Leading Shock' in processing_flags:
+        result_dict['Leading Shock'] = {}
 
         # Position
-        if processing_flags['Leading Shock Processing'].get('Position', False):
-            [result_dict['Lead Shock']['Index'], result_dict['Lead Shock']['Position']] = wave_tracking_function(
-                plt_data, sort_arr, "pressure", "Leading Shock")
+        if processing_flags['Leading Shock'].get('Position', False):
+            [result_dict['Leading Shock']['Index'], result_dict['Leading Shock']['Position']] = wave_tracking_function(
+                plt_data, sort_arr, "Leading Shock")
 
     # Step 3.3: Pre-Shock Processing
-    if 'Pre-Shock Processing' in processing_flags:
+    if 'Pre-Shock' in processing_flags:
         result_dict['Pre-Shock'] = {}
 
-        if processing_flags['Pre-Shock Processing'].get('Thermodynamic State', False):
+        if processing_flags['Pre-Shock'].get('Thermodynamic State', False):
             # If the leading shock wave is not flagged, determine the location here
-            if not processing_flags['Leading Shock Processing'].get('Position', False):
-                result_dict['Lead Shock'] = {}
-                [result_dict['Lead Shock']['Index'], _] = wave_tracking_function(plt_data, sort_arr, "pressure",
-                                                                                 "Leading Shock")
+            if not processing_flags['Leading Shock'].get('Position', False):
+                result_dict['Leading Shock'] = {}
+                [result_dict['Leading Shock']['Index'], _] = wave_tracking_function(plt_data, sort_arr, "Leading Shock")
 
             # Determine the thermodynamic state ahead of the leading shock wave
             result_dict['Pre-Shock']['Thermodynamic State'] = thermodynamic_state_function(plt_data, sort_arr,
-                                                                                           result_dict['Lead Shock'][
+                                                                                           result_dict['Leading Shock'][
                                                                                                'Index'], "Pre-Shock",
                                                                                            input_params)
 
     # Step 3.4: Post-Shock Processing
-    if 'Post-Shock Processing' in processing_flags:
+    if 'Post-Shock' in processing_flags:
         result_dict['Post-Shock'] = {}
 
-        if processing_flags['Post-Shock Processing'].get('Thermodynamic State', False):
+        if processing_flags['Post-Shock'].get('Thermodynamic State', False):
             # If the leading shock wave is not flagged, determine the location here
-            if not processing_flags['Leading Shock Processing'].get('Position', False):
-                result_dict['Lead Shock'] = {}
-                [result_dict['Lead Shock']['Index'], _] = wave_tracking_function(plt_data, sort_arr, "pressure",
-                                                                                 "Leading Shock")
+            if not processing_flags['Leading Shock'].get('Position', False):
+                result_dict['Leading Shock'] = {}
+                [result_dict['Leading Shock']['Index'], _] = wave_tracking_function(plt_data, sort_arr, "Leading Shock")
 
             # Determine the thermodynamic state behind of the leading shock wave
             result_dict['Post-Shock']['Thermodynamic State'] = thermodynamic_state_function(plt_data, sort_arr,
-                                                                                            result_dict['Lead Shock'][
+                                                                                            result_dict[
+                                                                                                'Leading Shock'][
                                                                                                 'Index'], "Post-Shock",
                                                                                             input_params)
 
@@ -1265,7 +1046,7 @@ def single_pltfile_processing(args):
 
                 hrr_arr = None
                 if key == 'Heat Release Rate Cantera' or key == 'Heat Release Rate PeleC':
-                    hrr_arr = result_dict['Flame'][value[0]]
+                    hrr_arr = result_dict['Flame'][[f"{value[0]} Array"]]
 
                 # Create directory for plt files
                 combined_key = "-".join(value[0])
@@ -1278,7 +1059,7 @@ def single_pltfile_processing(args):
                 state_animation(
                     method='Plot',
                     plt_type=value[0],
-                    mim_bnd_val=min_bnd_val,
+                    min_bnd_val=min_bnd_val,
                     max_bnd_val=max_bnd_val,
                     reference_loc=None,
                     time=time,
@@ -1313,12 +1094,12 @@ def single_pltfile_processing(args):
 
                     hrr_arr = None
                     if key == 'Heat Release Rate Cantera' or key == 'Heat Release Rate PeleC':
-                        hrr_arr = result_dict['Flame'][key]
+                        hrr_arr = result_dict['Flame'][f"{key} Array"]
 
                     state_animation(
                         method='Plot',
                         plt_type=key,
-                        mim_bnd_val=min_bnd_val,
+                        min_bnd_val=min_bnd_val,
                         max_bnd_val=max_bnd_val,
                         reference_loc=None,
                         time=time,
@@ -1330,136 +1111,73 @@ def single_pltfile_processing(args):
                         output_dir_path=temp_plt_dir,
                     )
 
-        """
-        # Step 3.5.3: Plot Temperature
-        if processing_flags['Domain State Animations'].get('Temperature', False):
-            # Select appropriate bounds
-            index = np.where(animation_bnd_arr[:, 0] == 'Temperature')[0][0]  # Get the first matching index
+    # Step 4: Local Feature State Plot Creation
 
-            # Extract min and max values for the key
-            min_val = animation_bnd_arr[index, 1]
-            max_val = animation_bnd_arr[index, 2]
+    if 'Local State Animations' in processing_flags:
+        local_physical_window = processing_flags['Local State Animations']['Physical Window']
+        # Step 1: Determine the location of the wave to be tracked
+        wave_idx = wave_tracking_function(plt_data, sort_arr,
+                                          processing_flags['Local State Animations']['Wave of Interest'])
 
-            # Create directory for plt files
-            temp_plt_dir = ensure_long_path_prefix(os.path.join(output_path, f"Animation-Frames", f"Temp-Plt-Files"))
+        # Step 2: Determine the bounding indices
+        # Find the lower bound index
+        lower_bnd_idx = np.searchsorted(plt_data["boxlib", "x"][sort_arr].to_value() / 100,
+                                        wave_idx[1] - local_physical_window, side='left')
 
-            if os.path.exists(temp_plt_dir) is False:
-                os.makedirs(temp_plt_dir, exist_ok=True)
+        # Find the upper bound index
+        upper_bnd_idx = np.searchsorted(plt_data["boxlib", "x"][sort_arr].to_value() / 100,
+                                        wave_idx[1] + local_physical_window, side='right')
 
-            createVariablePltFrame(plt_data, sort_arr, time, min_val, max_val, "Temp", domain_info, output_path)
+        # Step 3: Ensure indices stay within valid bounds
+        start_idx = max(0, lower_bnd_idx)
+        end_idx = min(len(plt_data["boxlib", "x"][sort_arr].to_value()), upper_bnd_idx)
 
-        # Step 3.5.4: Plot Pressure
-        if processing_flags['Domain State Animations'].get('Pressure', False):
-            # Select appropriate bounds
-            index = np.where(animation_bnd_arr[:, 0] == 'Pressure')[0][0]  # Get the first matching index
+        # Step 4:
+        for key, value in processing_flags.get('Domain State Animations', {}).items():
+            if key != 'Combined':
+                if isinstance(value, (np.ndarray, list, tuple)):
+                    bool_check = value[0]
+                    pelec_key = value[1]
+                else:
+                    bool_check = value
+                    pelec_key = None
 
-            # Extract min and max values for the key
-            min_val = animation_bnd_arr[index, 1]
-            max_val = animation_bnd_arr[index, 2]
+                if bool_check:
+                    # Collect the plot bounds based on the current desire
+                    bnd_arr_index = np.where(animation_bnd_arr[:, 0] == key)[0][0]  # Get the first matching index
+                    min_bnd_val = animation_bnd_arr[bnd_arr_index, 1]
+                    max_bnd_val = animation_bnd_arr[bnd_arr_index, 2]
 
-            # Create directory for plt files
-            temp_plt_dir = ensure_long_path_prefix(
-                os.path.join(output_path, f"Animation-Frames", f"pressure-Plt-Files"))
+                    # Create directory for plt files
+                    temp_plt_dir = ensure_long_path_prefix(
+                        os.path.join(output_path,
+                                     f"Animation-Frames",
+                                     f"{'-'.join(['Local', processing_flags['Local State Animations']['Wave of Interest'], key])}-Plt-Files"))
 
-            if os.path.exists(temp_plt_dir) is False:
-                os.makedirs(temp_plt_dir, exist_ok=True)
+                    if os.path.exists(temp_plt_dir) is False:
+                        os.makedirs(temp_plt_dir, exist_ok=True)
 
-            createVariablePltFrame(plt_data, sort_arr, time, min_val, max_val, "pressure", domain_info, output_path)
+                    hrr_arr = None
+                    if key == 'Heat Release Rate Cantera' or key == 'Heat Release Rate PeleC':
+                        hrr_arr = result_dict['Flame'][f"{key} Array"]
 
-        # Step 3.5.5: Plot Velocity
-        if processing_flags['Domain State Animations'].get('Velocity', False):
-            # Select appropriate bounds
-            index = np.where(animation_bnd_arr[:, 0] == 'Velocity')[0][0]  # Get the first matching index
-
-            # Extract min and max values for the key
-            min_val = animation_bnd_arr[index, 1]
-            max_val = animation_bnd_arr[index, 2]
-
-            # Create directory for plt files
-            temp_plt_dir = ensure_long_path_prefix(os.path.join(output_path, f"Animation-Frames", f"x_velocity-Plt-Files"))
-
-            if os.path.exists(temp_plt_dir) is False:
-                os.makedirs(temp_plt_dir, exist_ok=True)
-
-            createVariablePltFrame(plt_data, sort_arr, time, min_val, max_val, "x_velocity", domain_info, output_path)
-
-        # Step 3.5.5: Plot Velocity
-        if processing_flags['Domain State Animations'].get('Heat Release Rate Cantera', False):
-            # Select appropriate bounds
-            index = np.where(animation_bnd_arr[:, 0] == 'Heat Release Rate Cantera')[0][0]  # Get the first matching index
-
-            # Extract min and max values for the key
-            min_val = animation_bnd_arr[index, 1]
-            max_val = animation_bnd_arr[index, 2]
-
-            # Create directory for plt files
-            temp_plt_dir = ensure_long_path_prefix(os.path.join(output_path, f"Animation-Frames", f"HRR-Cantera-Plt-Files"))
-
-            if os.path.exists(temp_plt_dir) is False:
-                os.makedirs(temp_plt_dir, exist_ok=True)
-
-            createVariablePltFrame(plt_data, sort_arr, time, min_val, max_val, "HRR-Cantera",
-                                   domain_info, output_path, hrr_arr = result_dict['Flame']['Heat Release Rate Cantera'])
-
-        if processing_flags['Domain State Animations'].get('Heat Release Rate PeleC', False):
-            # Select appropriate bounds
-            index = np.where(animation_bnd_arr[:, 0] == 'Heat Release Rate PeleC')[0][0]  # Get the first matching index
-
-            # Extract min and max values for the key
-            min_val = animation_bnd_arr[index, 1]
-            max_val = animation_bnd_arr[index, 2]
-
-            # Create directory for plt files
-            temp_plt_dir = ensure_long_path_prefix(os.path.join(output_path,f"Animation-Frames", f"HRR-PeleC-Plt-Files"))
-
-            if os.path.exists(temp_plt_dir) is False:
-                os.makedirs(temp_plt_dir, exist_ok=True)
-
-            createVariablePltFrame(plt_data, sort_arr, time, min_val, max_val, "HRR-PeleC",
-                                   domain_info, output_path, hrr_arr = result_dict['Flame']['Heat Release Rate PeleC'])
-
-        # Step 3.5.6: Plot Species
-        if processing_flags['Domain State Animations'].get('Species', False):
-            # Select appropriate bounds
-            index = np.where(animation_bnd_arr[:, 0] == 'Species')[0][0]  # Get the first matching index
-
-            # Extract min and max values for the key
-            min_val = animation_bnd_arr[index, 1]
-            max_val = animation_bnd_arr[index, 2]
-
-            for i in range(len(input_params.species)):
-                # Create directory for plt files
-                temp_plt_dir = ensure_long_path_prefix(os.path.join(output_path, f"Animation-Frames", f"Y({str(input_params.species[i])})-Plt-Files"))
-                if os.path.exists(temp_plt_dir) is False:
-                    os.makedirs(temp_plt_dir, exist_ok=True)
-
-                createVariablePltFrame(plt_data, sort_arr, time, min_val[i + 4], max_val[i + 4], f"Y({str(input_params.species[i])})", domain_info, output_path)
-
-        # Step 3.5.3: Plot Combined
-        if processing_flags['Domain State Animations'].get('Combined', False):
-            # Select appropriate bounds
-            index_1 = np.where(animation_bnd_arr[:, 0] == f"{processing_flags['Domain State Animations']['Combined'][0]}")[0][0]  # Get the first matching index
-            index_2 = np.where(animation_bnd_arr[:, 0] == f"{processing_flags['Domain State Animations']['Combined'][2]}")[0][0]  # Get the first matching index
-
-            # Extract min and max values for the key
-            min_val_1 = animation_bnd_arr[index_1, 1]
-            max_val_1 = animation_bnd_arr[index_1, 2]
-
-            min_val_2 = animation_bnd_arr[index_2, 1]
-            max_val_2 = animation_bnd_arr[index_2, 2]
-
-            # Create directory for plt files
-            temp_plt_dir = ensure_long_path_prefix(
-                os.path.join(output_path, f"Animation-Frames", f"{processing_flags['Domain State Animations']['Combined'][0]}-"
-                                                               f"{processing_flags['Domain State Animations']['Combined'][1]}-Plt-Files"))
-            if os.path.exists(temp_plt_dir) is False:
-                os.makedirs(temp_plt_dir, exist_ok=True)
-
-            createVariablePltFrame(plt_data, sort_arr, time,
-                                   [min_val_1, min_val_2], [max_val_1, max_val_2],
-                                   [processing_flags['Domain State Animations']['Combined'][0],
-                                    processing_flags['Domain State Animations']['Combined'][1]], domain_info, output_path)
-        """
+                    state_animation(
+                        method='Plot',
+                        plt_type="-".join(
+                            ['Local', processing_flags['Local State Animations']['Wave of Interest'], key]),
+                        min_bnd_val=min_bnd_val,
+                        max_bnd_val=max_bnd_val,
+                        min_x_val=plt_data["boxlib", "x"][sort_arr][start_idx].to_value(),
+                        max_x_val=plt_data["boxlib", "x"][sort_arr][end_idx].to_value(),
+                        reference_loc=None,
+                        time=time,
+                        plt_data=plt_data,
+                        sort_arr=sort_arr,
+                        pelec_key=pelec_key,
+                        domain_size=domain_info,
+                        hrr_arr=hrr_arr,
+                        output_dir_path=temp_plt_dir,
+                    )
 
     return result_dict
 
@@ -1468,46 +1186,34 @@ def pelec_processing_function(plt_dir, domain_info, animation_bnd_arr, check_fla
     def file_output(file_path, smoothing_check):
         # Step 1: Dynamically create the text file header depending on the assigned flags
         header_data = ["Time [s]"]
-        # Position
-        if check_flags['Flame Processing'].get('Position', False):
-            header_data.extend(["Flame Position [m]"])
-        if check_flags['Leading Shock Processing'].get('Position', False):
-            header_data.extend(["Leading Shock Position [m]"])
-        if check_flags['Maximum Pressure Processing'].get('Position', False):
-            header_data.extend(["Max Pressure Position [m]"])
-        # Velocity
-        if check_flags['Flame Processing'].get('Velocity', False):
-            header_data.extend(["Flame Velocity [m/s]"])
-        if check_flags['Leading Shock Processing'].get('Velocity', False):
-            header_data.extend(["Leading Shock Velocity [m/s]"])
-        # Relative Velocity
-        if check_flags['Flame Processing'].get('Relative Velocity', False):
-            header_data.extend(["Relative Flame Velocity [m/s]"])
-        # Thermodynamic State
-        if check_flags['Flame Processing'].get('Thermodynamic State', False):
-            header_data.extend(["Flame Temperature [K]", "Flame Pressure [Pa]", "Flame Density [kg/m^3]",
-                                "Flame Soundspeed [m/s]"])
-        if check_flags['Maximum Pressure Processing'].get('Thermodynamic State', False):
-            header_data.extend(["Max Pressure Temperature [K]", "Max Pressure Pressure [Pa]",
-                                "Max Pressure Density [kg/m^3]", "Max Pressure Soundspeed [m/s]"])
-        if check_flags['Pre-Shock Processing'].get('Thermodynamic State', False):
-            header_data.extend(["Pre-Shock Temperature [K]", "Pre-Shock Pressure [Pa]",
-                                "Pre-Shock Density [kg/m^3]", "Pre-Shock Soundspeed [m/s]"])
-        if check_flags['Post-Shock Processing'].get('Thermodynamic State', False):
-            header_data.extend(["Post-Shock Temperature [K]", "Post-Shock Pressure [Pa]",
-                                "Post-Shock Density [kg/m^3]", "Post-Shock Soundspeed [m/s]"])
-        # Heat Release Rate
-        if check_flags['Flame Processing'].get('Heat Release Rate Cantera', False):
-            header_data.extend(["Max Heat Release Rate Cantera [W/m3]"])
-        if check_flags['Flame Processing'].get('Heat Release Rate PeleC', False):
-            header_data.extend(["Max Heat Release Rate PeleC [egs/cm3]"])
-        # Flame Thickness
-        if check_flags['Flame Processing'].get('Flame Thickness', False):
-            header_data.extend(["Flame Thickness [m]"])
-        # Flame Surface Length
-        if check_flags['Flame Processing'].get('Surface Length', False):
-            header_data.extend(["Flame Surface Length [m]"])
 
+        # Step 2: Loop over processing objectives (flame, Leading shock, maximum pressure, pre-shock, post-shock)
+        for key in check_flags.keys():
+            if key in {'Flame', 'Leading Shock', 'Maximum Pressure', 'Pre-Shock', 'Post-Shock'}:
+                # Access the sub-dictionary
+                sub_dict = check_flags[key]
+
+                # Loop through the sub-dictionary to create the header array
+                for sub_key, sub_value in sub_dict.items():
+                    if sub_value is True:  # Check if the value is True
+                        if sub_key == 'Thermodynamic State':
+                            header_data.extend([f"{key} Temperature [K]", f"{key} Pressure [Pa]",
+                                                f"{key} Density [kg/m^3]", f"{key} Soundspeed [m/s]"])
+                        else:
+                            if sub_key == 'Position' or sub_key == 'Flame Thickness' or sub_key == 'Surface Length':
+                                unit_str = 'm'
+                            elif sub_key == 'Velocity' or 'Relative Velocity':
+                                unit_str = 'm/s'
+                            elif sub_key == 'Heat Release Rate Cantera':
+                                unit_str = 'W/m^3'
+                            elif sub_key == 'Heat Release Rate PeleC':
+                                unit_str = 'erg/cm3'
+                            else:
+                                unit_str = '[]'
+
+                            header_data.extend([f"{key} {sub_key} [{unit_str}]"])
+
+        # Step 3:
         with open(file_path, "w") as outfile:
             outfile.write("#")
             for i in range(len(header_data)):
@@ -1519,137 +1225,52 @@ def pelec_processing_function(plt_dir, domain_info, animation_bnd_arr, check_fla
 
             if not smoothing_check:
                 for i in range(len(collective_results['Time']['Value'])):
-                    # Time
+                    # Write time value
                     outfile.write(" {0:<55e}".format(collective_results['Time']['Value'][i]))
 
-                    # Position
-                    if check_flags['Flame Processing'].get('Position', False):
-                        outfile.write(" {0:<55e}".format(collective_results['Flame']['Position'][i]))
+                    #
+                    for key in check_flags.keys():
+                        if key in {'Flame', 'Leading Shock', 'Maximum Pressure', 'Pre-Shock', 'Post-Shock'}:
+                            # Access the sub-dictionary
+                            sub_dict = check_flags[key]
 
-                    if check_flags['Maximum Pressure Processing'].get('Position', False):
-                        outfile.write(" {0:<55e}".format(collective_results['Maximum Pressure']['Position'][i]))
+                            # Loop through the sub-dictionary to create the header array
+                            for sub_key, sub_value in sub_dict.items():
+                                if sub_value is True:  # Check if the value is True
+                                    if sub_key == 'Thermodynamic State':
+                                        for j in range(len(collective_results[key]['Thermodynamic State'][0])):
+                                            outfile.write(" {0:<55e}".format(collective_results[key][sub_key][i][j]))
+                                    else:
+                                        outfile.write(" {0:<55e}".format(collective_results[key][sub_key][i]))
 
-                    if check_flags['Leading Shock Processing'].get('Position', False):
-                        outfile.write(" {0:<55e}".format(collective_results['Lead Shock']['Position'][i]))
-
-                    # Velocity
-                    if check_flags['Flame Processing'].get('Velocity', False):
-                        outfile.write(" {0:<55e}".format(collective_results['Flame']['Velocity'][i]))
-
-                    if check_flags['Leading Shock Processing'].get('Velocity', False):
-                        outfile.write(" {0:<55e}".format(collective_results['Lead Shock']['Velocity'][i]))
-
-                    # Relative Velocity
-                    if check_flags['Flame Processing'].get('Relative Velocity', False):
-                        outfile.write(" {0:<55e}".format(collective_results['Flame']['Relative Velocity'][i]))
-
-                    # Thermodynamic State
-                    if check_flags['Flame Processing'].get('Thermodynamic State', False):
-                        for j in range(len(collective_results['Flame']['Thermodynamic State'][i])):
-                            outfile.write(" {0:<55e}".format(collective_results['Flame']['Thermodynamic State'][i][j]))
-
-                    if check_flags['Maximum Pressure Processing'].get('Thermodynamic State', False):
-                        for j in range(len(collective_results['Maximum Pressure']['Thermodynamic State'][i])):
-                            outfile.write(
-                                " {0:<55e}".format(collective_results['Maximum Pressure']['Thermodynamic State'][i][j]))
-
-                    if check_flags['Pre-Shock Processing'].get('Thermodynamic State', False):
-                        for j in range(len(collective_results['Pre-Shock']['Thermodynamic State'][i])):
-                            outfile.write(
-                                " {0:<55e}".format(collective_results['Pre-Shock']['Thermodynamic State'][i][j]))
-
-                    if check_flags['Post-Shock Processing'].get('Thermodynamic State', False):
-                        for j in range(len(collective_results['Post-Shock']['Thermodynamic State'][i])):
-                            outfile.write(
-                                " {0:<55e}".format(collective_results['Post-Shock']['Thermodynamic State'][i][j]))
-
-                    # Heat Release Rate
-                    if check_flags['Flame Processing'].get('Heat Release Rate Cantera', False):
-                        outfile.write(
-                            " {0:<55e}".format(collective_results['Flame']['Max Heat Release Rate Cantera'][i]))
-
-                    if check_flags['Flame Processing'].get('Heat Release Rate PeleC', False):
-                        outfile.write(" {0:<55e}".format(collective_results['Flame']['Max Heat Release Rate PeleC'][i]))
-
-                    # Flame Thickness
-                    if check_flags['Flame Processing'].get('Flame Thickness', False):
-                        outfile.write(" {0:<55e}".format(collective_results['Flame']['Flame Thickness'][i]))
-
-                    # Surface Length
-                    if check_flags['Flame Processing'].get('Surface Length', False):
-                        outfile.write(" {0:<55e}".format(collective_results['Flame']['Surface Length'][i]))
                     outfile.write("\n")
 
-            if smoothing_check:
+            else:
                 for i in range(len(collective_results['Time']['Smooth']['Value'])):
-                    # Time
+                    # Write time value
                     outfile.write(" {0:<55e}".format(collective_results['Time']['Smooth']['Value'][i]))
 
-                    # Position
-                    if check_flags['Flame Processing'].get('Position', False):
-                        outfile.write(" {0:<55e}".format(collective_results['Flame']['Smooth']['Position'][i]))
+                    #
+                    for key in check_flags.keys():
+                        if key in {'Flame', 'Leading Shock', 'Maximum Pressure', 'Pre-Shock', 'Post-Shock'}:
+                            # Access the sub-dictionary
+                            sub_dict = check_flags[key]
 
-                    if check_flags['Maximum Pressure Processing'].get('Position', False):
-                        outfile.write(
-                            " {0:<55e}".format(collective_results['Maximum Pressure']['Smooth']['Position'][i]))
+                            # Loop through the sub-dictionary to create the header array
+                            for sub_key, sub_value in sub_dict.items():
+                                if sub_value is True:  # Check if the value is True
+                                    if sub_key == 'Thermodynamic State':
+                                        for j in range(
+                                                len(collective_results[key]['Smooth']['Thermodynamic State'][0])):
+                                            outfile.write(
+                                                " {0:<55e}".format(collective_results[key]['Smooth'][sub_key][i][j]))
+                                    else:
+                                        outfile.write(" {0:<55e}".format(collective_results[key]['Smooth'][sub_key][i]))
 
-                    if check_flags['Leading Shock Processing'].get('Position', False):
-                        outfile.write(" {0:<55e}".format(collective_results['Lead Shock']['Smooth']['Position'][i]))
-
-                    # Velocity
-                    if check_flags['Flame Processing'].get('Velocity', False):
-                        outfile.write(" {0:<55e}".format(collective_results['Flame']['Smooth']['Velocity'][i]))
-
-                    if check_flags['Leading Shock Processing'].get('Velocity', False):
-                        outfile.write(" {0:<55e}".format(collective_results['Lead Shock']['Smooth']['Velocity'][i]))
-
-                    # Relative Velocity
-                    if check_flags['Flame Processing'].get('Relative Velocity', False):
-                        outfile.write(" {0:<55e}".format(collective_results['Flame']['Smooth']['Relative Velocity'][i]))
-
-                    # Thermodynamic State
-                    if check_flags['Flame Processing'].get('Thermodynamic State', False):
-                        for j in range(len(collective_results['Flame']['Smooth']['Thermodynamic State'])):
-                            outfile.write(
-                                " {0:<55e}".format(collective_results['Flame']['Smooth']['Thermodynamic State'][j][i]))
-
-                    if check_flags['Maximum Pressure Processing'].get('Thermodynamic State', False):
-                        for j in range(len(collective_results['Maximum Pressure']['Smooth']['Thermodynamic State'])):
-                            outfile.write(
-                                " {0:<55e}".format(
-                                    collective_results['Maximum Pressure']['Smooth']['Thermodynamic State'][j][i]))
-
-                    if check_flags['Pre-Shock Processing'].get('Thermodynamic State', False):
-                        for j in range(len(collective_results['Pre-Shock']['Smooth']['Thermodynamic State'])):
-                            outfile.write(
-                                " {0:<55e}".format(
-                                    collective_results['Pre-Shock']['Smooth']['Thermodynamic State'][j][i]))
-
-                    if check_flags['Post-Shock Processing'].get('Thermodynamic State', False):
-                        for j in range(len(collective_results['Post-Shock']['Smooth']['Thermodynamic State'])):
-                            outfile.write(
-                                " {0:<55e}".format(
-                                    collective_results['Post-Shock']['Smooth']['Thermodynamic State'][j][i]))
-
-                    # Heat Release Rate
-                    if check_flags['Flame Processing'].get('Heat Release Rate Cantera', False):
-                        outfile.write(" {0:<55e}".format(
-                            collective_results['Flame']['Smooth']['Max Heat Release Rate Cantera'][i]))
-
-                    if check_flags['Flame Processing'].get('Heat Release Rate PeleC', False):
-                        outfile.write(
-                            " {0:<55e}".format(collective_results['Flame']['Smooth']['Max Heat Release Rate PeleC'][i]))
-
-                    # Flame Thickness
-                    if check_flags['Flame Processing'].get('Flame Thickness', False):
-                        outfile.write(" {0:<55e}".format(collective_results['Flame']['Smooth']['Flame Thickness'][i]))
-
-                    # Surface Length
-                    if check_flags['Flame Processing'].get('Surface Length', False):
-                        outfile.write(" {0:<55e}".format(collective_results['Flame']['Smooth']['Surface Length'][i]))
                     outfile.write("\n")
-            outfile.close()
-            return
+
+        outfile.close()
+        return
 
     """
 
@@ -1674,110 +1295,102 @@ def pelec_processing_function(plt_dir, domain_info, animation_bnd_arr, check_fla
             collective_results[master_key][slave_key] = temp_vec
 
     # Step 3:
-    if 'Flame Processing' in check_flags:
+    if 'Flame' in check_flags:
         print('Starting Flame Processing')
         # Step 3.1: Velocity
-        if check_flags['Flame Processing'].get('Velocity', False):
+        if check_flags['Flame'].get('Velocity', False):
             collective_results['Flame']['Velocity'] = np.gradient(
                 collective_results['Flame']['Position']) / np.gradient(collective_results['Time']['Value'])
         # Step 3.2: Relative Velocity
-        if check_flags['Flame Processing'].get('Relative Velocity', False):
-            if check_flags['Flame Processing'].get('Velocity', False):
+        if check_flags['Flame'].get('Relative Velocity', False):
+            if check_flags['Flame'].get('Velocity', False):
                 collective_results['Flame']['Relative Velocity'] = collective_results['Flame']['Velocity'] - \
                                                                    collective_results['Flame']['Gas Velocity']
             else:
                 print('ERROR: Must Enable Velocity Flag to compute the relative velocity')
 
         # Step 3.3: Data Smoothing
-        if check_flags['Flame Processing'].get('Smoothing', False) and check_flags['Flame Processing'].get('Position',
-                                                                                                           False):
+        if check_flags['Flame'].get('Smoothing', False) and check_flags['Flame'].get('Position', False):
             smoothing_function(collective_results, 'Flame', 'Position')
 
-        if check_flags['Flame Processing'].get('Smoothing', False) and check_flags['Flame Processing'].get('Velocity',
-                                                                                                           False):
+        if check_flags['Flame'].get('Smoothing', False) and check_flags['Flame'].get('Velocity', False):
             smoothing_function(collective_results, 'Flame', 'Velocity')
 
-        if check_flags['Flame Processing'].get('Smoothing', False) and check_flags['Flame Processing'].get(
-                'Relative Velocity', False):
+        if check_flags['Flame'].get('Smoothing', False) and check_flags['Flame'].get('Relative Velocity', False):
             smoothing_function(collective_results, 'Flame', 'Relative Velocity')
 
-        if check_flags['Flame Processing'].get('Smoothing', False) and check_flags['Flame Processing'].get(
-                'Thermodynamic State', False):
+        if check_flags['Flame'].get('Smoothing', False) and check_flags['Flame'].get('Thermodynamic State', False):
             smoothing_function(collective_results, 'Flame', 'Thermodynamic State')
 
-        if check_flags['Flame Processing'].get('Smoothing', False) and (
-        check_flags['Flame Processing'].get('Heat Release Rate Cantera', False)):
-            smoothing_function(collective_results, 'Flame', 'Max Heat Release Rate Cantera')
+        if check_flags['Flame'].get('Smoothing', False) and (
+        check_flags['Flame'].get('Heat Release Rate Cantera', False)):
+            smoothing_function(collective_results, 'Flame', 'Heat Release Rate Cantera')
 
-        if check_flags['Flame Processing'].get('Smoothing', False) and (
-        check_flags['Flame Processing'].get('Heat Release Rate PeleC', False)):
-            smoothing_function(collective_results, 'Flame', 'Max Heat Release Rate PeleC')
+        if check_flags['Flame'].get('Smoothing', False) and (
+        check_flags['Flame'].get('Heat Release Rate PeleC', False)):
+            smoothing_function(collective_results, 'Flame', 'Heat Release Rate PeleC')
 
-        if check_flags['Flame Processing'].get('Smoothing', False) and check_flags['Flame Processing'].get(
-                'Flame Thickness', False):
+        if check_flags['Flame'].get('Smoothing', False) and check_flags['Flame'].get('Flame Thickness', False):
             smoothing_function(collective_results, 'Flame', 'Flame Thickness')
 
-        if check_flags['Flame Processing'].get('Smoothing', False) and check_flags['Flame Processing'].get(
-                'Surface Length', False):
+        if check_flags['Flame'].get('Smoothing', False) and check_flags['Flame'].get('Surface Length', False):
             smoothing_function(collective_results, 'Flame', 'Surface Length')
 
         print('Completed Flame Processing')
-    # Step 4: Lead Shock Processing
-    if 'Leading Shock Processing' in check_flags:
-        print('Starting Lead Shock Processing')
+    # Step 4: Leading Shock Processing
+    if 'Leading Shock' in check_flags:
+        print('Starting Leading Shock Processing')
         # Step 4.1: Velocity
-        if check_flags['Leading Shock Processing'].get('Velocity', False):
-            collective_results['Lead Shock']['Velocity'] = np.gradient(
-                collective_results['Lead Shock']['Position']) / np.gradient(collective_results['Time']['Value'])
+        if check_flags['Leading Shock'].get('Velocity', False):
+            collective_results['Leading Shock']['Velocity'] = np.gradient(
+                collective_results['Leading Shock']['Position']) / np.gradient(collective_results['Time']['Value'])
         # Step 4.1: Data Smoothing
-        if check_flags['Leading Shock Processing'].get('Smoothing', False) and check_flags[
-            'Leading Shock Processing'].get('Position', False):
-            smoothing_function(collective_results, 'Lead Shock', 'Position')
+        if check_flags['Leading Shock'].get('Smoothing', False) and check_flags['Leading Shock'].get('Position', False):
+            smoothing_function(collective_results, 'Leading Shock', 'Position')
 
-        if check_flags['Leading Shock Processing'].get('Smoothing', False) and check_flags[
-            'Leading Shock Processing'].get('Velocity', False):
-            smoothing_function(collective_results, 'Lead Shock', 'Velocity')
+        if check_flags['Leading Shock'].get('Smoothing', False) and check_flags['Leading Shock'].get('Velocity', False):
+            smoothing_function(collective_results, 'Leading Shock', 'Velocity')
 
-        print('Completed Lead Shock Processing')
+        print('Completed Leading Shock Processing')
     # Step 5: Maximum Pressure Processing
-    if 'Maximum Pressure Processing' in check_flags:
+    if 'Maximum Pressure' in check_flags:
         print('Starting Max Pressure Processing')
         # Step 5.1: Data Smoothing
-        if check_flags['Maximum Pressure Processing'].get('Smoothing', False) and check_flags[
-            'Maximum Pressure Processing'].get('Position', False):
+        if check_flags['Maximum Pressure'].get('Smoothing', False) and check_flags['Maximum Pressure'].get('Position',
+                                                                                                           False):
             smoothing_function(collective_results, 'Maximum Pressure', 'Position')
 
-        if check_flags['Maximum Pressure Processing'].get('Smoothing', False) and check_flags[
-            'Maximum Pressure Processing'].get('Thermodynamic State', False):
+        if check_flags['Maximum Pressure'].get('Smoothing', False) and check_flags['Maximum Pressure'].get(
+                'Thermodynamic State', False):
             smoothing_function(collective_results, 'Maximum Pressure', 'Thermodynamic State')
 
         print('Completed Max Pressure Processing')
     # Step 6: Pre-Shock Processing
-    if 'Pre-Shock Processing' in check_flags:
+    if 'Pre-Shock' in check_flags:
         print('Starting Pre-Shock Processing')
         # Step 6.1: Data Smoothing
-        if check_flags['Pre-Shock Processing'].get('Smoothing', False) and check_flags['Pre-Shock Processing'].get(
-                'Thermodynamic State', False):
+        if check_flags['Pre-Shock'].get('Smoothing', False) and check_flags['Pre-Shock'].get('Thermodynamic State',
+                                                                                             False):
             smoothing_function(collective_results, 'Pre-Shock', 'Thermodynamic State')
 
         print('Completed Pre-Shock Processing')
     # Step 7: Post-Shock Processing
-    if 'Post-Shock Processing' in check_flags:
+    if 'Post-Shock' in check_flags:
         print('Starting Post-Shock Processing')
         # Step 7.1: Data Smoothing
-        if check_flags['Post-Shock Processing'].get('Smoothing', False) and check_flags['Post-Shock Processing'].get(
-                'Thermodynamic State', False):
+        if check_flags['Post-Shock'].get('Smoothing', False) and check_flags['Post-Shock'].get('Thermodynamic State',
+                                                                                               False):
             smoothing_function(collective_results, 'Post-Shock', 'Thermodynamic State')
 
         print('Completed Post-Shock Processing')
 
     # Step 4: Write to file, if any of the sub-dictionary values except 'Domain State Animations' are true
     print('Start Output File Writing')
+    write_to_file = False
+    smoothing_flag = False
     for key, sub_dict in check_flags.items():
         if 'Smoothing' in sub_dict and sub_dict['Smoothing'] == True:
             smoothing_flag = True
-        else:
-            smoothing_flag = False
         if key != 'Domain State Animations':
             if any(sub_dict.values()):  # If any value is True
                 write_to_file = True
@@ -1802,22 +1415,46 @@ def pelec_processing_function(plt_dir, domain_info, animation_bnd_arr, check_fla
         for key, value in plot_check.items():
             if isinstance(value, (np.ndarray, list, tuple)):
                 bool_check = value[0]
-                pelec_key = value[1]
+                # Create directory for plt files
+                if key == 'Combined':
+                    plot_key = "-".join(value[0])
+                else:
+                    plot_key = key
             else:
+                plot_key = key
                 bool_check = value
-                pelec_key = None
 
             if bool_check:
                 # Create directory for plt files
                 temp_plt_dir = ensure_long_path_prefix(
-                    os.path.join(output_dir, f"Animation-Frames", f"{key}-Plt-Files"))
+                    os.path.join(output_dir, f"Animation-Frames", f"{plot_key}-Plt-Files"))
 
                 state_animation(
                     method='Animate',
                     folder_path=temp_plt_dir,
                     animation_filename=ensure_long_path_prefix(
-                        os.path.join(output_dir, f"{key}-Evolution-Animation.mp4")),
+                        os.path.join(output_dir, f"{plot_key}-Evolution-Animation.mp4")),
                 )
+
+        if 'Local State Animations' in check_flags:
+            for key, value in plot_check.items():
+                if key != 'Combined':
+                    if isinstance(value, (np.ndarray, list, tuple)):
+                        bool_check = value[0]
+                    else:
+                        bool_check = value
+
+                    if bool_check:
+                        temp_plt_dir = ensure_long_path_prefix(os.path.join(output_dir, f"Animation-Frames",
+                                                                            f"Local-{check_flags['Local State Animations']['Wave of Interest']}-{key}-Plt-Files"))
+
+                        state_animation(
+                            method='Animate',
+                            folder_path=temp_plt_dir,
+                            animation_filename=ensure_long_path_prefix(
+                                os.path.join(output_dir,
+                                             f"Local-{check_flags['Local State Animations']['Wave of Interest']}-{key}-Evolution-Animation.mp4")),
+                        )
 
         print('Completed Animation Processing')
 
@@ -1825,6 +1462,7 @@ def pelec_processing_function(plt_dir, domain_info, animation_bnd_arr, check_fla
 
 
 def main():
+    start_time = time.time()
     ####################################################################################################################
     # This code is developed to process a 2D Planar Flame simulated using PeleC for a given y-position and a given
     # (temperature) isotherm for the flame and pressure for any shock
@@ -1834,36 +1472,36 @@ def main():
     # Step 0: Set all the desired tasks to be performed bny the python script
     skip_load = 0
     row_index = "Center"  # Desired row location for data collection
-    ddt_plt_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'Raw-PeleC-Data', 'plt308219')
+    ddt_plt_file = 'plt308219'
 
     check_flag_dict = {
-        'Flame Processing': {
+        'Flame': {
             'Position': True,
             'Velocity': True,
-            'Relative Velocity': False,
-            'Thermodynamic State': False,
-            'Heat Release Rate Cantera': False,
-            'Heat Release Rate PeleC': False,
-            'Flame Thickness': False,
-            'Surface Length': False,
+            'Relative Velocity': True,
+            'Thermodynamic State': True,
+            'Heat Release Rate Cantera': True,
+            'Heat Release Rate PeleC': True,
+            'Flame Thickness': True,
+            'Surface Length': True,
             'Smoothing': False
         },
-        'Leading Shock Processing': {
+        'Leading Shock': {
+            'Position': True,
+            'Velocity': True,
+            'Smoothing': False
+        },
+        'Maximum Pressure': {
             'Position': False,
-            'Velocity': False,
-            'Smoothing': False
-        },
-        'Maximum Pressure Processing': {
-            'Position': False,
             'Thermodynamic State': False,
             'Smoothing': False
         },
-        'Pre-Shock Processing': {
-            'Thermodynamic State': False,
+        'Pre-Shock': {
+            'Thermodynamic State': True,
             'Smoothing': False
         },
-        'Post-Shock Processing': {
-            'Thermodynamic State': False,
+        'Post-Shock': {
+            'Thermodynamic State': True,
             'Smoothing': False
         },
         'Domain State Animations': {
@@ -1871,20 +1509,11 @@ def main():
             'Pressure': (True, 'pressure'),
             'Velocity': (False, 'x_velocity'),
             'Species': False,
-            'Heat Release Rate Cantera': (False, None),
-            'Heat Release Rate PeleC': (False, None),
-            'Flame Thickness': (False, None),
-            'Combined': (('Temperature', 'Pressure'), ('Temp', 'pressure'))
-        },
-        'Local State Animations': {
-            'Temperature': True,
-            'Pressure': False,
-            'Velocity': False,
-            'Species': False,
             'Heat Release Rate Cantera': False,
-            'Heat Release Rate PeleC': False,
+            'Heat Release Rate PeleC': (False, 'heatRelease'),
+            'Surface Contour': False,
             'Flame Thickness': False,
-            # 'Combined': ('Temp', 'pressure')
+            'Combined': (('Temperature', 'Pressure'), ('Temp', 'pressure'))
         }
     }
 
@@ -1916,7 +1545,8 @@ def main():
 
     # Step 5: Determine the domain sizing parameters (size, # of cells)
     if row_index == 'DDT':
-        domain_info = domain_size_parameters(ddt_plt_dir, row_index)
+        domain_info = domain_size_parameters(
+            os.path.join(os.path.dirname(os.path.realpath(__file__)), 'Raw-PeleC-Data', ddt_plt_file), row_index)
     else:
         domain_info = domain_size_parameters(updated_data_list[0], row_index)
 
@@ -1926,11 +1556,11 @@ def main():
     output_dir_path = os.path.join(dir_path, f"Processed-Global-Results", f"y-{domain_info[1][0][1]:.3g}cm")
 
     # Step 7: Pre-determine the maximum value present in simulations using the DDT "frame" as the center of a bin
-    ddt_idx = updated_data_list.index(ddt_plt_dir)
+    ddt_idx = updated_data_list.index(
+        os.path.join(os.path.dirname(os.path.realpath(__file__)), 'Raw-PeleC-Data', ddt_plt_file))
     temp_plt_files = updated_data_list[
                      max(0, ddt_idx - plotting_bnds_bin):min(len(updated_data_list), ddt_idx + plotting_bnds_bin + 1)]
-    temp_max_arr = parallel_processing_function(temp_plt_files, (domain_info, check_flag_dict,), animation_bounds,
-                                                n_proc)
+    temp_max_arr = parallel_processing_function(temp_plt_files, (domain_info, check_flag_dict,), animation_bounds, 24)
 
     # Find the number of rows and columns (assuming all sub-arrays have the same structure)
     n_rows = len(temp_max_arr[0])  # Number of rows (same for all sub-arrays)
@@ -1967,6 +1597,8 @@ def main():
     # Step 8: Individual PltFile Processing
     pelec_processing_function(updated_data_list, domain_info, animation_bnd_arr, check_flag_dict, output_dir_path)
 
+    end_time = time.time()
+    print(f"Execution time: {end_time - start_time} seconds")
     return
 
 
