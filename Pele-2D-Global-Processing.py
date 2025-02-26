@@ -13,8 +13,9 @@ import pywt
 
 yt.set_log_level(0)
 
-n_proc = 24
+n_proc = 16
 bin_size = 51
+flame_thickness_bin = 11
 
 
 class MyClass():
@@ -178,6 +179,10 @@ def domain_size_parameters(directory_path, desired_y_location):
                             # fields=desired_varables
                             )
 
+    grid_arr = np.empty(2, dtype=object)
+    grid_arr[0] = data["boxlib", "x"][:, 0].to_value()
+    grid_arr[1] = data["boxlib", "y"][0, :].to_value()
+
     # Step 3:
     if isinstance(desired_y_location, str) is True:
         if desired_y_location == "Bottom":
@@ -196,7 +201,8 @@ def domain_size_parameters(directory_path, desired_y_location):
     return (
     np.array([[int(data.ActiveDimensions[0]), int(y_slice_index)], [data.RightEdge[0].to_value(), y_slice_loc]]),
     np.array([[int(data.ActiveDimensions[0]), int(data.ActiveDimensions[1])],
-              [data.RightEdge[0].to_value(), data.RightEdge[1].to_value()]]))
+              [data.RightEdge[0].to_value(), data.RightEdge[1].to_value()]]),
+    grid_arr)
 
 
 def wave_tracking_function(raw_data, sort_arr, tracking_str, wave_type):
@@ -327,42 +333,7 @@ def heat_release_rate_function(raw_data, sort_arr, input_params):
     return heat_release_rate, np.max(heat_release_rate)
 
 
-def flame_thickness_function(raw_data, sort_arr, wave_idx):
-    # Step 1: Load the desired marker and x positions
-    if wave_idx < 100:
-        temp_data = raw_data["boxlib", str('Temp')][sort_arr].to_value()[0:2 * wave_idx]
-        temp_x_pos = raw_data["boxlib", str('x')][sort_arr].to_value()[0:2 * wave_idx] / 100
-    else:
-        temp_data = raw_data["boxlib", str('Temp')][sort_arr].to_value()[wave_idx - 100:wave_idx + 100]
-        temp_x_pos = raw_data["boxlib", str('x')][sort_arr].to_value()[wave_idx - 100:wave_idx + 100] / 100
-
-    # Step 2: Compute the gradient of temperature with respect to position
-    temperature_gradient = abs(np.gradient(temp_data) / np.gradient(temp_x_pos))
-    temperature_gradient_idx = np.argwhere(temperature_gradient == np.max(temperature_gradient))[0][0]
-
-    # Step 3:
-    flame_thickness = (np.max(temp_data) - np.min(temp_data)) / np.max(temperature_gradient)
-
-    # Step 4:
-    flame_thickness_arr = [temp_x_pos[temperature_gradient_idx] - flame_thickness / 2,
-                           temp_x_pos[temperature_gradient_idx] + flame_thickness / 2]
-
-    plt_check = False
-    if plt_check:
-        plt.figure(figsize=(8, 6))
-        plt.plot(temp_x_pos, temp_data, linestyle='-', color='k')
-        plt.plot(flame_thickness_arr, [2000, 2000], linestyle='-', color='r')
-        plt.plot(temp_x_pos[temperature_gradient_idx], 2000, marker='.', markersize=10, color='b')
-        plt.xlabel('x')
-        plt.ylabel('y')
-        plt.xlim([temp_x_pos[temperature_gradient_idx] - flame_thickness,
-                  temp_x_pos[temperature_gradient_idx] + flame_thickness])
-        plt.show()
-
-    return flame_thickness
-
-
-def flame_length_contour_function(raw_data, plt_data, sort_arr, plt_check=False):
+def flame_geometry_function(raw_data, center_loc, grid, output_dir_path, contour_check=False, thickness_check=False):
     def sort_by_nearest_neighbors(points, plt_check=False):
         # Convert points to numpy array if it's a list of lists
         points = np.array(points)
@@ -397,166 +368,138 @@ def flame_length_contour_function(raw_data, plt_data, sort_arr, plt_check=False)
         # print('Approximate Surface Length =', surface_approx, 'cm')
         return points[order]
 
-    def flame_front_wavelength_spectrum(raw_data, flame_contours):
-        def segment_flame_contour(x, y, plt_check=False):
-            # Step 1: Compute the difference in x-values
-            dx = np.diff(x)
-            # Step 2: Identify points where x-values turn back (i.e., sign change in dx)
-            turning_points = np.where(np.diff(np.sign(dx)))[0] + 1  # +1 to correct index after np.diff
-            # Step 3: Split the data into segments at turning points
-            segments = []
-            start = 0
-            for tp in turning_points:
-                segments.append((x[start:tp], y[start:tp]))
-                start = tp
-            # Append the last segment
-            segments.append((x[start:], y[start:]))
+    def flame_thickness(raw_data, contour_arr, center_loc, grid):
+        def compute_contour_normal(points):
+            # Create a placeholder array for the tangent
+            dx = np.gradient(points[:, 0])
+            dy = np.gradient(points[:, 1])
+            # Compute normal vectors
+            normals = np.zeros_like(points)
+            normals[:, 0] = dy  # dy
+            normals[:, 1] = -dx  # dx
 
-            if plt_check:
-                plt.figure(figsize=(8, 6))
-                for i in range(len(segments)):
-                    plt.plot(segments[i][0], segments[i][1])
-                plt.xlabel('Wavelength (m)')
-                plt.ylabel('Amplitude')
-                plt.title('FFT Amplitude vs Wavelength')
-                plt.grid(True)
-                plt.show()
+            normal_vect = normals / np.linalg.norm(normals)
+            return normal_vect
 
-            return segments
+        def closest_point_from_poly(points, line):
 
-        def contour_poly_fit_and_distance(x_data, y_data, degree=2, plt_check=False):
-            # Step 1: Create a polynomial fit of the provided data
-            coefficients = np.polyfit(x_data, y_data, degree)
-            poly_func = np.poly1d(coefficients)
+            # Step 1: Generate points along the line defined by the unit vector
+            # Define a range for the line, e.g., from -10 to 10 in the direction of the unit vector
+            t_range = np.linspace(-10, 10, 10000)
+            line_points = np.column_stack(
+                (grid[0][flame_x_idx] + t_range * line[0], grid[1][flame_y_idx] + t_range * line[1]))
 
-            def distance_to_curve(x0, y0):
-                # Step 1: Minimize the distance function to find the closest point on the polynomial
-                def distance(x):
-                    y = poly_func(x)
-                    return np.sqrt((x - x0) ** 2 + (y - y0) ** 2)
+            within_bounds_mask = (
+                    (line_points[:, 0] >= min(points[:, 0])) & (line_points[:, 0] <= max(points[:, 0])) &
+                    (line_points[:, 1] >= min(points[:, 1])) & (line_points[:, 1] <= max(points[:, 1]))
+            )
+            line_points = line_points[within_bounds_mask]
 
-                # Step 2: Optimize to find the x that minimizes the distance
-                result = minimize(distance, x0)  # Initial guess is x0
+            # Step 3: Determine the nearest point to the line generated by the unit vector
+            min_distance_indices = []
 
-                # Step 3: Closest point on the curve
-                x_closest = result.x[0]
-                y_closest = poly_func(x_closest)
+            for line_point in line_points:
+                line_x, line_y = line_point
+                distances = []
 
-                # Step 4: Calculate the distance
-                distance_val = np.sqrt((x_closest - x0) ** 2 + (y_closest - y0) ** 2)
-                return distance_val, (x_closest, y_closest)
+                for point in points:
+                    x, y = point
+                    # Calculate perpendicular distance to the line point
+                    distance = np.sqrt((line_x - x) ** 2 + (line_y - y) ** 2)
+                    distances.append(distance)
 
-            # Step 2: Calculate distances for each data point
-            distances = []
-            closest_points = []
+                # Find the index of the minimum distance for this point
+                min_distance_index = np.argmin(distances)
+                min_distance_indices.append(min_distance_index)
 
-            for x0, y0 in zip(x_data, y_data):
-                dist, point = distance_to_curve(x0, y0)
-                distances.append(dist)
-                closest_points.append(point)
+            min_distance_indices = np.unique(min_distance_indices)
+            closest_points = [points[idx] for idx in min_distance_indices]
 
-            if plt_check:
-                # Step : Create the resulting figure
-                plt.figure(figsize=(12, 10))
-                # Plot the original data and wavelet reconstruction
-                plt.subplot(2, 1, 1)
-                plt.plot(x_data, y_data, label='Original')
-                plt.plot(np.linspace(0, data.RightEdge.to_value()[1], len(x_data)),
-                         poly_func(np.linspace(0, data.RightEdge.to_value()[1], len(x_data))),
-                         label='Polynomial Fit', linestyle='dashed')
-                plt.legend()
-                plt.grid()
-                # Plot the distance
-                plt.subplot(2, 1, 2)
-                plt.plot(np.arange(len(x_data)), distances, label='Original')
-                plt.legend()
-                plt.grid()
-                plt.show()
-
-            return distances, closest_points, poly_func
-
-        """
-
-        """
-        # Step 1: Only process the main flame front, ignore any small detatched flame kernels
-        if len(flame_contours) > 1:
-            flame_contour = max(flame_contours, key=len)
-        else:
-            flame_contour = flame_contours[0]
+            return min_distance_indices, np.array(closest_points)
 
         # Step 1:
-        data = raw_data.covering_grid(raw_data.max_level,
-                                      left_edge=[0.0, 0.0, 0.0],
-                                      dims=raw_data.domain_dimensions * [2 ** raw_data.max_level,
-                                                                         2 ** raw_data.max_level, 1],
-                                      # And any fields to preload (this is optional!)
-                                      # fields=desired_varables
-                                      )
+        normal_vect = compute_contour_normal(contour_arr)
+        # Step 2:
+        flame_idx = np.argmin(abs(contour_arr[:, 1] - center_loc))
+        flame_norm = normal_vect[flame_idx]
 
-        # Step 1: Separate the x and y components from the flame position array
-        try:
-            x_arr = np.array(flame_contour[:, 0], dtype=float)
-            y_arr = np.array(flame_contour[:, 1], dtype=float)
-        except:
-            print('Error in Size Matching')
+        # Find the location of the flame
+        flame_x_idx = np.argmin(abs(grid[0] - contour_arr[flame_idx, 0]))
+        flame_y_idx = np.argmin(abs(grid[1] - contour_arr[flame_idx, 1]))
 
-        # Step 2: Segment the flame contour based on multivaluedness (change in sign of dx)
-        flame_x_segments = segment_flame_contour(x_arr, y_arr, plt_check=True)
-        flame_y_segments = segment_flame_contour(y_arr, x_arr, plt_check=True)
+        # Create a sudo-grid region around the center flame point
+        region = raw_data.box(np.array([grid[0][flame_x_idx - (flame_thickness_bin // 2) - 1][0],
+                                        grid[1][flame_y_idx - (flame_thickness_bin // 2) - 1][0], 0.0]),
+                              np.array([grid[0][flame_x_idx + (flame_thickness_bin // 2)][0],
+                                        grid[1][flame_y_idx + (flame_thickness_bin // 2)][0], 1.0]))
+
+        region_mesh_x, region_mesh_y = np.meshgrid(np.unique(region["x"].to_value()), np.unique(region["y"].to_value()))
+
+        region_grid = np.dstack((region["x"].to_value(), region["y"].to_value()))[0]
+        # Determine the closes points in the region grid to the line created by the norm
+        nearest_norm_idx, nearest_norm_points = closest_point_from_poly(region_grid, flame_norm)
+
+        # Collect the temperature points nearest the flame surface norm
+        region_data = region['Temp'][nearest_norm_idx].to_value()
+
+        # Step 2: Compute the gradient of temperature with respect to position
+        # temperature_gradient = abs(np.gradient(region_data) / np.gradient(np.sqrt(temp_grad_x[len()]**2 + temp_grad_y[]**2)))
+        # temperature_gradient_idx = np.argwhere(temperature_gradient == np.max(temperature_gradient))[0][0]
 
         # Step 3:
-        amplitudes, _, poly_fit = contour_poly_fit_and_distance(y_arr, x_arr, degree=9, plt_check=True)
-        # Step 4:
-        x_poly_fit_data = poly_fit(np.linspace(0, data.RightEdge.to_value()[1], len(y_arr)))
-        poly_fit_power_spectrum = np.abs(np.fft.fft(x_poly_fit_data)) ** 2
-        poly_fit_frequencies = np.fft.fftfreq(len(x_poly_fit_data),
-                                              d=x_poly_fit_data[1] - x_poly_fit_data[0])  # Frequency bins
+        dx = np.diff(nearest_norm_points[:, 0] / 100)  # cm to m
+        dy = np.diff(nearest_norm_points[:, 1] / 100)  # cm to m
 
-        # Step 5:
-        amplitude_power_spectrum = np.abs(np.fft.fft(amplitudes)) ** 2
-        amplitude_frequencies = np.fft.fftfreq(len(y_arr), d=data.dds.to_value()[1])  # Frequency bins
+        dx[dx == 0] = np.nan
+        dy[dy == 0] = np.nan
 
-        plt.figure(figsize=(12, 10))
-        # Plot the original data and wavelet reconstruction
-        plt.subplot(2, 1, 1)
-        plt.plot(y_arr, x_arr, label='Original')
-        plt.plot(np.linspace(0, data.RightEdge.to_value()[1], len(y_arr)),
-                 poly_fit(np.linspace(0, data.RightEdge.to_value()[1], len(y_arr)))
-                 , label='Reconstruction', linestyle='dashed')
-        plt.legend()
-        plt.grid()
-        #
-        plt.subplot(2, 2, 3)
-        plt.plot(amplitude_frequencies[:len(amplitude_frequencies) // 2],
-                 amplitude_power_spectrum[:len(amplitude_frequencies) // 2],
-                 label='Amplitude Spectrum')
-        plt.xscale('log')
-        plt.legend()
-        plt.grid()
-        #
-        plt.subplot(2, 2, 4)
-        plt.plot(poly_fit_frequencies[:len(poly_fit_frequencies) // 2],
-                 poly_fit_power_spectrum[:len(poly_fit_frequencies) // 2],
-                 label='Poly-Fit Spectrum')
-        plt.xscale('log')
-        plt.legend()
-        plt.grid()
+        temp_grad_x = np.diff(region_data) / dx
+        temp_grad_y = np.diff(region_data) / dy
 
-        plt.tight_layout()
+        temp_grad_x = np.nan_to_num(temp_grad_x, nan=0)
+        temp_grad_y = np.nan_to_num(temp_grad_y, nan=0)
 
-        output_dir_path = ensure_long_path_prefix(os.path.join(os.path.dirname(os.path.realpath(__file__)),
-                                                               f"Processed-Global-Results",
-                                                               f"Flame-Contour-FFT-Plt-Files"))
-        if os.path.exists(output_dir_path) is False:
-            os.mkdir(output_dir_path)
+        flame_thickness_val = (np.max(region_data) - np.min(region_data)) / np.max(
+            np.sqrt(temp_grad_x ** 2 + temp_grad_y ** 2))
 
-        formatted_time = '{:.16f}'.format(raw_data.current_time.to_value()).rstrip('0').rstrip('.')
-        filename = os.path.join(output_dir_path, f"Flame-Countour-FFT-Time-{formatted_time}.png")
-        plt.savefig(filename, format='png')
-        plt.show()
-        plt.close()
+        plt_check = True
+        if plt_check:
+            plt.figure(figsize=(8, 6))
+            plt.plot(np.array(contour_arr[:, 0], dtype=float), np.array(contour_arr[:, 1], dtype=float), color='r')
+            plt.scatter(region_grid[:, 0], region_grid[:, 1], marker='o', color='k')
+            plt.scatter(grid[0][flame_x_idx][0], grid[1][flame_y_idx][0], marker='o', color='r')
+            plt.scatter(nearest_norm_points[:, 0], nearest_norm_points[:, 1], marker='o', color='b')
+            # plt.scatter(nearest_norm_points[:, 0], nearest_norm_points[:, 1], c=region_data, cmap='gist_heat', marker='o')
+            plt.quiver(grid[0][flame_x_idx], grid[1][flame_y_idx], flame_norm[0], flame_norm[1],
+                       angles='xy', scale_units='xy', scale=5, color='r', label='Normals')
+            plt.xlabel('x')
+            plt.ylabel('y')
+            plt.xlim(min(region_grid[:, 0].ravel()), max(region_grid[:, 0].ravel()))
+            plt.ylim(min(region_grid[:, 1].ravel()), max(region_grid[:, 1].ravel()))
 
-        return
+            formatted_time = '{:.16f}'.format(raw_data.current_time.to_value()).rstrip('0').rstrip('.')
+            filename = os.path.join(output_dir_path, f"Flame-Thickness-Animation-Time-{formatted_time}.png")
+            plt.savefig(filename, format='png')
+            plt.show()
+            plt.close()
+
+            """
+            plt.figure(figsize=(8, 6))
+            plt.scatter(region["x"].to_value(), region["y"].to_value(),
+                        c=region['Temp'].to_value().reshape(len(np.unique(region["x"].to_value())),
+                                                            len(np.unique(region["y"].to_value()))), cmap='gist_heat',
+                        marker='o')
+            plt.plot(np.array(contour_arr[:, 0], dtype=float), np.array(contour_arr[:, 1], dtype=float), color='r')
+            plt.quiver(grid[0][flame_x_idx][0], grid[1][flame_y_idx][0], flame_norm[0], flame_norm[1],
+                       angles='xy', scale_units='xy', scale=5, color='r', label='Normals')
+            plt.xlabel('x')
+            plt.ylabel('y')
+            plt.xlim(min(region_grid[:, 0].ravel()), max(region_grid[:, 0].ravel()))
+            plt.ylim(min(region_grid[:, 1].ravel()), max(region_grid[:, 1].ravel()))
+            plt.show()
+            """
+
+        return flame_thickness_val
 
     """
 
@@ -593,7 +536,7 @@ def flame_length_contour_function(raw_data, plt_data, sort_arr, plt_check=False)
 
     contour_pts = np.array([x for x in contour_pts if x[0] is not None])
     #
-    contour_arr = sort_by_nearest_neighbors(contour_pts)
+    contour_arr = sort_by_nearest_neighbors(contour_pts).astype(float)
     # Calculate the length of a line between adjacent points for the determine contour
     contour_segments = []
     current_contour = [contour_arr[0]]  # Start with the first point
@@ -621,14 +564,18 @@ def flame_length_contour_function(raw_data, plt_data, sort_arr, plt_check=False)
         contour_segments.append(np.array(current_contour))
         contour_lines.append(np.array(current_line))
 
-    # Determine the wavelength spectrum for a given flame contour using FFT
-    # flame_front_wavelength_spectrum(raw_data, contour_segments)
-
     # Calculate the total line length, by summing the lines between points
     surface_length = sum(np.sum(distances) for distances in contour_lines)
-    # print('Flame Surface Length: ', surface_length, 'cm')
 
-    return surface_length / 100
+    # Determine the normal vectors to the flame surface
+    flame_thickness_val = flame_thickness(raw_data, contour_arr, center_loc, grid)
+
+    if contour_check and thickness_check:
+        return surface_length / 100, flame_thickness_val
+    elif contour_check:
+        return surface_length / 100
+    elif thickness_check:
+        return flame_thickness_val
 
 
 def cantera_ignition_function(plt_data, ddt_window, processing_flags, input_params, reactor_type='Pressure'):
@@ -971,6 +918,7 @@ def single_pltfile_processing(args):
     animation_pltfiles = args[1][1]
     domain_info = args[1][2]
     domain_size = domain_info[0][1]
+    domain_grid = domain_info[-1]
     input_params = args[1][3]
 
     # Step 2: Load the pltFile for individual processing
@@ -1004,16 +952,42 @@ def single_pltfile_processing(args):
                                                                                          input_params)
 
         # Surface Flame Thickness
-        if processing_flags['Flame Processing'].get('Flame Thickness', False):
-            result_dict['Flame']['Flame Thickness'] = flame_thickness_function(plt_data, sort_arr,
-                                                                               result_dict['Flame']['Index'])
+        if processing_flags['Flame Processing'].get('Flame Thickness', False) or processing_flags[
+            'Flame Processing'].get('Surface Length', False):
+            temp_plt_dir = ensure_long_path_prefix(
+                os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
+                             f"Animation-Frames", f"Flame-Thickness-Plt-Files"))
 
-        # Surface Length
-        if processing_flags['Flame Processing'].get('Surface Length', False):
+            if os.path.exists(temp_plt_dir) is False:
+                os.makedirs(temp_plt_dir, exist_ok=True)
             try:
-                result_dict['Flame']['Surface Length'] = flame_length_contour_function(raw_data, plt_data, sort_arr)
+                if processing_flags['Flame Processing'].get('Flame Thickness', False) and processing_flags[
+                    'Flame Processing'].get('Surface Length', False):
+                    [result_dict['Flame']['Surface Length'],
+                     result_dict['Flame']['Flame Thickness']] = flame_geometry_function(raw_data,
+                                                                                        domain_info[0][1][1],
+                                                                                        domain_grid,
+                                                                                        temp_plt_dir,
+                                                                                        thickness_check=True,
+                                                                                        contour_check=True)
+
+                # Flame Thickness
+                if processing_flags['Flame Processing'].get('Flame Thickness', False) and not processing_flags[
+                    'Flame Processing'].get('Surface Length', False):
+                    result_dict['Flame']['Flame Thickness'] = flame_geometry_function(raw_data,
+                                                                                      domain_info[0][1][1], domain_grid,
+                                                                                      temp_plt_dir,
+                                                                                      thickness_check=True)
+
+                if processing_flags['Flame Processing'].get('Surface Length', False) and not processing_flags[
+                    'Flame Processing'].get('Flame Thickness', False):
+                    result_dict['Flame']['Surface Length'] = flame_geometry_function(raw_data,
+                                                                                     domain_info[0][1][1], domain_grid,
+                                                                                     None,
+                                                                                     contour_check=True)
             except:
                 result_dict['Flame']['Surface Length'] = 0
+                result_dict['Flame']['Flame Thickness'] = 0
 
     # Step 3.2: Maximum Pressure Processing
     if 'Maximum Pressure Processing' in processing_flags:
@@ -1689,6 +1663,16 @@ def pelec_processing_function(plt_dir, domain_info, input_params, check_flags, o
             createVariableAnimation(temp_plt_dir,
                                     os.path.join(animation_dir, 'HRR-Evolution-Animation.mp4'), fps=15)
 
+        if check_flags['Domain State Animations'].get('Flame Thickness', False):
+            # Create directory for plt files
+            temp_plt_dir = ensure_long_path_prefix(
+                os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
+                             f"Animation-Frames", f"Flame-Thickness-Plt-Files"))
+
+            # Create the animation file
+            createVariableAnimation(temp_plt_dir,
+                                    os.path.join(animation_dir, 'Flame-Thickness-Evolution-Animation.mp4'), fps=15)
+
         if check_flags['Domain State Animations'].get('Combined', False):
             temp_plt_dir = ensure_long_path_prefix(
                 os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
@@ -2021,13 +2005,13 @@ def main():
             'Smoothing': True
         },
         'Domain State Animations': {
-            'Temperature': True,
-            'Pressure': True,
-            'Velocity': True,
-            'Species': True,
-            'Heat Release Rate': True,
-            'Flame Spectrum': False,
-            'Combined': ('Temp', 'pressure')
+            'Temperature': False,
+            'Pressure': False,
+            'Velocity': False,
+            'Species': False,
+            'Heat Release Rate': False,
+            'Flame Thickness': True,
+            # 'Combined': ('Temp', 'pressure')
         }
     }
 
