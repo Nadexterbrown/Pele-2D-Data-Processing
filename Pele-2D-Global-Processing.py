@@ -13,7 +13,7 @@ import pywt
 
 yt.set_log_level(0)
 
-n_proc = 1
+n_proc = 24
 bin_size = 51
 
 
@@ -294,18 +294,18 @@ def thermodynamic_state_function(raw_data, sort_arr, wave_idx, wave_type, input_
     return result_array.tolist()
 
 
-def heat_release_rate_function(raw_data, sort_arr, time, input_params, plt_check=False):
+def heat_release_rate_function(raw_data, sort_arr, input_params):
     # Step 1: Collect the partial molar enthalpies and net production rates
     net_production_rates = np.empty(len(raw_data["boxlib", str('x')][sort_arr].to_value()), dtype=object)
     partial_molar_enthalpies = np.empty(len(raw_data["boxlib", str('x')][sort_arr].to_value()), dtype=object)
     for i in range(len(raw_data["boxlib", str('x')][sort_arr].to_value())):
         species_comp = {}
-        for j in range(len(input_params.species)):
-            species_comp.update({str(input_params.species[j]):
-                                     raw_data["boxlib", str("Y(" + input_params.species[j] + ")")][sort_arr][
+        temp_obj = ct.Solution(input_params.mech)
+        for j in range(len(temp_obj.species_names)):
+            species_comp.update({str(temp_obj.species_names[j]):
+                                     raw_data["boxlib", str("Y(" + temp_obj.species_names[j] + ")")][sort_arr][
                                          i].to_value()})
 
-        temp_obj = ct.Solution(input_params.mech)
         temp_obj.TPY = (raw_data["boxlib", str("Temp")][sort_arr][i].to_value(),
                         raw_data["boxlib", str("pressure")][sort_arr][i].to_value() * 10,
                         species_comp)
@@ -323,26 +323,8 @@ def heat_release_rate_function(raw_data, sort_arr, time, input_params, plt_check
             integral = integral + net_production_rates[i][j] * partial_molar_enthalpies[i][j]
 
         heat_release_rate[i] = -1.0 * integral
-    # Step 4:
-    if plt_check:
-        plt.xlabel("Position [cm]")
-        plt.ylabel("Heat Release Rate (W/m3)")
-        plt.plot(100 * raw_data["boxlib", str('x')][sort_arr].to_value(), heat_release_rate, label="Heat Release Rate")
-        plt.legend()
 
-        output_dir_path = ensure_long_path_prefix(os.path.join(os.path.dirname(os.path.realpath(__file__)),
-                                                               f"Processed-Global-Results", f"Animation-Frames",
-                                                               f"HRR-Plt-Files"))
-
-        if os.path.exists(output_dir_path) is False:
-            os.makedirs(output_dir_path, exist_ok=True)
-
-        formatted_time = '{:.16f}'.format(time).rstrip('0').rstrip('.')
-        filename = os.path.join(output_dir_path, f"HRR-Animation-Time-{formatted_time}.png")
-        plt.savefig(filename, format='png')
-        plt.close()  # Close the figure to avoid displaying it inline if using in a Jupyter notebook
-
-    return np.max(heat_release_rate)
+    return heat_release_rate, np.max(heat_release_rate)
 
 
 def flame_thickness_function(raw_data, sort_arr, wave_idx):
@@ -788,7 +770,7 @@ def cantera_flame_function(plt_data, ddt_window, processing_flags, input_params)
     return flame_arr
 
 
-def createVariablePltFrame(raw_data, sort_arr, time, min_bounds, max_bounds, tracking_obj, domain_info):
+def createVariablePltFrame(raw_data, sort_arr, time, min_bounds, max_bounds, tracking_obj, domain_info, hrr_arr=None):
     def pltAnimationFrame():
         """
             Plots the data and saves the plot as an image file.
@@ -807,7 +789,8 @@ def createVariablePltFrame(raw_data, sort_arr, time, min_bounds, max_bounds, tra
 
         fig, ax1 = plt.subplots()
         if isinstance(tracking_obj, (np.ndarray, list)):
-            ax1.plot(raw_data["boxlib", str('x')][sort_arr], raw_data["boxlib", str(tracking_obj[0])][sort_arr],
+            ax1.plot(raw_data["boxlib", str('x')][sort_arr].to_value(),
+                     raw_data["boxlib", str(tracking_obj[0])][sort_arr].to_value(),
                      label=tracking_obj[0], linestyle='-', color='k')
             ax1.set_xlabel('Position [cm]')
             ax1.set_ylabel(str(tracking_obj[0]))
@@ -816,7 +799,8 @@ def createVariablePltFrame(raw_data, sort_arr, time, min_bounds, max_bounds, tra
 
             # Create a second Y-axis
             ax2 = ax1.twinx()
-            ax2.plot(raw_data["boxlib", str('x')][sort_arr], raw_data["boxlib", str(tracking_obj[1])][sort_arr],
+            ax2.plot(raw_data["boxlib", str('x')][sort_arr].to_value(),
+                     raw_data["boxlib", str(tracking_obj[1])][sort_arr].to_value(),
                      label=tracking_obj[1], linestyle='--', color='r')
             if tracking_obj[1] == "pressure":
                 plt.yscale('log')
@@ -826,10 +810,16 @@ def createVariablePltFrame(raw_data, sort_arr, time, min_bounds, max_bounds, tra
             wrapped_title = "\n".join(textwrap.wrap(
                 f"{tracking_obj[0]} and {tracking_obj[1]} Variation at y = {domain_size[1]} and t = {time}", width=55))
         else:
-            ax1.plot(raw_data["boxlib", str('x')][sort_arr], raw_data["boxlib", str(tracking_obj)][sort_arr],
-                     label=tracking_obj, linestyle='-', color='k')
-            if tracking_obj == "pressure":
-                plt.yscale('log')
+            if tracking_obj == 'HRR':
+                ax1.plot(raw_data["boxlib", str('x')][sort_arr].to_value(), hrr_arr,
+                         label=tracking_obj, linestyle='-', color='k')
+            else:
+                ax1.plot(raw_data["boxlib", str('x')][sort_arr].to_value(),
+                         raw_data["boxlib", str(tracking_obj)][sort_arr].to_value(),
+                         label=tracking_obj, linestyle='-', color='k')
+                if tracking_obj == "pressure":
+                    plt.yscale('log')
+
             ax1.set_ylabel(str(tracking_obj))
             ax1.set_ylim(y_limit_min, y_limit_max)
 
@@ -1009,13 +999,9 @@ def single_pltfile_processing(args):
 
         # Flame Heat Release Rate
         if processing_flags['Flame Processing'].get('Heat Release Rate', False):
-            if processing_flags['Domain State Animations'].get('Heat Release Rate', False):
-                result_dict['Flame']['Heat Release Rate'] = heat_release_rate_function(plt_data, sort_arr, time,
-                                                                                       input_params,
-                                                                                       plt_check=True)
-            else:
-                result_dict['Flame']['Heat Release Rate'] = heat_release_rate_function(plt_data, sort_arr, time,
-                                                                                       input_params)
+            [result_dict['Flame']['Heat Release Rate'],
+             result_dict['Flame']['Max Heat Release Rate']] = heat_release_rate_function(plt_data, sort_arr,
+                                                                                         input_params)
 
         # Surface Flame Thickness
         if processing_flags['Flame Processing'].get('Flame Thickness', False):
@@ -1024,8 +1010,10 @@ def single_pltfile_processing(args):
 
         # Surface Length
         if processing_flags['Flame Processing'].get('Surface Length', False):
-            result_dict['Flame']['Surface Length'] = flame_length_contour_function(raw_data, plt_data, sort_arr,
-                                                                                   plt_check=True)
+            try:
+                result_dict['Flame']['Surface Length'] = flame_length_contour_function(raw_data, plt_data, sort_arr)
+            except:
+                result_dict['Flame']['Surface Length'] = 0
 
     # Step 3.2: Maximum Pressure Processing
     if 'Maximum Pressure Processing' in processing_flags:
@@ -1095,8 +1083,8 @@ def single_pltfile_processing(args):
         temp_slice = temp_data.ray(np.array([0.0, domain_info[0][1][1], 0.0]),
                                    np.array([domain_info[0][1][0], domain_info[0][1][1], 0.0]))
 
-        min_val_marker = np.empty(3 + len(input_params.species), dtype=object)
-        min_val_arr = np.zeros(3 + len(input_params.species))
+        min_val_marker = np.empty(4 + len(input_params.species), dtype=object)
+        min_val_arr = np.zeros(4 + len(input_params.species))
         for i in range(len(min_val_arr)):
             if i == 0:
                 min_val_marker[i] = str('Temp')
@@ -1107,17 +1095,20 @@ def single_pltfile_processing(args):
             elif i == 2:
                 min_val_marker[i] = 'x_velocity'
                 min_val_arr[i] = np.min(temp_slice["boxlib", str('x_velocity')])
+            elif i == 3:
+                min_val_marker[i] = 'HRR'
+                min_val_arr[i] = np.min(result_dict['Flame']['Heat Release Rate'])
             else:
-                min_val_marker[i] = str("Y(" + input_params.species[i - 3] + ")")
-                min_val_arr[i] = np.min(temp_slice["boxlib", str("Y(" + input_params.species[i - 3] + ")")])
+                min_val_marker[i] = str("Y(" + input_params.species[i - 4] + ")")
+                min_val_arr[i] = np.min(temp_slice["boxlib", str("Y(" + input_params.species[i - 4] + ")")])
 
         # Step 3.5.2: Get last time step to determine minimum parameters
         temp_data = yt.load(animation_pltfiles[1])
         temp_slice = temp_data.ray(np.array([0.0, domain_info[0][1][1], 0.0]),
                                    np.array([domain_info[0][1][0], domain_info[0][1][1], 0.0]))
 
-        max_val_marker = np.empty(3 + len(input_params.species), dtype=object)
-        max_val_arr = np.zeros(3 + len(input_params.species))
+        max_val_marker = np.empty(4 + len(input_params.species), dtype=object)
+        max_val_arr = np.zeros(4 + len(input_params.species))
         for i in range(len(max_val_arr)):
             if i == 0:
                 max_val_marker[i] = str('Temp')
@@ -1128,9 +1119,12 @@ def single_pltfile_processing(args):
             elif i == 2:
                 max_val_marker[i] = 'x_velocity'
                 max_val_arr[i] = np.max(temp_slice["boxlib", str('x_velocity')])
+            elif i == 3:
+                max_val_marker[i] = 'HRR'
+                max_val_arr[i] = np.max(result_dict['Flame']['Heat Release Rate'])
             else:
-                max_val_marker[i] = str("Y(" + input_params.species[i - 3] + ")")
-                max_val_arr[i] = np.max(temp_slice["boxlib", str("Y(" + input_params.species[i - 3] + ")")])
+                max_val_marker[i] = str("Y(" + input_params.species[i - 4] + ")")
+                max_val_arr[i] = np.max(temp_slice["boxlib", str("Y(" + input_params.species[i - 4] + ")")])
 
         # Step 3.5.3: Plot Temperature
         if processing_flags['Domain State Animations'].get('Temperature', False):
@@ -1168,6 +1162,19 @@ def single_pltfile_processing(args):
 
             createVariablePltFrame(plt_data, sort_arr, time, min_val_arr[2], max_val_arr[2], "x_velocity", domain_info)
 
+        # Step 3.5.5: Plot Velocity
+        if processing_flags['Domain State Animations'].get('Heat Release Rate', False):
+            # Create directory for plt files
+            temp_plt_dir = ensure_long_path_prefix(
+                os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Processed-Global-Results",
+                             f"Animation-Frames", f"HRR-Plt-Files"))
+
+            if os.path.exists(temp_plt_dir) is False:
+                os.makedirs(temp_plt_dir, exist_ok=True)
+
+            createVariablePltFrame(plt_data, sort_arr, time, min_val_arr[3], max_val_arr[3], "HRR",
+                                   domain_info, hrr_arr=result_dict['Flame']['Heat Release Rate'])
+
         # Step 3.5.6: Plot Species
         if processing_flags['Domain State Animations'].get('Species', False):
             for i in range(len(input_params.species)):
@@ -1178,7 +1185,7 @@ def single_pltfile_processing(args):
                 if os.path.exists(temp_plt_dir) is False:
                     os.makedirs(temp_plt_dir, exist_ok=True)
 
-                createVariablePltFrame(plt_data, sort_arr, time, min_val_arr[i + 3], max_val_arr[i + 3],
+                createVariablePltFrame(plt_data, sort_arr, time, min_val_arr[i + 4], max_val_arr[i + 4],
                                        f"Y({str(input_params.species[i])})", domain_info)
 
         # Step 3.5.3: Plot Combined
@@ -1262,6 +1269,7 @@ def single_ddt_pltfile_processing(args):
     result_dict['PeleC']['Density'] = np.empty(len(spatial_idx))
     result_dict['PeleC']['Species'] = np.empty(len(spatial_idx), dtype=object)
     result_dict['PeleC']['Heat Release Rate'] = np.empty(len(spatial_idx))
+    result_dict['PeleC']['Max Heat Release Rate'] = np.empty(len(spatial_idx))
 
     for i, value in enumerate(spatial_idx):
         if processing_flags['PeleC Processing'].get('Temperature', False):
@@ -1282,8 +1290,9 @@ def single_ddt_pltfile_processing(args):
             result_dict['PeleC']['Species'][i] = species_comp
 
         if processing_flags['PeleC Processing'].get('Heat Release Rate', False):
-            result_dict['PeleC']['Heat Release Rate'][i] = heat_release_rate_function(plt_data, spatial_idx, time,
-                                                                                      input_params)
+            [result_dict['PeleC']['Heat Release Rate'][i],
+             result_dict['PeleC']['Max Heat Release Rate'][i]] = heat_release_rate_function(plt_data, spatial_idx,
+                                                                                            input_params)
 
         # Step 4.2: Constant Pressure Ignition Delay Processing
     if processing_flags['Comparison Type'].get('Ignition Delay Pressure', False):
@@ -1422,7 +1431,7 @@ def pelec_processing_function(plt_dir, domain_info, input_params, check_flags, o
 
                     # Heat Release Rate
                     if check_flags['Flame Processing'].get('Heat Release Rate', False):
-                        outfile.write(" {0:<55e}".format(collective_results['Flame']['Heat Release Rate'][i]))
+                        outfile.write(" {0:<55e}".format(collective_results['Flame']['Max Heat Release Rate'][i]))
 
                     # Flame Thickness
                     if check_flags['Flame Processing'].get('Flame Thickness', False):
@@ -1486,7 +1495,8 @@ def pelec_processing_function(plt_dir, domain_info, input_params, check_flags, o
 
                     # Heat Release Rate
                     if check_flags['Flame Processing'].get('Heat Release Rate', False):
-                        outfile.write(" {0:<55e}".format(collective_results['Flame']['Smooth']['Heat Release Rate'][i]))
+                        outfile.write(
+                            " {0:<55e}".format(collective_results['Flame']['Smooth']['Max Heat Release Rate'][i]))
 
                     # Flame Thickness
                     if check_flags['Flame Processing'].get('Flame Thickness', False):
@@ -1551,7 +1561,7 @@ def pelec_processing_function(plt_dir, domain_info, input_params, check_flags, o
 
         if check_flags['Flame Processing'].get('Smoothing', False) and check_flags['Flame Processing'].get(
                 'Heat Release Rate', False):
-            smoothing_function(collective_results, 'Flame', 'Heat Release Rate')
+            smoothing_function(collective_results, 'Flame', 'Max Heat Release Rate')
 
         if check_flags['Flame Processing'].get('Smoothing', False) and check_flags['Flame Processing'].get(
                 'Flame Thickness', False):
@@ -1702,13 +1712,13 @@ def pelec_processing_function(plt_dir, domain_info, input_params, check_flags, o
                 break  # Break as soon as we find a True value
 
     if write_to_file:
-        file_output(os.path.join(output_dir, 'Wave-Tracking-Results.txt'), False)
+        file_output(ensure_long_path_prefix(os.path.join(output_dir, 'Wave-Tracking-Results.txt')), False)
         if smoothing_flag:
-            file_output(os.path.join(output_dir, 'Wave-Tracking-Smooth-Results.txt'), True)
+            file_output(ensure_long_path_prefix(os.path.join(output_dir, 'Wave-Tracking-Smooth-Results.txt')), True)
 
         for master_key, sub_dict in check_flags.items():
             if 'Smoothing' in sub_dict and sub_dict['Smoothing'] == True:
-                file_output(os.path.join(output_dir, 'Wave-Tracking-Smooth-Results.txt'), True)
+                file_output(ensure_long_path_prefix(os.path.join(output_dir, 'Wave-Tracking-Smooth-Results.txt')), True)
 
     return
 
@@ -1779,7 +1789,7 @@ def pelec_ddt_processing_function(ddt_pltFile, plt_dir, domain_info, input_param
                 header_data.extend(["Heat Release Rate [W/m3]"])
 
         #
-        with (open(file_path, "w") as outfile):
+        with (open(ensure_long_path_prefix(file_path), "w") as outfile):
             outfile.write("#")
             for i in range(len(header_data)):
                 outfile.write("{0:<55.0f} ".format(int(i + 1)))
@@ -1806,7 +1816,7 @@ def pelec_ddt_processing_function(ddt_pltFile, plt_dir, domain_info, input_param
                             outfile.write(" {0:<55e}".format(plt_result[i]['PeleC']['Species'][spatial_cell]))
                     # Heat Release Rate
                     if check_flags['PeleC Processing'].get('Heat Release Rate', False):
-                        outfile.write(" {0:<55e}".format(plt_result[i]['PeleC']['Heat Release Rate'][spatial_cell]))
+                        outfile.write(" {0:<55e}".format(plt_result[i]['PeleC']['Max Heat Release Rate'][spatial_cell]))
 
                     outfile.write("\n")
 
@@ -1835,7 +1845,8 @@ def pelec_ddt_processing_function(ddt_pltFile, plt_dir, domain_info, input_param
                         # Heat Release Rate
                         if check_flags['Ignition Delay Processing'].get('Heat Release Rate', False):
                             outfile.write(" {0:<55e}".format(
-                                plt_result[time_step]['Ignition Delay Pressure'][spatial_cell]['Heat Release Rate'][i]))
+                                plt_result[time_step]['Ignition Delay Pressure'][spatial_cell]['Max Heat Release Rate'][
+                                    i]))
 
                         outfile.write("\n")
                 if result_type == 'Ignition Delay Volume':
@@ -1862,7 +1873,8 @@ def pelec_ddt_processing_function(ddt_pltFile, plt_dir, domain_info, input_param
                         # Heat Release Rate
                         if check_flags['Ignition Delay Processing'].get('Heat Release Rate', False):
                             outfile.write(" {0:<55e}".format(
-                                plt_result[time_step]['Ignition Delay Volume'][spatial_cell]['Heat Release Rate'][i]))
+                                plt_result[time_step]['Ignition Delay Volume'][spatial_cell]['Max Heat Release Rate'][
+                                    i]))
 
                         outfile.write("\n")
             elif result_type == 'Flame':
@@ -1888,8 +1900,8 @@ def pelec_ddt_processing_function(ddt_pltFile, plt_dir, domain_info, input_param
                                 " {0:<55e}".format(plt_result[time_step]['Flame'][spatial_cell]['Species'][j]))
                     # Heat Release Rate
                     if check_flags['Ignition Delay Processing'].get('Heat Release Rate', False):
-                        outfile.write(
-                            " {0:<55e}".format(plt_result[time_step]['Flame'][spatial_cell]['Heat Release Rate'][i]))
+                        outfile.write(" {0:<55e}".format(
+                            plt_result[time_step]['Flame'][spatial_cell]['Max Heat Release Rate'][i]))
 
                     outfile.write("\n")
             outfile.close()
@@ -1940,7 +1952,8 @@ def pelec_ddt_processing_function(ddt_pltFile, plt_dir, domain_info, input_param
     for spatial_cell in range(check_flags['Processing Parameters']['Spatial Window']):
         if os.path.exists(
                 os.path.join(os.path.join(output_dir, f"Processed-DDT-Results", f"Cell-{spatial_cell}"))) is False:
-            os.mkdir(os.path.join(output_dir, f"Processed-DDT-Results", f"Cell-{spatial_cell}"))
+            os.mkdir(
+                ensure_long_path_prefix(os.path.join(output_dir, f"Processed-DDT-Results", f"Cell-{spatial_cell}")))
 
         if check_flags['Comparison Type'].get('PeleC', False):
             file_output(
@@ -1974,9 +1987,9 @@ def main():
     # All functions are configured for a 2 dimensional space
     ####################################################################################################################
     # Step 0: Set all the desired tasks to be performed bny the python script
-    skip_load = 5
+    skip_load = 0
     row_index = "Middle"  # Desired row location for data collection
-    ddt_plt_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'Raw-PeleC-Data', 'plt53830')
+    ddt_plt_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'Raw-PeleC-Data', 'plt426200')
 
     check_flag_dict = {
         'Flame Processing': {
@@ -1984,7 +1997,7 @@ def main():
             'Velocity': True,
             'Relative Velocity': False,
             'Thermodynamic State': True,
-            'Heat Release Rate': False,
+            'Heat Release Rate': True,
             'Flame Thickness': True,
             'Surface Length': True,
             'Smoothing': True
@@ -2008,20 +2021,20 @@ def main():
             'Smoothing': True
         },
         'Domain State Animations': {
-            'Temperature': False,
-            'Pressure': False,
-            'Velocity': False,
-            'Species': False,
+            'Temperature': True,
+            'Pressure': True,
+            'Velocity': True,
+            'Species': True,
             'Heat Release Rate': True,
             'Flame Spectrum': False,
-            # 'Combined': ('Temp', 'pressure')
+            'Combined': ('Temp', 'pressure')
         }
     }
 
     detonation_check_flag = {
         'Processing Parameters': {
-            'Time Window': (11, 4),
-            'Spatial Window': 15,
+            'Time Window': (10, 10),
+            'Spatial Window': 5,
         },
         'Comparison Type': {
             'PeleC': True,
@@ -2048,7 +2061,7 @@ def main():
             'Pressure': True,
             'Density': True,
             'Velocity': True,
-            'Species': False,
+            'Species': True,
             'Heat Release Rate': True,
         }
     }
@@ -2100,8 +2113,7 @@ def main():
     pelec_processing_function(updated_data_list, domain_info, input_params, check_flag_dict, output_dir=output_dir_path)
 
     # Step 7:
-    pelec_ddt_processing_function(ddt_plt_dir, updated_data_list, domain_info, input_params, detonation_check_flag,
-                                  output_dir=output_dir_path)
+    # pelec_ddt_processing_function(ddt_plt_dir, updated_data_list, domain_info, input_params, detonation_check_flag, output_dir=output_dir_path)
 
     return
 
