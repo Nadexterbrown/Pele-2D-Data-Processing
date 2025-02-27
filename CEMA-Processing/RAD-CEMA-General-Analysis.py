@@ -276,7 +276,8 @@ def cantera_flame():
             # Specific Enthalpies (h_k)
             data[f'h({species})'] = f.standard_enthalpies_RT[gas.species_index(species)] * ct.gas_constant * f.T
             # Species Reaction Rates (Net Rate of Production)
-            data[f'W({species})'] = f.net_production_rates[gas.species_index(species)] * gas.molecular_weights[gas.species_index(species)]
+            data[f'W({species})'] = f.net_production_rates[gas.species_index(species)] * gas.molecular_weights[
+                gas.species_index(species)]
 
         return data
 
@@ -306,25 +307,50 @@ def sdtoolbox_detonation():
     ###########################################
 
     def dict_creation():
+        # Initialize an empty dictionary with NumPy arrays
         data = {
-            'Grid': f.grid,
-            'Temperature': f.T,
-            'Pressure': f.P,
-            'Density': f.density_mass,
-            'Viscosity': f.viscosity,
-            'Conductivity': f.thermal_conductivity,
-            'Heat Release Rate': f.heat_release_rate,
-            'Cp': f.cp_mass,
-            'X Velocity': f.velocity
+            'Grid': np.array(out['distance']),
+            'Temperature': np.zeros(len(out['distance'])),
+            'Pressure': np.zeros(len(out['distance'])),
+            'Density': np.zeros(len(out['distance'])),
+            'Viscosity': np.zeros(len(out['distance'])),
+            'Conductivity': np.zeros(len(out['distance'])),
+            'Heat Release Rate': np.zeros(len(out['distance'])),
+            'Cp': np.zeros(len(out['distance'])),
+            'X Velocity': np.zeros(len(out['distance']))
         }
 
+        # Add species-dependent properties dynamically
         for species in input_params.species:
-            # Mass Fractions (Y_k)
-            data[f'Y({species})'] = f.Y(species)
-            # Mixture Averaged Diffusion Coefficients (D_k)
-            data[f'Y({species})'] = f.mix_diff_coeffs_mass(species)
-            # Specific Enthalpies (h_k)
-            data[f'Y({species})'] = f.standard_enthalpies_RT(species) * ct.gas_constant * f.T
+            data[f'Y({species})'] = np.zeros(len(out['distance']))
+            data[f'D({species})'] = np.zeros(len(out['distance']))
+            data[f'h({species})'] = np.zeros(len(out['distance']))
+            data[f'W({species})'] = np.zeros(len(out['distance']))
+
+        # Create a gas object
+        gas_tmp = ct.Solution(input_params.mech)
+
+        for i in range(len(out['distance'])):
+            # Set gas state for the current step
+            species_dict = {input_params.species[j]: out['species'][j][i] for j in range(len(input_params.species))}
+            gas_tmp.TPY = out['T'][i], out['P'][i], species_dict
+
+            # Store computed values directly into the NumPy arrays
+            data['Temperature'][i] = gas_tmp.T
+            data['Pressure'][i] = gas_tmp.P
+            data['Density'][i] = gas_tmp.density_mass
+            data['Viscosity'][i] = gas_tmp.viscosity
+            data['Conductivity'][i] = gas_tmp.thermal_conductivity
+            data['Heat Release Rate'][i] = gas_tmp.heat_release_rate
+            data['Cp'][i] = gas_tmp.cp_mass
+            data['X Velocity'][i] = out['U'][i]
+
+            for species in input_params.species:
+                idx = gas_tmp.species_index(species)
+                data[f'Y({species})'][i] = gas_tmp.Y[idx]  # Mass Fraction
+                data[f'D({species})'][i] = gas_tmp.mix_diff_coeffs_mass[idx]  # Diffusion Coefficient
+                data[f'h({species})'][i] = gas_tmp.standard_enthalpies_RT[idx] * ct.gas_constant * gas_tmp.T  # Enthalpy
+                data[f'W({species})'][i] = gas_tmp.net_production_rates[idx] * gas_tmp.molecular_weights[idx]  # Reaction Rate
 
         return data
 
@@ -465,6 +491,9 @@ def rad_analysis(data, species='OH', PLT_FLAG=False):
         # Step 2: Calculate the diffusion velocity for the species using Fick's law
         diff_vel = -data[f'D({species})'] * grad_Y / data[f'Y({species})']
 
+        # Replace NaNs/Infs with nearest valid values or 0
+        diff_vel[np.isnan(diff_vel) | np.isinf(diff_vel)] = 0
+
         # Step 3: Multiply the terms together for differentiation
         tmp_arr = data['Density'] * data[f'Y({species})'] * diff_vel
         return np.gradient(tmp_arr) / np.gradient(data['Grid'])
@@ -489,17 +518,17 @@ def rad_analysis(data, species='OH', PLT_FLAG=False):
 
         # Plot on the first y-axis
         ax1.plot(data['Grid'], r, 'r-', label="Reaction")
-        ax1.plot(data['Grid'], a, 'r--', label="Advection")
-        ax1.plot(data['Grid'], d, 'r-.', label="Diffusion")
-        ax1.set_xlim(0.00065, 0.0008)
+        ax1.plot(data['Grid'], a, 'b--', label="Advection")
+        ax1.plot(data['Grid'], d, 'g:', label="Diffusion")
+        ax1.set_xlim(0.001, 0.0003)
         ax1.set_xlabel('Grid')
         ax1.set_ylabel('Primary Y-axis')
-        ax1.legend(loc='upper left')
+        ax1.legend(loc='center right')
 
         # Create a second y-axis
         ax2 = ax1.twinx()
         ax2.plot(data['Grid'], data[f'Y({species})'], 'k-', label=f"Y({species})")
-        ax2.set_ylabel('Secondary Y-axis')
+        ax2.set_ylabel('Y(OH)')
         ax2.legend(loc='upper right')
 
         # Display the plot
@@ -554,8 +583,8 @@ def main():
 
     # Step 1: Script Flags
     SOLVER_TYPE = {
-        'Laminar Flame': True,
-        'ZND Detonation': False,
+        'Laminar Flame': False,
+        'ZND Detonation': True,
         'PeleC 2D Data': False,
     }
 
@@ -566,8 +595,8 @@ def main():
 
     # Step 2: Set reactant mixture parameters
     initialize_parameters(
-        T=503.15,
-        P=10.0 * 100000,
+        T=300.0,
+        P=1.0 * 100000,
         Phi=1.0,
         Fuel='H2',
         nitrogenAmount=0.5 * 3.76,
