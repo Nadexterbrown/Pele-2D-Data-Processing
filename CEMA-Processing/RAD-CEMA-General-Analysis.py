@@ -670,14 +670,14 @@ def rad_analysis(data, species='OH', flame_y_loc=None, PLT_FLAG=False):
             grad_Y[n] = (data[f'Y({species})'][n + 1] - data[f'Y({species})'][n]) / (data['Grid'][n + 1, 0] - data['Grid'][n, 0])
 
         # Step 2: Calculate the diffusion velocity for the species using Fick's law
-        diff_vel = -data[f'D({species})'] * grad_Y / data[f'Y({species})']
+        diff_vel = - data[f'D({species})'] * grad_Y / data[f'Y({species})']
 
         # Replace NaNs/Infs with nearest valid values or 0
         diff_vel[np.isnan(diff_vel) | np.isinf(diff_vel)] = 0
 
         # Step 3: Multiply the terms together for differentiation
         tmp_arr = data['Density'] * data[f'Y({species})'] * diff_vel
-        return - np.gradient(tmp_arr) / np.gradient(data['Grid'][:, 0])
+        return np.gradient(tmp_arr) / np.gradient(data['Grid'][:, 0])
 
     ###########################################
     # Main Function
