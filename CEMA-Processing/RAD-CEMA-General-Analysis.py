@@ -273,7 +273,7 @@ def cantera_flame():
 
     def dict_creation():
         data = {
-            'Grid': [[x, 0] for x in f.grid],
+            'Grid': np.array([[x, 0] for x in f.grid]),
             'Temperature': f.T,
             'Pressure': f.P,
             'Density': f.density_mass,
@@ -309,7 +309,7 @@ def cantera_flame():
     gas.TPX = input_params.T, input_params.P, input_params.X
     # Step 3: Set up flame object
     f = ct.FreeFlame(gas, width=width)
-    f.set_refine_criteria(ratio=3, slope=0.01, curve=0.01)
+    f.set_refine_criteria(ratio=3, slope=0.1, curve=0.1)
     # Step 4: Solve with mixture-averaged transport model
     f.transport_model = 'mixture-averaged'
     f.solve(loglevel=loglevel, auto=True)
@@ -324,7 +324,7 @@ def sdtoolbox_detonation():
     def dict_creation():
         # Initialize an empty dictionary with NumPy arrays
         data = {
-            'Grid': [[x, 0] for x in  np.array(out['distance'])],
+            'Grid': np.zeros((len(out['distance']), 2)),
             'Temperature': np.zeros(len(out['distance'])),
             'Pressure': np.zeros(len(out['distance'])),
             'Density': np.zeros(len(out['distance'])),
@@ -351,8 +351,9 @@ def sdtoolbox_detonation():
             gas_tmp.TPY = out['T'][i], out['P'][i], species_dict
 
             # Store computed values directly into the NumPy arrays
-            data['Temperature'][i] = gas_tmp.T
-            data['Pressure'][i] = gas_tmp.P
+            data['Grid'][i] = out['distance'][i]
+            data['Temperature'][i] = out['T'][i]
+            data['Pressure'][i] = out['P'][i]
             data['Density'][i] = gas_tmp.density_mass
             data['Viscosity'][i] = gas_tmp.viscosity
             data['Conductivity'][i] = gas_tmp.thermal_conductivity
@@ -389,7 +390,7 @@ def sdtoolbox_detonation():
     gas = PostShock_fr(cj_speed, input_params.P, input_params.T, input_params.X, input_params.mech)
 
     # Solve ZND ODEs, make ZND plots
-    out = zndsolve(gas, gas1, cj_speed, t_end=1e-4, advanced_output=True)
+    out = zndsolve(gas, gas1, cj_speed, t_end=1e-6, advanced_output=True)
 
     return dict_creation()
 
@@ -641,7 +642,8 @@ def cantera_enthalpy(data):
                     # Set the gas object state
                     gas_tmp.TPY = temperature[j, i], pressure[j, i] / 10, species_dict
 
-                    species_enthalpy[f"Y({species})"][j, i] = gas_tmp.standard_enthalpies_RT[k] * ct.gas_constant * temperature[j,i] * 10000
+
+                    species_enthalpy[f"Y({species})"][j, i] = gas_tmp.standard_enthalpies_RT[gas_tmp.species_index(species)] * ct.gas_constant * temperature[j,i] * 10000
 
     return species_enthalpy
 
@@ -677,7 +679,7 @@ def rad_analysis(data, species='OH', flame_y_loc=None, PLT_FLAG=False):
 
         # Step 3: Multiply the terms together for differentiation
         tmp_arr = data['Density'] * data[f'Y({species})'] * diff_vel
-        return np.gradient(tmp_arr) / np.gradient(data['Grid'][:, 0])
+        return - np.gradient(tmp_arr) / np.gradient(data['Grid'][:, 0])
 
     ###########################################
     # Main Function
@@ -975,9 +977,9 @@ def main():
 
     # Step 1: Script Flags
     SOLVER_TYPE = {
-        'Laminar Flame': False,
+        'Laminar Flame': True,
         'ZND Detonation': False,
-        'PeleC 2D Data': True,
+        'PeleC 2D Data': False,
     }
 
     ANALYSIS_MODE = {
@@ -987,14 +989,12 @@ def main():
 
     # Step 2: Set reactant mixture parameters
     initialize_parameters(
-        T=503.15,
+        T=503,
         P=10.0 * 1e5,
         Phi=1.0,
         Fuel='H2',
         mech='../Chemical-Mechanisms/Li-Dryer-H2-mechanism.yaml',
     )
-
-    input_params.species.remove("N2")
 
     # Step 3: Create or extract data from file, depending on SOLVER_TYPE
 
@@ -1021,11 +1021,12 @@ def main():
 
         # Chronologically order the pltFiles and truncate the raw data list if skip loading is enabled
         updated_data_list = sort_files(time_data_dir)
-        updated_data_list = [updated_data_list[-1]]
+        updated_data_list = [updated_data_list[0]]
 
         # Step 3:
         ddt_box_size = 1e-2  # cm
         ddt_y_loc = 0.0462731
+        input_params.species.remove("N2")
         # If multiple plot files are provided, determine the size of the box to fit data from the first and last file
         if len(np.array(updated_data_list)) > 1:
             initial_box = flame_box(updated_data_list[0], flame_y_loc=ddt_y_loc, box_size=ddt_box_size)
