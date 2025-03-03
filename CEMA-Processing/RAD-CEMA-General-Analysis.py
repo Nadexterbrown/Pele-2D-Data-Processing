@@ -660,7 +660,7 @@ def rad_analysis(data, species='OH', flame_y_loc=None, PLT_FLAG=False):
 
     def advection_terms():
         tmp_arr = data['Density'] * data[f'Y({species})'] * data['X Velocity']
-        return np.gradient(tmp_arr) / np.gradient(data['Grid'][:, 0])
+        return - np.gradient(tmp_arr) / np.gradient(data['Grid'][:, 0])
 
     def diffusion_terms():
         # Step 1: Compute the species mass fraction gradient
@@ -677,7 +677,7 @@ def rad_analysis(data, species='OH', flame_y_loc=None, PLT_FLAG=False):
 
         # Step 3: Multiply the terms together for differentiation
         tmp_arr = data['Density'] * data[f'Y({species})'] * diff_vel
-        return np.gradient(tmp_arr) / np.gradient(data['Grid'][:, 0])
+        return - np.gradient(tmp_arr) / np.gradient(data['Grid'][:, 0])
 
     ###########################################
     # Main Function
