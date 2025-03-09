@@ -2039,6 +2039,7 @@ def single_file_processing(args):
     output_dir = kwargs.get('output_dir', None)
     animation_bnds = kwargs.get('animation_bnds', None)
     CHECK_FLAGS = kwargs.get('CHECK_FLAGS', [])
+    PLT_BNDS_FLAG = kwargs.get('PLT_BNDS_FLAG', False)
 
     # Step 1: Load the PeleC data from the desired plot file
     time, raw_data, pre_loaded_data, grids = load_data()
@@ -2157,8 +2158,11 @@ def single_file_processing(args):
                     y_data_arr = tmp_arr[key]
 
                 # Determine bounds
-                bnd_arr_index = [item[0] for item in animation_bnds].index(key)
-                y_lim = [animation_bnds[bnd_arr_index][1], animation_bnds[bnd_arr_index][2]]
+                if PLT_BNDS_FLAG:
+                    bnd_arr_index = [item[0] for item in animation_bnds].index(key)
+                    y_lim = [animation_bnds[bnd_arr_index][1], animation_bnds[bnd_arr_index][2]]
+                else:
+                    y_lim = None
 
                 # Prepare directory for output
                 if " " in key:  # Check if there's a space
@@ -2216,10 +2220,13 @@ def single_file_processing(args):
             i += 1
 
         # Step 4: Find the corresponding bounds for each subdictionary
-        bnd_arr_indices = [
-            [item[0] for item in animation_bnds].index(name) for name in subdict_names
-        ]
-        y_lims = [[animation_bnds[idx][1], animation_bnds[idx][2]] for idx in bnd_arr_indices]
+        if PLT_BNDS_FLAG:
+            bnd_arr_indices = [
+                [item[0] for item in animation_bnds].index(name) for name in subdict_names
+            ]
+            y_lims = [[animation_bnds[idx][1], animation_bnds[idx][2]] for idx in bnd_arr_indices]
+        else:
+            y_lims = None
 
         # Step 5: Create the output directory for the combined state animations
         temp_plt_dir = ensure_long_path_prefix(os.path.join(output_dir, f"Animation-Frames", f"{'-'.join(animation_str)}-Plt-Files"))
@@ -2281,7 +2288,10 @@ def single_file_processing(args):
         x_idx = [np.searchsorted(x_data_arr, wave_loc - local_physical_window, side='left'),
                  np.searchsorted(x_data_arr, wave_loc + local_physical_window, side='right')]
         x_lim = [x_data_arr[x_idx[0]], x_data_arr[x_idx[1]]]
-        y_lims = [[animation_bnds[idx][1], animation_bnds[idx][2]] for idx in bnd_arr_indices]
+        if PLT_BNDS_FLAG:
+            y_lims = [[animation_bnds[idx][1], animation_bnds[idx][2]] for idx in bnd_arr_indices]
+        else:
+            y_lims = None
 
         # Step 5: Create the output directory for the combined state animations
         temp_plt_dir = ensure_long_path_prefix(
@@ -2301,7 +2311,7 @@ def single_file_processing(args):
 
     return result_dict
 
-def pelec_processing(pelec_dirs, domain_info, animation_bnds, output_dir, CHECK_FLAGS, SMOOTHING_FLAG):
+def pelec_processing(pelec_dirs, domain_info, animation_bnds, output_dir, CHECK_FLAGS, PLT_BNDS_FLAG, SMOOTHING_FLAG):
     ###########################################
     # Internal Functions
     ###########################################
@@ -2357,9 +2367,10 @@ def pelec_processing(pelec_dirs, domain_info, animation_bnds, output_dir, CHECK_
     # Step 1: Process the individual pelec data files in parallel using multiprocessing
     pelec_data = parallel_processing_function(pelec_dirs, (), single_file_processing,
                                               domain_info=domain_info,
-                                              CHECK_FLAGS=CHECK_FLAGS,
                                               animation_bnds=animation_bnds,
-                                              output_dir=output_dir)
+                                              output_dir=output_dir,
+                                              CHECK_FLAGS=CHECK_FLAGS,
+                                              PLT_BNDS_FLAG=PLT_BNDS_FLAG)
 
     # Step 2: Re-organize the processed data for ease of manipulation
     collective_results = {master_key: {slave_key: [pelec_data[i][master_key][slave_key] for i in range(len(pelec_data))] for slave_key in pelec_data[0][master_key]} for master_key in pelec_data[0]}
@@ -2468,6 +2479,7 @@ def main():
     ddt_plt_file = 'plt332330'
 
     SMOOTHING_FLAG = True
+    PLT_BNDS_FLAG = True
     CHECK_FLAGS = {
         'Flame': {
             'Position': True,
@@ -2561,11 +2573,15 @@ def main():
     output_dir_path = os.path.join(dir_path, f"Processed-Global-Results-V{version}", f"y-{domain_info[1][0][1]:.3g}cm")
 
     # Step 7:
-    animation_axis_bnds = animation_axis(updated_data_list, ddt_dir, ddt_plt_file, domain_info, CHECK_FLAGS)
+    if PLT_BNDS_FLAG:
+        animation_axis_bnds = animation_axis(updated_data_list, ddt_dir, ddt_plt_file, domain_info, CHECK_FLAGS)
+    else:
+        animation_axis_bnds = None
+
 
     # Step 8:
     print('Beginning PeleC Processing')
-    pelec_processing(updated_data_list, domain_info, animation_axis_bnds, output_dir_path, CHECK_FLAGS, SMOOTHING_FLAG)
+    pelec_processing(updated_data_list, domain_info, animation_axis_bnds, output_dir_path, CHECK_FLAGS, PLT_BNDS_FLAG, SMOOTHING_FLAG)
     print('Completed PeleC Processing')
 
     end_time = time.time()
