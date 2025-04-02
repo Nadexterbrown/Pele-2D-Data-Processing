@@ -38,6 +38,7 @@ def cantera_flame(input_params, width=0.001, spacing=0.0001):
             'Cp': np.zeros((1, len(f.grid))),
             'Cv': np.zeros((1, len(f.grid))),
             'X Velocity': np.zeros((1, len(f.grid))),
+            'Y Velocity': np.zeros((1, len(f.grid))),
             'rho_e': np.zeros((1, len(f.grid)))
         }
 

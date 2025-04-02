@@ -98,34 +98,36 @@ def jacobian(data, input_params, species_enthalpy, jac_method='Simple', chem_met
         temperature_jacobian = gas_tmp.net_production_rates_ddT
 
         # Map the jacobians to a pandas dataframe
-        species_jacobian = pd.DataFrame(species_jacobian, index=gas_tmp.species_names, columns=gas_tmp.species_names)
-        temperature_jacobian = pd.Series(temperature_jacobian, index=gas_tmp.species_names)
+        species_jacobian = pd.DataFrame(species_jacobian, index=gas_tmp.species_names, columns=gas_tmp.species_names, dtype=np.float64)
+        temperature_jacobian = pd.Series(temperature_jacobian, index=gas_tmp.species_names, dtype=np.float64)
 
         return species_jacobian, temperature_jacobian
 
     def pyjac_solution(gas_tmp, T, P, Y):
+        import pyjacob  # Only imports if not already loaded
+
         # Set the gas object state
         gas_tmp.TPY = T, P, Y
 
         # Setup the state vector (Does not account for N2)
-        y = np.zeros(gas_tmp.n_species)
+        y = np.zeros(gas_tmp.n_species, dtype=np.float64)
         y[0] = T
-        y[1:] = gas_tmp.Y[:-1]
+        y[1:] = gas_tmp.concentrations[:-1]
 
         # Create a dydt vector
         dydt = np.zeros_like(y)
         pyjacob.py_dydt(0, P, y, dydt)
 
         # Create a jacobian vector
-        jac = np.zeros(gas_tmp.n_species * gas_tmp.n_species)
+        jac = np.zeros(gas_tmp.n_species * gas_tmp.n_species, dtype=np.float64)
 
         # Evaluate the Jacobian
         pyjacob.py_eval_jacobian(0, P, y, jac)
 
         J_vector = np.array(jac)  # Ensure it's a NumPy array
-        J_tmp = J_vector.reshape((len(gas_tmp.n_species), len(gas_tmp.n_species)), order='F')  # Reshape using Fortran order
-        J_matrix = np.zeros((J_tmp.shape[0] + 1, J_tmp.shape[0] + 1))
-        J_matrix[:-1, -1] = J_matrix
+        J_tmp = J_vector.reshape((gas_tmp.n_species, gas_tmp.n_species), order='F')  # Reshape using Fortran order
+        J_matrix = np.zeros((J_tmp.shape[0] + 1, J_tmp.shape[0] + 1), dtype=np.float64)
+        J_matrix[:-1, :-1] = J_tmp
 
         species_jacobian = J_matrix[1:, 1:]
         temperature_jacobian = J_matrix[1:, 0]
@@ -138,7 +140,7 @@ def jacobian(data, input_params, species_enthalpy, jac_method='Simple', chem_met
 
     def simple_jacobian(gas_tmp, T, P, Y):
         # Step 1: Allocate memory for the jacobian array
-        tmp_jacobian = np.zeros((len(input_params.species), len(input_params.species)))
+        tmp_jacobian = np.zeros((len(input_params.species), len(input_params.species)), dtype=np.float64)
 
         # Set the gas object state
         gas_tmp.TPY = T, P, Y
@@ -146,10 +148,7 @@ def jacobian(data, input_params, species_enthalpy, jac_method='Simple', chem_met
         #
         if chem_method == 'Cantera':
             species_jacobian, temperature_jacobian = cantera_solution(gas_tmp, T, P, Y)
-        elif chem_method == 'pyJac':
-            if "pyjacob" not in globals():
-                import pyjacob  # Only imports if not already loaded
-
+        elif chem_method == 'Pyjac':
             # reorder the gas to match pyJac
             n2_ind = gas_tmp.species_index('N2')
             specs = gas_tmp.species()[:]
@@ -162,20 +161,28 @@ def jacobian(data, input_params, species_enthalpy, jac_method='Simple', chem_met
             print('Invalid Chemical Jacobian Solver Selection')
 
         # Calculate the CEMA jacobian values
-        for row, primary_species in enumerate(input_params.species):
-            for col, secondary_species in enumerate(input_params.species):
+        for row in range(0, tmp_jacobian.shape[0]):
+            if row < len(input_params.species):
+                primary_species = input_params.species[row]
 
-                if row < tmp_jacobian.shape[0] and col < tmp_jacobian.shape[1]:
-                    tmp_jacobian[row, col] = species_jacobian[primary_species][secondary_species]
+            for col in range(0, tmp_jacobian.shape[1]):
+                if col < len(input_params.species):
+                    secondary_species = input_params.species[col]
+
+                if row < len(input_params.species) and col < len(input_params.species):
+                    tmp_jacobian[row, col] = ((gas_tmp.molecular_weights[gas_tmp.species_index(primary_species)] /
+                                               gas_tmp.molecular_weights[gas_tmp.species_index(secondary_species)]) *
+                                              species_jacobian[primary_species][secondary_species])
 
                 elif row < tmp_jacobian.shape[0] and col == tmp_jacobian.shape[1]:
                     tmp_jacobian[row, col] = temperature_jacobian[primary_species]
 
-                elif row == tmp_jacobian.shape[0] and col < tmp_jacobian.shape[1]:
-                    tmp_jacobian[row, col] = (sum(species_jacobian[species][secondary_species] *
+                elif row == tmp_jacobian.shape[0]:
+                    tmp_jacobian[row, col] = (sum((gas_tmp.molecular_weights[gas_tmp.species_index(species)] /
+                                                   gas_tmp.molecular_weights[gas_tmp.species_index(secondary_species)]) *
+                                                  species_jacobian[species][secondary_species] *
                                                   species_enthalpy[f'Y({species})'][j, i] for species in
-                                                  input_params.species) /
-                                              data['Cp'][j, i])
+                                                  input_params.species) / data['Cp'][j, i])
 
                 elif row == tmp_jacobian.shape[0] and col == tmp_jacobian.shape[1]:
                     tmp_jacobian[row, col] = (sum(temperature_jacobian[species] *
@@ -184,14 +191,17 @@ def jacobian(data, input_params, species_enthalpy, jac_method='Simple', chem_met
                                                   input_params.species) /
                                               data['Density'][j, i] / data['Cp'][j, i])
 
+                else:
+                    print('Jacobian Error: Please Examine Code')
+
         return tmp_jacobian
 
     def compressible_jacobian(gas_tmp, T, P, Y):
         # Step 1: Allocate memory for the jacobian array
         if data['Dimension'] == 1:
-            tmp_jacobian = np.zeros((len(input_params.species) + 2, len(input_params.species) + 2))
+            tmp_jacobian = np.zeros((len(input_params.species) + 2, len(input_params.species) + 2), dtype=np.float64)
         else:
-            tmp_jacobian = np.zeros((len(input_params.species) + 3, len(input_params.species) + 3))
+            tmp_jacobian = np.zeros((len(input_params.species) + 3, len(input_params.species) + 3), dtype=np.float64)
 
         # Set the gas object state
         gas_tmp.TPY = T, P, Y
@@ -199,7 +209,7 @@ def jacobian(data, input_params, species_enthalpy, jac_method='Simple', chem_met
         #
         if chem_method == 'Cantera':
             species_jacobian, temperature_jacobian = cantera_solution(gas_tmp, T, P, Y)
-        elif chem_method == 'pyJac':
+        elif chem_method == 'Pyjac':
             if "pyjacob" not in globals():
                 import pyjacob  # Only imports if not already loaded
 
@@ -306,7 +316,7 @@ def jacobian(data, input_params, species_enthalpy, jac_method='Simple', chem_met
             #
             J[j, i] = tmp_jacobian
 
-        return J
+    return J
 
 def cema_solver(data, input_params, solver_mode, chem_jac):
     ###########################################
@@ -388,9 +398,7 @@ def cema_solver(data, input_params, solver_mode, chem_jac):
 
             # Initialize and calculate the variables for the x-direction (and y-direction if applicable)
             dYdx, Jx, dJdx, dTdx, qx, dqdx = directional_components('x')
-
-            if data['Dimension'] == 2:
-                dYdy, Jy, dJdy, dTdy, qy, dqdy = directional_components('y')
+            dYdy, Jy, dJdy, dTdy, qy, dqdy = directional_components('y')
 
             # Step 2: Calculate the full spatial array space
             for j in range(0, y_pts):

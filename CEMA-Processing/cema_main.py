@@ -490,15 +490,15 @@ def main():
     #data_set = '1D-Solid-Boundary-Test-Data'
     # Step 1: Script Flags
     SOLVER_TYPE = {
-        'Laminar Flame': False,
-        'ZND Detonation': True,
+        'Laminar Flame': True,
+        'ZND Detonation': False,
         'PeleC 1D Data': False,
         'PeleC 2D Data': False,
     }
 
     ANALYSIS_MODE = {
         'CEMA Solver': 'Compressible',  # Simple or Compressible
-        'Chemical Jacobian Solver': 'Pyjac', # Cantera or Pyjac
+        'Chemical Jacobian Solver': 'Cantera', # Cantera or Pyjac
     }
 
     # Step 2: Set reactant mixture parameters
