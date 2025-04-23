@@ -13,7 +13,7 @@ yt.set_log_level(0)
 __all__ = [
     'PELE_VAR_MAP', 'add_species_vars', 'UnitConverter',
     'domain_parameters', 'data_extraction',
-    'wave_tracking', 'thermodynamic_state_extractor', 'heat_release_rate_extractor'
+    'wave_tracking', 'thermodynamic_state_extractor'
 ]
 
 
@@ -545,19 +545,5 @@ def thermodynamic_state_extractor(pre_loaded_data, wave_loc, offset):
     tmp_dict['Pressure'] = pre_loaded_data['Pressure'][probe_idx]
     tmp_dict['Density'] = pre_loaded_data['Density'][probe_idx]
     tmp_dict['Sound Speed'] = pre_loaded_data['Sound speed'][probe_idx]
-
-    return tmp_dict
-
-
-def heat_release_rate_extractor(pre_loaded_data, wave_loc, offset):
-    ###########################################
-    # Main Function
-    ###########################################
-    # Step 1: Determine the location of the wave
-    probe_idx = np.argmin(abs(pre_loaded_data['X'] - (wave_loc + offset)))
-
-    # Step 2: Return the thermodynamic state
-    tmp_dict = {}
-    tmp_dict['Heat Release Rate'] = pre_loaded_data['Heat Release Rate'][probe_idx]
 
     return tmp_dict

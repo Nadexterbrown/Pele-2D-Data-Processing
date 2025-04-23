@@ -655,9 +655,7 @@ def single_file_processing(args):
                                                                                   script_config.Flame.ThermodynamicState.Offset)
         # Heat Release Rate
         if script_config.Flame.HeatReleaseRate.Flag:
-            result_dict['Flame']['HRR'] = heat_release_rate_extractor(pre_loaded_data,
-                                                                      result_dict['Flame']['Position'],
-                                                                      script_config.Flame.ThermodynamicState.Offset)
+            result_dict['Flame']['HRR'] = pre_loaded_data['Heat Release Rate'][result_dict['Flame']['Index']]
         # Flame Thickness and Surface Length
         if script_config.Flame.FlameThickness.Flag or script_config.Flame.SurfaceLength.Flag:
             tmp_dict = flame_geometry(data_dir, output_dir, script_config)
