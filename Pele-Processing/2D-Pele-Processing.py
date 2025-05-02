@@ -809,7 +809,6 @@ def pelec_processing(args):
     ###########################################
     if rank == 0:
         result_dict = {k: v for k, v in result_dict.items() if v is not None}
-        print(result_dict, flush=True)
         # Step 2: Create an array to store the results
         result_arr = np.empty(len(result_dict), dtype=object)
         for i, (fn, vals) in enumerate(sorted(result_dict.items())):
