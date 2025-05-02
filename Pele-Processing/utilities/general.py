@@ -2,9 +2,11 @@ import os
 import re
 import yt
 import time
+import logging
 import numpy as np
 import cantera as ct
 from mpi4py import MPI
+from io import StringIO
 from datetime import datetime
 
 import matplotlib.pyplot as plt
@@ -14,10 +16,26 @@ import matplotlib.animation as animation
 # Optional imports if needed externally:
 __all__ = [
     'MyClass', 'input_params', 'initialize_parameters',
-    'ensure_long_path_prefix', 'create_log_file', 'append_to_log_file',
+    'ensure_long_path_prefix',
+    'init_rank_logging' ,'rank_log', 'flush_log',
     'load_directories', 'sort_files', 'write_output',
     'animation_frame_generation', 'generate_animation',
 ]
+
+
+#################################################################
+# MPI Global Parameters
+#################################################################
+
+# Internal MPI setup
+_comm = MPI.COMM_WORLD
+_rank = _comm.Get_rank()
+_size = _comm.Get_size()
+
+# Internal buffer and state
+_log_buffer = StringIO()
+_log_file_path = None
+
 
 #################################################################
 # Initial Thermodynamic Condition Class
@@ -85,22 +103,40 @@ def ensure_long_path_prefix(path):
     return r"\\?\\" + path
 
 
-def create_log_file(base_name="progress"):
-    now = datetime.now()
-    timestamp = now.strftime("%Y%m%d_%H%M%S")
-    filename = f"{base_name}_{timestamp}.txt"
+def init_rank_logging(logfile: str = "log.txt", overwrite: bool = False):
+    """Initialize shared log file and buffer for per-rank logging."""
+    global _log_file_path
+    _log_file_path = logfile
 
-    header = now.strftime("===== %Y-%m-%d %H:%M:%S =====")
-    with open(filename, 'w') as f:
-        f.write("Progress Log Initiated\n")
-        f.write(f"{header}\n")
-    return filename
+    # Only rank 0 clears the file if requested
+    if overwrite and _rank == 0 and os.path.exists(_log_file_path):
+        with open(_log_file_path, "w") as f:
+            pass  # Truncate file
+
+    if _rank == 0:
+        rank_log(datetime.now().strftime("===== %Y-%m-%d %H:%M:%S ====="))
+        rank_log(f"Script Initiated: Using {_size} Ranks")
+
+    _comm.Barrier()
+    rank_log(f"Rank {_rank} Successfully Initialized")
+    flush_log()
 
 
-def append_to_log_file(filename, message):
+def rank_log(msg: str):
+    """Buffer a log message with timestamp and rank."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(filename, 'a') as f:
-        f.write(f"[{timestamp}] {message}\n")
+    _log_buffer.write(f"{timestamp} [Rank {_rank}] - {msg}\n")
+
+
+def flush_log():
+    """Write buffered messages to the shared log file."""
+    if _log_file_path is None:
+        raise RuntimeError("Log file not initialized. Call init_rank_logging() first.")
+
+    with open(_log_file_path, "a") as f:
+        f.write(_log_buffer.getvalue())
+    _log_buffer.truncate(0)
+    _log_buffer.seek(0)
 
 
 #################################################################
@@ -137,7 +173,7 @@ def write_output(data_dict, output_dir):
     ###########################################
 
     UNIT_MAP = {
-        'Position': 'cm',
+        'Position': 'm',
         'Temperature': 'K',
         'Pressure': 'kg / m / s^2',
         'Density': 'kg / m^3',
@@ -147,9 +183,10 @@ def write_output(data_dict, output_dir):
         'Mach Number': '',
         'Velocity': 'm / s',
         'Gas Velocity': 'm / s',
+        'Relative Velocity': 'm / s',
         'Heat Release Rate': 'kg m^2 / s^3 / m^3',
-        'Cp': 'g m^2 / s^2 / kg / K',
-        'Cv': 'g m^2 / s^2 / kg / K',
+        'Cp': 'kg m^2 / s^2 / kg / K',
+        'Cv': 'kg m^2 / s^2 / kg / K',
     }
 
     FIELD_WIDTH = 65

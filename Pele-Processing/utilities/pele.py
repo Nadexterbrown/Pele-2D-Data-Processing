@@ -22,7 +22,7 @@ yt.enable_parallelism()
 # Optional imports if needed externally:
 __all__ = [
     'PELE_VAR_MAP', 'add_species_vars', 'UnitConverter',
-    'domain_parameters', 'data_extraction', 'data_ray_extraction',
+    'domain_parameters', 'data_ray_extraction',
     'wave_tracking', 'thermodynamic_state_extractor'
 ]
 
@@ -235,7 +235,7 @@ def cantera_str_acquisition(raw_data, grid, idx, gas, missing_str):
 
     return missing_data
 
-def data_ray_extraction(dataset, extract_location, comm, logger, direction='x'):
+def data_ray_extraction(dataset, extract_location, direction='x'):
 
     def ray_processing():
         # Step 1: Extract the ray through the domain using yt
@@ -246,11 +246,6 @@ def data_ray_extraction(dataset, extract_location, comm, logger, direction='x'):
 
         # Step 2: Sort the ray based on position
         ray_sort = np.argsort(dr["boxlib", 'x'])
-
-        if rank == 0:
-            filename = f"{dataset.basename}.png"
-            animation_frame_generation(dr["boxlib", 'x'][ray_sort], dr["boxlib", 'Temp'][ray_sort], 'Temp',
-                                       filename)
 
         # Step 3:
         temp_data = {var_info["Name"]: [] for var_info in PELE_VAR_MAP.values()}
@@ -280,10 +275,6 @@ def data_ray_extraction(dataset, extract_location, comm, logger, direction='x'):
 
     global input_params
 
-    # Step 1: Collect current MPI rank and size
-    rank = comm.Get_rank()
-    size = comm.Get_size()
-
     # Step 2: Initialize the missing variables
     missing_str = {
         key: raw_var["Name"]
@@ -299,13 +290,6 @@ def data_ray_extraction(dataset, extract_location, comm, logger, direction='x'):
 
     # Step 4:
     tmp_data = ray_processing()
-
-    # Gather the processed data on rank 0
-    comm.Barrier()
-
-    # Step 6: Now make the *rest* of the function conditional on being root
-    if not rank == 0:
-        return None
 
     # Step 9: Merge the data from all levels into a single dataset
     merged_data = {}
@@ -637,7 +621,11 @@ def wave_tracking(wave_type, **kwargs):
                 tmp_arr[0] = np.argwhere(data_arr[0, :] >= flame_temp)[-1]
                 return tmp_arr[0]
         elif wave_type == 'Shock':
-            return np.argwhere(data_arr >= 1.01 * data_arr[-1])[-1][0]
+            try:
+                tmp_idx = np.argwhere(data_arr >= 1.01 * data_arr[-1])[-1][0]
+            except:
+                tmp_idx = 0
+            return tmp_idx
         else:
             raise ValueError('Invalid Wave Type! Must be Flame, Maximum Pressure, or Leading Shock')
 
@@ -647,10 +635,10 @@ def wave_tracking(wave_type, **kwargs):
     # Step 1: Parse input data type
 
     pre_loaded_data = kwargs.get('pre_loaded_data', None)
-    data_dir_path = kwargs.get('data_dir_path', None)
+    dataset = kwargs.get('dataset', None)
 
-    if pre_loaded_data is None and data_dir_path is None:
-        raise ValueError('Either pre_loaded_data or data_dir_path must be provided.')
+    if pre_loaded_data is None and dataset is None:
+        raise ValueError('Either pre_loaded_data or dataset must be provided.')
 
     # Step 2: Extract flame temperature from kwargs or use default
     flame_temp = kwargs.get('flame_temp', 2000)
@@ -666,12 +654,12 @@ def wave_tracking(wave_type, **kwargs):
         else:
             data_arr = pre_loaded_data['Pressure']
 
-    elif data_dir_path is not None:
+    elif dataset is not None:
         y_loc = kwargs.get('y_loc', None)
         if y_loc is None:
             raise ValueError('y_loc must be provided when raw_data is used.')
 
-        pre_loaded_data = data_extraction(data_dir_path, y_loc)
+        pre_loaded_data = data_ray_extraction(dataset, y_loc)
 
         x_arr = pre_loaded_data['X']
         # Use the preloaded data directly
