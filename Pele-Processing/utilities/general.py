@@ -277,11 +277,12 @@ def write_output(data_dict, output_dir):
 #################################################################
 # Animation and Visualization
 #################################################################
-def animation_frame_generation(x, y, labels, output_dir, plot_center=None, window_size=None):
+def animation_frame_generation(x, y, labels, output_dir, split_axis=True, plot_center=None, window_size=None):
     """
-       x_list: list of arrays for x-axis data
-       y_list: list of arrays for y-axis data
+       x: array for x-axis data
+       y: list of arrays for y-axis data
        labels: optional list of labels for each y series
+       split_axis: if True, plots each y on a separate y-axis; if False, plots all on the same axis
     """
 
     ###########################################
@@ -301,38 +302,43 @@ def animation_frame_generation(x, y, labels, output_dir, plot_center=None, windo
         fig, ax = plt.subplots()
         axes = [ax]
 
-        # First axis
-        x0, y0 = plot_axis(x, y[0])
-        ax.scatter(x0, y0, label=labels[0], color=f"C0", s=10)  # <-- scatter instead of plot
-        ax.set_ylabel(labels[0])
-        ax.set_xlabel("x")
-        ax.tick_params(axis='y', labelcolor=f"C0")
+        if split_axis:
+            # First axis
+            x0, y0 = plot_axis(x, y[0])
+            ax.plot(x0, y0, label=labels[0], color=f"C0")
+            ax.set_ylabel(labels[0])
+            ax.set_xlabel("x")
+            ax.tick_params(axis='y', labelcolor=f"C0")
 
-        # Additional y-axes, spaced to avoid overlap
-        for i in range(1, len(y)):
-            ax_new = ax.twinx()
-            axes.append(ax_new)
+            # Additional y-axes, spaced to avoid overlap
+            for i in range(1, len(y)):
+                ax_new = ax.twinx()
+                axes.append(ax_new)
 
-            # Shift spine to the right
-            offset = 0.1 * (i - 1)
-            ax_new.spines["right"].set_position(("axes", 1 + offset))
-            ax_new.set_frame_on(True)
-            ax_new.patch.set_visible(False)
+                offset = 0.1 * (i - 1)
+                ax_new.spines["right"].set_position(("axes", 1 + offset))
+                ax_new.set_frame_on(True)
+                ax_new.patch.set_visible(False)
 
-            # Plot data
-            _, yi = plot_axis(x, y[i])
-            ax_new.scatter(x0, yi, label=labels[i], color=f"C{i}", s=10)  # <-- scatter instead of plot
-            ax_new.set_ylabel(labels[i])
-            ax_new.tick_params(axis='y', labelcolor=f"C{i}")
+                x_i, y_i = plot_axis(x, y[i])
+                ax_new.plot(x_i, y_i, label=labels[i], color=f"C{i}")
+                ax_new.set_ylabel(labels[i])
+                ax_new.tick_params(axis='y', labelcolor=f"C{i}")
+        else:
+            ax.set_xlabel("x")
+            for i, y_i in enumerate(y):
+                x_i, y_i = plot_axis(x, y_i)
+                ax.plot(x_i, y_i, label=labels[i], color=f"C{i}")
+            ax.set_ylabel("Value")
+            ax.legend()
 
         fig.tight_layout()
-        fig.legend(loc="upper right")
         return fig
 
     ###########################################
     # Main Function
     ###########################################
-    if not isinstance(y, list):
+    if not isinstance(y, (list, tuple)):
         y = [y]
     if labels is None or isinstance(labels, str):
         labels = [labels]

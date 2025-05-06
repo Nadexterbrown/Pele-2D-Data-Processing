@@ -182,18 +182,18 @@ def domain_parameters(directory_path, desired_y_location=None):
             grid_arr)
 
 
-def cantera_str_acquisition(raw_data, grid, idx, gas, missing_str):
+def cantera_str_acquisition(dr, ray_sort, field_list, idx, gas, missing_str):
     ##########################################
     # Main Function
     ###########################################
     # Step 1: Extract the thermodynamic state and composition
-    T = grid["boxlib", "Temp"].to_value().flatten()[idx]
-    P = grid["boxlib", "pressure"].to_value().flatten()[idx] / 10
+    T = dr["boxlib", "Temp"][ray_sort].to_value().flatten()[idx]
+    P = dr["boxlib", "pressure"][ray_sort].to_value().flatten()[idx] / 10
 
     species_list = [var for var in input_params.species]
     Y = {
-        species: grid["boxlib", f"Y({species})"].to_value().flatten()[idx]  # Construct key dynamically
-        for species in species_list if f"Y({species})" in np.array(raw_data.field_list)[:, 1]  # Ensure key exists
+        species: dr["boxlib", f"Y({species})"][ray_sort].to_value().flatten()[idx]  # Construct key dynamically
+        for species in species_list if f"Y({species})" in np.array(field_list)[:, 1]  # Ensure key exists
     }
 
     # Step 2: Modify the gas object
@@ -211,7 +211,7 @@ def cantera_str_acquisition(raw_data, grid, idx, gas, missing_str):
         if key == 'Sound speed':
             missing_data[key] = gas.sound_speed
         if key == 'Mach Number':
-            missing_data[key] = grid["boxlib", "x_velocity"].to_value().flatten()[idx] / gas.sound_speed
+            missing_data[key] = dr["boxlib", "x_velocity"][ray_sort].to_value().flatten()[idx] / gas.sound_speed
         if key == 'Heat Release Rate':
             missing_data[key] = gas.heat_release_rate
         if key == 'Cp':
@@ -235,7 +235,7 @@ def cantera_str_acquisition(raw_data, grid, idx, gas, missing_str):
 
     return missing_data
 
-def data_ray_extraction(dataset, extract_location, direction='x'):
+def data_ray_extraction(dataset, extract_location, direction='x', flux_calc=False, transport_species=None):
 
     def ray_processing():
         # Step 1: Extract the ray through the domain using yt
@@ -255,7 +255,7 @@ def data_ray_extraction(dataset, extract_location, direction='x'):
 
             if var in missing_str:
                 for i in range(0, len(dr["boxlib", 'x'][ray_sort])):
-                    temp_var = cantera_str_acquisition(dr, i, gas_missing, missing_str)
+                    temp_var = cantera_str_acquisition(dr, ray_sort, dataset.field_list, i, gas_missing, missing_str)
                     temp_data[var_name].append(temp_var[var])
             else:
                 try:
@@ -268,6 +268,67 @@ def data_ray_extraction(dataset, extract_location, direction='x'):
 
         # Return result
         return temp_data
+
+
+    def flux_calculation(data, field_list):
+
+        # Step 1:
+        gas = ct.Solution(input_params.mech)
+
+        # Step 3: Calculate the mole fraction spatial gradient
+        tmp_mole_frac_grad = {}
+        for species in input_params.species:
+            tmp_mole_frac_grad[f'X({species})'] = []
+
+        for species in input_params.species:
+            tmp_mole_frac_grad[f'X({species})'].append(np.gradient(data[f'X({species})'], data['X']))
+
+        # Step 2:
+        flux_dict = {'Mass Flux': [],
+                     'Diffusion Flux': [],
+                     'Momentum Flux': [],
+                     'Energy Flux': []}
+
+        # Step 3:
+        for idx in range(len(data['X'])):
+            # Step 1:
+            T = data['Temperature'][idx]
+            P = data['Pressure'][idx]
+
+            species_list = [var for var in input_params.species]
+            Y = {
+                species: data[f"Y({species})"][idx]  # Construct key dynamically
+                for species in species_list if f"Y({species})" in np.array(field_list)[:, 1]  # Ensure key exists
+            }
+
+            # Step 2: Modify the gas object
+            gas.TPY = T, P, Y
+
+            # Step 1: Save the conservative variables from the conservation equations
+            # Mass Flux
+            flux_dict['Mass Flux'].append(gas.density_mass * data['X Velocity'][idx])
+
+            # Species Flux
+            flux_dict[f'{transport_species} Flux'] = gas.density_mass * gas.Y[gas.species_index(transport_species)]
+
+            # Diffusion Flux (Mixture Averaged)
+            j_k_star = np.zeros(len(input_params.species))
+            for k, species in enumerate(input_params.species):
+                species_idx = gas.species_index(species)
+                j_k_star[k] = - gas.density_mass * (gas.molecular_weights[species_idx] / gas.mean_molecular_weight) * \
+                              data[f'D({transport_species})'][idx] * tmp_mole_frac_grad[f'X({species})'][idx]
+
+            flux_dict[f'{transport_species} Diffusion Flux'].append(
+                j_k_star[input_params.species.index(transport_species)] - data[f'Y({transport_species})'] * np.sum(j_k_star))
+
+            # Momentum FLux
+            flux_dict['Momentum Flux'].append(gas.density_mass * (data['X Velocity'][idx] ** 2))
+
+            # Energy Flux
+            flux_dict['Energy Flux'].append(gas.density_mass * gas.int_energy_mass)
+
+        return
+
 
     ###########################################
     # Main Function
@@ -309,6 +370,11 @@ def data_ray_extraction(dataset, extract_location, direction='x'):
             merged_data[var] = np.array(converted_y)
         else:
             merged_data[var] = merged_y
+
+    # Step 5:
+    if flux_calc:
+        flux_data = flux_calculation(merged_data)
+        merged_data.update(flux_data)  # Add all computed fluxes to merged_data
 
     return merged_data
 

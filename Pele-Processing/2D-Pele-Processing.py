@@ -628,7 +628,7 @@ def single_file_processing(dataset, args):
                 result_dict['Flame']['Flame Thickness'] = tmp_dict['Flame Thickness']
             # Surface Length
             if script_config.Flame.SurfaceLength.Flag:
-                result_dict['Flame']['Surface Length'] = tmp_dict['Flame Thickness']
+                result_dict['Flame']['Surface Length'] = tmp_dict['Surface Length']
 
         # Burned Gas Processing
         if script_config.Flame.Position.Flag and (
