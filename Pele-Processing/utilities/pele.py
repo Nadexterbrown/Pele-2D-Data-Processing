@@ -49,10 +49,10 @@ PELE_VAR_MAP = {
 
 
 def add_species_vars(species_list):
-    for species in input_params.species:
+    for species in species_list:
         PELE_VAR_MAP[f'Y({species})'] = {'Name': f'Y({species})', 'Units': ''}
         PELE_VAR_MAP[f'D({species})'] = {'Name': f'D({species})', 'Units': ''}
-        PELE_VAR_MAP[f'W({species})'] = {'Name': f'rho_omega_{species}', 'Units': 'g / cm^3'}
+        PELE_VAR_MAP[f'W({species})'] = {'Name': f'rho_omega_{species}', 'Units': 'g / cm^3 / s'}
 
 
 #################################################################
@@ -270,66 +270,6 @@ def data_ray_extraction(dataset, extract_location, direction='x', flux_calc=Fals
         return temp_data
 
 
-    def flux_calculation(data, field_list):
-
-        # Step 1:
-        gas = ct.Solution(input_params.mech)
-
-        # Step 3: Calculate the mole fraction spatial gradient
-        tmp_mole_frac_grad = {}
-        for species in input_params.species:
-            tmp_mole_frac_grad[f'X({species})'] = []
-
-        for species in input_params.species:
-            tmp_mole_frac_grad[f'X({species})'].append(np.gradient(data[f'X({species})'], data['X']))
-
-        # Step 2:
-        flux_dict = {'Mass Flux': [],
-                     'Diffusion Flux': [],
-                     'Momentum Flux': [],
-                     'Energy Flux': []}
-
-        # Step 3:
-        for idx in range(len(data['X'])):
-            # Step 1:
-            T = data['Temperature'][idx]
-            P = data['Pressure'][idx]
-
-            species_list = [var for var in input_params.species]
-            Y = {
-                species: data[f"Y({species})"][idx]  # Construct key dynamically
-                for species in species_list if f"Y({species})" in np.array(field_list)[:, 1]  # Ensure key exists
-            }
-
-            # Step 2: Modify the gas object
-            gas.TPY = T, P, Y
-
-            # Step 1: Save the conservative variables from the conservation equations
-            # Mass Flux
-            flux_dict['Mass Flux'].append(gas.density_mass * data['X Velocity'][idx])
-
-            # Species Flux
-            flux_dict[f'{transport_species} Flux'] = gas.density_mass * gas.Y[gas.species_index(transport_species)]
-
-            # Diffusion Flux (Mixture Averaged)
-            j_k_star = np.zeros(len(input_params.species))
-            for k, species in enumerate(input_params.species):
-                species_idx = gas.species_index(species)
-                j_k_star[k] = - gas.density_mass * (gas.molecular_weights[species_idx] / gas.mean_molecular_weight) * \
-                              data[f'D({transport_species})'][idx] * tmp_mole_frac_grad[f'X({species})'][idx]
-
-            flux_dict[f'{transport_species} Diffusion Flux'].append(
-                j_k_star[input_params.species.index(transport_species)] - data[f'Y({transport_species})'] * np.sum(j_k_star))
-
-            # Momentum FLux
-            flux_dict['Momentum Flux'].append(gas.density_mass * (data['X Velocity'][idx] ** 2))
-
-            # Energy Flux
-            flux_dict['Energy Flux'].append(gas.density_mass * gas.int_energy_mass)
-
-        return
-
-
     ###########################################
     # Main Function
     ###########################################
@@ -363,6 +303,11 @@ def data_ray_extraction(dataset, extract_location, direction='x', flux_calc=Fals
         merged_x = np.array(tmp_data['x'])
         merged_y = np.array(tmp_data[var_name])
 
+        # Skip unit conversion if variable is in missing_str
+        if var in missing_str:
+            merged_data[var] = merged_y
+            continue
+
         # Now apply the unit conversion for each variable in the merged data
         unit_expr = var_info.get('Units', '')
         if unit_expr:
@@ -370,11 +315,6 @@ def data_ray_extraction(dataset, extract_location, direction='x', flux_calc=Fals
             merged_data[var] = np.array(converted_y)
         else:
             merged_data[var] = merged_y
-
-    # Step 5:
-    if flux_calc:
-        flux_data = flux_calculation(merged_data)
-        merged_data.update(flux_data)  # Add all computed fluxes to merged_data
 
     return merged_data
 
