@@ -563,9 +563,6 @@ def single_file_processing(dataset, args):
         pltFile_name = dataset.basename
         extract_location = script_config.DataExtraction.Location + (dataset.index.get_smallest_dx().to_value() / 2)
 
-        if dataset.basename == 'plt332331':
-            print(test)
-
         ###########################################
         # MPI Parallel Processing: Shared loading
         ###########################################
@@ -809,13 +806,12 @@ def pelec_processing(args):
     ###########################################
     if rank == 0:
         result_dict = {k: v for k, v in result_dict.items() if v is not None}
+
         # Step 2: Create an array to store the results
-        result_arr = np.empty(len(result_dict), dtype=object)
-        for i, (fn, vals) in enumerate(sorted(result_dict.items())):
-            # Find the index of the current key in data_dirs
-            if fn in pltname_list:
-                index = pltname_list.index(fn)
-                result_arr[index] = vals  # Store values in result_arr at the corresponding index
+        # Build a list of values from result_dict, ordered by their key's position in pltname_list
+        result_arr = [result_dict[fn] for fn in pltname_list if fn in result_dict]
+        # Convert to NumPy array if needed
+        result_arr = np.array(result_arr, dtype=object)
 
         rank_log(f"Global Result Variable Extraction...")
 
