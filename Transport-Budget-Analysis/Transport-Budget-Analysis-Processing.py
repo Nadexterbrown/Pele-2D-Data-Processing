@@ -5,16 +5,13 @@ import time
 import numpy as np
 import cantera as ct
 from mpi4py import MPI
-from ast import literal_eval
+from typing import Optional
 from datetime import datetime
 from collections import defaultdict
-from itertools import groupby, repeat
 from scipy.interpolate import CubicSpline
 from dataclasses import dataclass, field, fields
 from yt.utilities.parallel_tools.parallel_analysis_interface import parallel_objects, communication_system
 
-
-import matplotlib.pyplot as plt
 
 from sdtoolbox.znd import zndsolve
 from sdtoolbox.utilities import CJspeed_plot
@@ -35,9 +32,40 @@ rank = comm.Get_rank()
 size = comm.Get_size()
 print(f"Rank {rank} of {size} is running.", flush=True)
 
+########################################################################################################################
+# Script Configuration Classes
+########################################################################################################################
+
+@dataclass
+class DataExtractionConfig:
+    DataType: Optional[str] = None
+    Flag: Optional[bool] = False
+    Stride: Optional[int] = 1
+    _DataPath: Optional[str] = field(default=None, init=False, repr=False)
+
+    @property
+    def DataPath(self) -> Optional[str]:
+        return self._DataPath
+
+    @DataPath.setter
+    def DataPath(self, path: Optional[str]):
+        if path is None:
+            self._DataPath = None
+        elif os.path.isabs(path):
+            self._DataPath = path
+        else:
+            base_path = os.path.dirname(os.path.realpath(__file__))
+            self._DataPath = os.path.normpath(os.path.join(base_path, path))
+
+@dataclass
+class ScriptConfig:
+    FreeFlame: DataExtractionConfig = field(default_factory=lambda: DataExtractionConfig(DataType='Cantera Flame'))
+    Detonation: DataExtractionConfig = field(default_factory=lambda: DataExtractionConfig(DataType='SDToolbox Detonation'))
+    SLTORC: DataExtractionConfig = field(default_factory=lambda: DataExtractionConfig(DataType='SLTORC'))
+    Pele: DataExtractionConfig = field(default_factory=lambda: DataExtractionConfig(DataType='Pele'))
 
 ########################################################################################################################
-# Flame/Detonation Simulation
+# Cantera Flame/Detonation Simulation
 ########################################################################################################################
 
 def cantera_flame(transport_species):
@@ -290,71 +318,84 @@ def sltorc_data_loading(dir_path, transport_species, stride=1):
 
 
 ########################################################################################################################
-# 2D Pele Data Extraction
+# Data Extraction Parent Function
 ########################################################################################################################
 
+def data_extraction(transport_species, script_config):
 
-########################################################################################################################
-# Math Helper Functions
-########################################################################################################################
+    # Step 1: Required variables
+    base_vars = ['X', 'Temperature', 'Pressure', 'X Velocity', f'W({transport_species})']
+    species_vars = [f'Y({s})' for s in input_params.species]
+    required_vars = base_vars + species_vars
 
-def grid_regularization(data):
-    """
-        Determine the smallest grid spacing across all spatial grids from multiple ranks.
+    # Step 2: Determine which configuration is active
+    data_dict = {}
 
-        Parameters:
-        -----------
-        data : list of lists
-            A list of lists, where each list contains a 1D array representing spatial grids.
+    if script_config.FreeFlame.Flag and rank == 0:
+        # Step 2.1: Extract and filter data
+        tmp_data = cantera_flame(transport_species)
+        tmp_data_dict = {var: tmp_data[var] for var in required_vars if var in tmp_data}
+        # Step 2.2: Populate time-labeled entries
+        for t in range(4):
+            data_dict[t] = {
+                'Time': float(t),
+                'Data': tmp_data_dict
+            }
 
-        Returns:
-        --------
-        dx_min : float
-            The smallest spacing found across all x arrays.
-        x_uniform : 1D array
-            A common uniform grid spanning the full domain using dx_min.
-    """
+    elif script_config.Detonation.Flag and rank == 0:
+        # W.I.P.
+        print('Detonation case: Work in Progress')
 
-    dx_min = []
-    x_min = []
-    x_max = []
+    elif script_config.SLTORC.Flag:
+        if rank == 0:
+            rank_log(f"Beginning SLTORC Data Extraction")
+        # Step 2.1: Extract and filter SLTORC data
+        tmp_data = sltorc_data_loading(
+            script_config.SLTORC.DataPath,
+            transport_species,
+            stride=script_config.SLTORC.Stride)
+        data_dict = {var: tmp_data[var] for var in required_vars if var in tmp_data}
 
-    # Iterate over all lists of spatial grids
-    for x_arr in data:
-        x_min.append(np.min(x_arr))
-        x_max.append(np.max(x_arr))
-        dx_min.append(np.min(np.diff(x_arr)))
+    elif script_config.Pele.Flag:
+        if rank == 0:
+            rank_log(f"Beginning Pele Data Extraction")
+        # Step 2.1: Determine file paths for each time step
+        paths = load_directories(script_config.Pele.DataPath)
+        sorted_paths = sort_files(paths)[::script_config.Pele.Stride]
+        pltname_list = [os.path.basename(p) for p in sorted_paths]
+        # Step 3.1: Extract data
+        for sto, dir in yt.parallel_objects(sorted_paths, -1, storage=data_dict):
+            # Step 4.1: Load the data
+            ds = yt.load(dir)
+            # Step 4.2: Extract and filter Pele data
+            tmp_data = data_ray_extraction(ds, 0.005 / 100)
+            tmp_data_dict = {var: tmp_data[var] for var in required_vars if var in tmp_data}
+            rank_log(f"{ds.basename} Processed")
+            # Step 4.4: Export Data
+            sto.result_id = pltname_list.index(ds.basename)
+            sto.result = {
+                'Time': ds.current_time.to_value(),
+                'Data': tmp_data_dict
+            }
+    else:
+        if rank == 0:
+            print('No data extraction flag was set in script_config.')
 
-    # Find the overall minimum dx and create a uniform grid using the minimum dx
-    min_dx = np.min(dx_min)
-    uniform_grid_start = np.min(x_min)
-    uniform_grid_end = np.max(x_max)
+    # If the case was serial-only, bcast the data_dict from rank 0 to everyone
+    if not script_config.Pele.Flag or script_config.SLTORC.Flag:
+        data_dict = None
+        data_dict = comm.bcast(data_dict, root=0)
 
-    # Create the uniform grid with the smallest spacing
-    x_uniform = np.arange(uniform_grid_start, uniform_grid_end, min_dx)
-
-    return x_uniform
-
-
-def data_interpolation(x, y, x_interp):
-    # Create cubic spline with extrapolation disabled
-    spline = CubicSpline(x, y, extrapolate=False)
-
-    # Interpolate values (in-range get interpolated, out-of-range become nan)
-    y_interp = spline(x_interp)
-
-    # Manually clamp out-of-bounds: fill with first/last y value
-    y_interp = np.where(x_interp < x[0], y[0], y_interp)
-    y_interp = np.where(x_interp > x[-1], y[-1], y_interp)
-
-    return y_interp
+    if rank == 0:
+        rank_log(f"Data Extraction Complete")
+    return data_dict
 
 
 ########################################################################################################################
 # Transport Budget Analysis (CDR)
 ########################################################################################################################
 
-def transport_budget_analysis(data, transport_species, data_type, output_path):
+def transport_budget_analysis(data, transport_species, output_path, script_config):
 
     ###############################################################################
     # Internal Functions
@@ -370,53 +411,31 @@ def transport_budget_analysis(data, transport_species, data_type, output_path):
             # Define the local cantera gas object
             gas_tmp = ct.Solution(input_params.mech)
 
-            try:
-                T_tmp = data_interpolation(local_data[i]['Data']['X'], local_data[i]['Data']['Temperature'], x_uniform)
-                P_tmp = data_interpolation(local_data[i]['Data']['X'], local_data[i]['Data']['Pressure'], x_uniform)
-                Y_tmp = {f'Y({species})': data_interpolation(local_data[i]['Data']['X'], local_data[i]['Data'][f'Y({species})'], x_uniform)
-                         for species in input_params.species}
-                V_tmp = data_interpolation(local_data[i]['Data']['X'], local_data[i]['Data']['X Velocity'], x_uniform)
+            T_tmp = local_data[i]['Data']['Temperature']
+            P_tmp = local_data[i]['Data']['Pressure']
+            Y_tmp = {f'Y({species})': local_data[i]['Data'][f'Y({species})']
+                     for species in input_params.species}
+            V_tmp = local_data[i]['Data']['X Velocity']
 
-                X_tmp = {}
+            X_tmp = {}
+            for species in input_params.species:
+                X_tmp[f'X({species})'] = []
+
+            for idx in range(len(local_data[i]['Data']['X'])):
+                Y_vec =  {f'{species}': Y_tmp[f'Y({species})'][idx] for species in input_params.species}
+
+                gas_tmp.TPY = T_tmp[idx], P_tmp[idx], Y_vec
                 for species in input_params.species:
-                    X_tmp[f'X({species})'] = []
-
-                for idx in range(len(x_uniform)):
-                    Y_vec =  {f'{species}': Y_tmp[f'Y({species})'][idx] for species in input_params.species}
-
-                    gas_tmp.TPY = T_tmp[idx], P_tmp[idx], Y_vec
-                    for species in input_params.species:
-                        X_tmp[f'X({species})'].append(gas_tmp.X[gas_tmp.species_index(species)])
-
-            except Exception:
-                T_tmp = data_interpolation(local_data[i]['Data']['X'], local_data[i]['Data']['Temperature'], x_uniform)
-                D_tmp = data_interpolation(local_data[i]['Data']['X'], local_data[i]['Data']['Density'], x_uniform)
-                Y_tmp = {f'Y({species})': data_interpolation(local_data[i]['Data']['X'], local_data[i]['Data'][f'Y({species})'], x_uniform)
-                         for species in input_params.species}
-                V_tmp = data_interpolation(local_data[i]['Data']['X'], local_data[i]['Data']['X Velocity'],
-                                           x_uniform)
-
-                P_tmp = []
-                X_tmp = {}
-                for species in input_params.species:
-                    X_tmp[f'X({species})'] = []
-
-                for idx in range(len(x_uniform)):
-                    Y_vec =  {f'{species}': Y_tmp[f'Y({species})'][idx] for species in input_params.species}
-
-                    gas_tmp.TDY = T_tmp[idx], D_tmp[idx], Y_vec
-                    P_tmp.append(gas_tmp.P)
-                    for species in input_params.species:
-                        X_tmp[f'X({species})'].append(gas_tmp.X[gas_tmp.species_index(species)])
+                    X_tmp[f'X({species})'].append(gas_tmp.X[gas_tmp.species_index(species)])
 
             # Mole Fraction Gradient
             tmp_mole_frac_grad = {f'X({species})': [] for species in input_params.species}
             for k, species in enumerate(input_params.species):
-                tmp_mole_frac_grad[f'X({species})'] = np.gradient(X_tmp[f'X({species})'], x_uniform)
+                tmp_mole_frac_grad[f'X({species})'] = np.gradient(X_tmp[f'X({species})'], local_data[i]['Data']['X'])
 
             # Flux Calculation
             tmp_mass_flux, tmp_species_flux, tmp_diffusion_flux, tmp_momentum_flux, tmp_energy_flux = [], [], [], [], []
-            for idx in range(len(x_uniform)):
+            for idx in range(len(local_data[i]['Data']['X'])):
                 # Step gas object
                 gas_tmp.TPY = T_tmp[idx], P_tmp[idx], {species: Y_tmp[f"Y({species})"][idx] for species in input_params.species}
                 transport_species_cantera_idx = gas_tmp.species_index(transport_species)
@@ -454,56 +473,215 @@ def transport_budget_analysis(data, transport_species, data_type, output_path):
 
 
     def unsteady_term():
-        # Step 2: Determine the maximum number of time steps in a single rank
+
+        ###############################################################################
+        # Internal Functions
+        ###############################################################################
+
+        def data_interpolation(x, y, x_interp):
+            # Create cubic spline with extrapolation disabled
+            spline = CubicSpline(x, y, extrapolate=False)
+
+            # Interpolate values (in-range get interpolated, out-of-range become nan)
+            y_interp = spline(x_interp)
+
+            # Manually clamp out-of-bounds: fill with first/last y value
+            y_interp = np.where(x_interp < x[0], y[0], y_interp)
+            y_interp = np.where(x_interp > x[-1], y[-1], y_interp)
+
+            return y_interp
+
+
+        def pele_griding(time_arr, pos_arr, flux_arr, idx):
+
+            #####################################
+            # Internal Functions
+            #####################################
+
+            def find_refined_boundaries(grid, dx_level0=None, spike_threshold=1e-12):
+                # First derivative (spacing between grid points)
+                dx = np.gradient(grid)
+                # Second derivative (change in spacing — detects refinement interfaces)
+                ddx = np.gradient(dx)
+                # Identify where second derivative spikes
+                spike_indices = np.where(np.abs(ddx) > spike_threshold)[0]
+                if spike_indices.size == 0:
+                    return None, None
+                # Define the boundaries
+                left_idx = spike_indices[0]
+                right_idx = spike_indices[-1]
+                left_boundary = grid[left_idx]
+                right_boundary = grid[right_idx] if right_idx < len(grid) else grid[-1]
+                return left_boundary, right_boundary
+
+
+            #####################################
+            # Main Function
+            #####################################
+
+            tmp_grids = {0: {'Grid': pos_arr[0],
+                             'dx': np.diff(pos_arr[0])},
+                         1: {'Grid': pos_arr[1],
+                             'dx': np.diff(pos_arr[1])},
+                         2: {'Grid': pos_arr[2],
+                             'dx': np.diff(pos_arr[2])}}
+
+            boundaries = {}
+            for key in tmp_grids:
+                left, right = find_refined_boundaries(tmp_grids[key]['Grid'], dx_level0=np.max(tmp_grids[1]['dx']))
+                boundaries[key] = {'left': left, 'right': right}
+
+            # Determine global min/max boundaries
+            left_bound = np.min([g['Grid'][0] for g in tmp_grids.values()])
+            right_bound = np.max([g['Grid'][-1] for g in tmp_grids.values()])
+            refined_left = np.min([b['left'] for b in boundaries.values() if b['left'] is not None])
+            refined_right = np.max([b['right'] for b in boundaries.values() if b['right'] is not None])
+
+            # Build the grid in three regions
+            grid_left = np.arange(left_bound, refined_left, np.max(tmp_grids[1]['dx']))
+            grid_mid = np.arange(refined_left, refined_right, np.min(tmp_grids[1]['dx']))
+            grid_right = np.arange(refined_right, right_bound + np.max(tmp_grids[1]['dx']), np.max(tmp_grids[1]['dx']))
+
+            # Remove duplicates at junctions
+            if grid_left.size > 0 and grid_mid.size > 0 and np.isclose(grid_left[-1], grid_mid[0]):
+                grid_mid = grid_mid[1:]
+            if grid_mid.size > 0 and grid_right.size > 0 and np.isclose(grid_mid[-1], grid_right[0]):
+                grid_right = grid_right[1:]
+
+            hybrid_grid = np.concatenate([grid_left, grid_mid, grid_right])
+
+            # Interpolate the flux data onto the uniform grid for each time step
+            tmp_flux_data = np.array([
+                data_interpolation(pos_arr[0], flux_arr[0], hybrid_grid),
+                data_interpolation(pos_arr[1], flux_arr[1], hybrid_grid),
+                data_interpolation(pos_arr[2], flux_arr[2], hybrid_grid)
+            ])  # Shape: (3, N)
+
+            # Compute time derivative
+            dfdt = np.gradient(tmp_flux_data, time_arr, axis=0)[idx]
+
+            return data_interpolation(hybrid_grid, dfdt, data[i]['Data']['X'])
+
+
+        def general_griding(time_arr, pos_arr, flux_arr, idx):
+
+            #####################################
+            # Internal Functions
+            #####################################
+
+            def grid_regularization(data):
+                """
+                    Determine the smallest grid spacing across all spatial grids from multiple ranks.
+
+                    Parameters:
+                    -----------
+                    data : list of lists
+                        A list of lists, where each list contains a 1D array representing spatial grids.
+
+                    Returns:
+                    --------
+                    dx_min : float
+                        The smallest spacing found across all x arrays.
+                    x_uniform : 1D array
+                        A common uniform grid spanning the full domain using dx_min.
+                """
+
+                dx_min = []
+                x_min = []
+                x_max = []
+
+                # Iterate over all lists of spatial grids
+                for x_arr in data:
+                    x_min.append(np.min(x_arr))
+                    x_max.append(np.max(x_arr))
+                    dx_min.append(np.min(np.diff(x_arr)))
+
+                # Find the overall minimum dx and create a uniform grid using the minimum dx
+                min_dx = np.min(dx_min)
+                uniform_grid_start = np.min(x_min)
+                uniform_grid_end = np.max(x_max)
+
+                # Create the uniform grid with the smallest spacing
+                x_uniform = np.arange(uniform_grid_start, uniform_grid_end, min_dx)
+
+                return x_uniform
+
+
+            #####################################
+            # Main Function
+            #####################################
+
+            # Create the uniform grid for the current time (i)
+            x_uniform = grid_regularization(pos_arr)
+
+            # Interpolate the flux data onto the uniform grid for each time step
+            tmp_flux_data = np.array([
+                data_interpolation(pos_arr[0], flux_arr[0], x_uniform),
+                data_interpolation(pos_arr[1], flux_arr[1], x_uniform),
+                data_interpolation(pos_arr[2], flux_arr[2], x_uniform)
+            ])  # Shape: (3, N)
+
+            # Compute time derivative
+            dfdt = np.gradient(tmp_flux_data, time_arr, axis=0)[idx]
+
+            return data_interpolation(x_uniform, dfdt, data[i]['Data']['X'])
+
+
+        ###############################################################################
+        # Main Function
+        ###############################################################################
+
         tmp_results = {}
         for sto, i in parallel_objects(data.keys(), njobs=size, storage=tmp_results):
-            sto.result_id = int(i)
+            # Step 1: Extract the adjacent time step grids
+            if i > 0 and i < len(data) - 1:
+                tmp_time = [data[j]['Time'] for j in [i - 1, i, i + 1]]
+                tmp_pos = [data[j]['Data']['X'] for j in [i - 1, i, i + 1]]
+                tmp_flux = [flux_data[j]['Species Flux'] for j in [i - 1, i, i + 1]]
+                tmp_idx = 1
+
+            elif i == 0:
+                tmp_time = [data[j]['Time'] for j in [i, i + 1, i + 2]]
+                tmp_pos = [data[j]['Data']['X'] for j in [i, i + 1, i + 2]]
+                tmp_flux = [flux_data[j]['Species Flux'] for j in [i, i + 1, i + 2]]
+                tmp_idx = 0
+
+            elif i == len(data) - 1:
+                tmp_time = [data[j]['Time'] for j in [i - 2, i - 1, i]]
+                tmp_pos = [data[j]['Data']['X'] for j in [i - 2, i - 1, i]]
+                tmp_flux = [flux_data[j]['Species Flux'] for j in [i - 2, i - 1, i]]
+                tmp_idx = 2
+
+            else:
+                print('Error')
+
+            if data_type == 'Pele':
+                dfdt = pele_griding(tmp_time, tmp_pos, tmp_flux, tmp_idx)
+            else:
+                dfdt = general_griding(tmp_time, tmp_pos, tmp_flux, tmp_idx)
+
+            # Store result
+            sto.result_id = i
             sto.result = {
-                'Time': data[i]['Time'],
-                'Flux': flux_data[i]['Species Flux']
+                'Time': tmp_time[tmp_idx],
+                'dfdt': dfdt
             }
 
         comm.Barrier()
-
-        if rank == 0:
-            print('Hurray!', flush=True)
-
-            # Extract time and flux arrays
-            tmp_time_arr = [v['Time'] for v in tmp_results.values()]
-            tmp_flux_arr = [v['Flux'] for v in tmp_results.values()]
-            time_arr = np.array(tmp_time_arr)
-            flux_arr = np.stack(tmp_flux_arr)
-
-            # Ensure time is sorted
-            idx = np.argsort(time_arr)
-            time_arr = time_arr[idx]
-            flux_arr = flux_arr[idx]
-
-            # Compute time derivative
-            result = np.gradient(flux_arr, time_arr, axis=0)
-
-            print(result.shape, flush=True)
-            return result
-
-        else:
-            return None
+        return tmp_results
 
 
     ###############################################################################
     # Main Function
     ###############################################################################
-    if rank == 0:
-        # Extract the spatial grids at each time step
-        tmp_x_arr = [v['Data']['X'] for v in data.values()]
-        x_uniform = grid_regularization(tmp_x_arr)  # Can still compute dx and x_uniform as before
-        print('Uniform X:', x_uniform, flush=True)
-        print('Uniform X Length:', len(x_uniform), flush=True)
-    else:
-        x_uniform = None
 
-    # Broadcast back to all ranks
-    x_uniform = comm.bcast(x_uniform, root=0)
-    comm.Barrier()
+    if rank == 0:
+        rank_log(f"Beginning Temporal and Flux Calculations")
+
+    data_type = next(
+        (name for name, config in vars(script_config).items() if getattr(config, 'Flag', False)),
+        None
+    )
 
     # Determine all conservation fluxes
     flux_data = flux_calculation()
@@ -519,24 +697,24 @@ def transport_budget_analysis(data, transport_species, data_type, output_path):
             tmp_data = data[key]['Data']
             tmp_flux_data = flux_data[key]
             # Step 2.3:
-            C = np.gradient(tmp_flux_data['Mass Flux'] * data_interpolation(tmp_data['X'], tmp_data[f'Y({transport_species})'], x_uniform), x_uniform)
+            C = np.gradient(tmp_flux_data['Mass Flux'] * tmp_data[f'Y({transport_species})'], tmp_data['X'])
             # Step 2.4:
-            D = np.gradient(tmp_flux_data['Diffusion Flux'], x_uniform)
+            D = np.gradient(tmp_flux_data['Diffusion Flux'], tmp_data['X'])
             # Step 2.5:
-            R = data_interpolation(tmp_data['X'], tmp_data[f'W({transport_species})'], x_uniform)
+            R = tmp_data[f'W({transport_species})']
             # Step 2.6:
-            if np.max(R) > abs(np.min(R)):
-                total = (drhoYdt[i] + C + D + R)
+            if data_type == 'Pele':
+                total = (drhoYdt[i]['dfdt'] + C + D + R)
             else:
-                total = (drhoYdt[i] + C + D - R)
+                total = (drhoYdt[i]['dfdt'] + C + D - R)
 
             #
-            plot_center = x_uniform[np.argmax(data_interpolation(tmp_data['X'], tmp_data['Y(HO2)'], x_uniform))]
-            animation_frame_generation(x_uniform, (drhoYdt[i], C, D, R, total),
+            plot_center = tmp_data['X'][np.argmax(tmp_data['Y(HO2)'])]
+            animation_frame_generation(tmp_data['X'], (drhoYdt[i]['dfdt'], C, D, R, total),
                                        ('drhoY/dt', 'C', 'D', 'R', 'Total'),
                                        os.path.join(output_path, f'Overall-Plot-{key}.png'),
                                        split_axis=False, plot_center=plot_center, window_size=1e-4)
-            animation_frame_generation(x_uniform, data_interpolation(tmp_data['X'], tmp_data['Temperature'], x_uniform),
+            animation_frame_generation(tmp_data['X'], tmp_data['Temperature'],
                                        'Temperature',
                                        os.path.join(output_path, f'Overall-Temperature-Plot-{key}.png'),
                                        split_axis=False)
@@ -549,20 +727,15 @@ def transport_budget_analysis(data, transport_species, data_type, output_path):
 ########################################################################################################################
 
 def main():
-    # Step 1:
-    dir_path = os.path.dirname(os.path.realpath(__file__))
-    sltorc_path = os.path.join(dir_path, '../1D-SLTORC-Data/C2H6-O2/Phi-1.0')
-    pele_path = os.path.join(dir_path, '../2D-Test-Data')
-
-    transport_species = 'HO2'
-
-    freeflame_flag = False
-    detonation_flag = False
-    sltorc_flag = False
-    pele_flag = True
+    # Step 1: Set the processing parameters
+    script_config = ScriptConfig()
+    #
+    script_config.Pele.Flag = True
+    script_config.Pele.DataPath = '../2D-Pele-Test-Data'
+    script_config.Pele.Stride = 1
 
     # Step 2: Define the input parameters
-
+    transport_species = 'HO2'
     initialize_parameters(
         T=503.15,
         P=10.0 * 100000,
@@ -583,72 +756,14 @@ def main():
     add_species_vars(input_params.species)
 
     # Step 3:
-    if freeflame_flag:
-        # if rank == 0:
-        # Step 3.1: Extract data
-        tmp_data = cantera_flame(transport_species)
-        # Step 3.2: Map data to dict
-        data_dict = {}
-        data_dict[0] = {
-            'Time': 0.0,
-            'Data': tmp_data
-        }
-        data_dict[1] = {
-            'Time': 1.0,
-            'Data': tmp_data
-        }
-        data_dict[2] = {
-            'Time': 2.0,
-            'Data': tmp_data
-        }
-        data_dict[3] = {
-            'Time': 3.0,
-            'Data': tmp_data
-        }
+    data_dict = data_extraction(transport_species, script_config)
 
-        # Step 3.3: Set output path
-        output_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'Cantera-H2-Plots')
-        os.makedirs(output_path, exist_ok=True)
-
-        # Step 3.4: Perform transport budget analysis
-        transport_budget_analysis(data_dict, transport_species, 'cantera', output_path)
-
-
-    if detonation_flag:
-        if rank == 0:
-            # W.I.P.
-            print('Work in Progress')
-
-    if sltorc_flag:
-        # Step 3.1: Extract data
-        data_dict = sltorc_data_loading(sltorc_path, transport_species, stride=1)
-
-        output_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'SLTORC-C2H6-Plots')
-        os.makedirs(output_path, exist_ok=True)
-        # Step 3.3: Perform transport budget analysis
-        print(len(data_dict.keys()), flush=True)
-        transport_budget_analysis(data_dict, transport_species, 'SLTORC', output_path)
-
-    if pele_flag:
-        data_paths = load_directories(pele_path)
-        updated_data_paths = sort_files(data_paths)
-        pltname_list = [os.path.basename(d) for d in updated_data_paths]
-
-        data_dict = {}
-        for sto, dir in yt.parallel_objects(updated_data_paths, -1, storage=data_dict):
-            # Step 4.1: Load the data
-            ds = yt.load(dir)
-            # Step 4.2: Process each file
-            sto.result_id = pltname_list.index(ds.basename)
-            sto.result = {
-                'Time': ds.current_time.to_value(),
-                'Data': data_ray_extraction(ds, 0.0445 / 100)
-            }
-
-        output_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'Pele-2D-Plots')
-        os.makedirs(output_path, exist_ok=True)
-
-        transport_budget_analysis(data_dict, transport_species, 'Pele', output_path)
+    # Step 4: Transport Budget Analysis
+    # Step 4.1: Set output path
+    output_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), f'Transport-Budget-Plots')
+    os.makedirs(output_path, exist_ok=True)
+    # Step 4.2:
+    transport_budget_analysis(data_dict, transport_species, output_path, script_config)
 
     return
 
