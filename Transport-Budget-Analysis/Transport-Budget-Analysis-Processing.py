@@ -560,7 +560,7 @@ def transport_budget_analysis(data, transport_species, output_path, script_confi
             # Compute time derivative
             dfdt = np.gradient(tmp_flux_data, time_arr, axis=0)[idx]
 
-            return data_interpolation(hybrid_grid, dfdt, data[i]['Data']['X'])
+            return data_interpolation(hybrid_grid, dfdt, pos_arr[idx])
 
 
         def general_griding(time_arr, pos_arr, flux_arr, idx):
@@ -569,7 +569,7 @@ def transport_budget_analysis(data, transport_species, output_path, script_confi
             # Internal Functions
             #####################################
 
-            def grid_regularization(data):
+            def grid_regularization(grid_data):
                 """
                     Determine the smallest grid spacing across all spatial grids from multiple ranks.
 
@@ -591,7 +591,7 @@ def transport_budget_analysis(data, transport_species, output_path, script_confi
                 x_max = []
 
                 # Iterate over all lists of spatial grids
-                for x_arr in data:
+                for x_arr in grid_data:
                     x_min.append(np.min(x_arr))
                     x_max.append(np.max(x_arr))
                     dx_min.append(np.min(np.diff(x_arr)))
@@ -624,31 +624,35 @@ def transport_budget_analysis(data, transport_species, output_path, script_confi
             # Compute time derivative
             dfdt = np.gradient(tmp_flux_data, time_arr, axis=0)[idx]
 
-            return data_interpolation(x_uniform, dfdt, data[i]['Data']['X'])
+            return data_interpolation(x_uniform, dfdt, pos_arr[idx])
 
 
         ###############################################################################
         # Main Function
         ###############################################################################
 
+        # Step 1: Distribute data across all ranks
+        local_data = comm.bcast(data, root=0)
+
         tmp_results = {}
-        for sto, i in parallel_objects(data.keys(), njobs=size, storage=tmp_results):
+
+        for sto, i in parallel_objects(local_data.keys(), njobs=size, storage=tmp_results):
             # Step 1: Extract the adjacent time step grids
-            if i > 0 and i < len(data) - 1:
-                tmp_time = [data[j]['Time'] for j in [i - 1, i, i + 1]]
-                tmp_pos = [data[j]['Data']['X'] for j in [i - 1, i, i + 1]]
+            if i > 0 and i < len(local_data.keys()) - 1:
+                tmp_time = [local_data[j]['Time'] for j in [i - 1, i, i + 1]]
+                tmp_pos = [local_data[j]['Data']['X'] for j in [i - 1, i, i + 1]]
                 tmp_flux = [flux_data[j]['Species Flux'] for j in [i - 1, i, i + 1]]
                 tmp_idx = 1
 
             elif i == 0:
-                tmp_time = [data[j]['Time'] for j in [i, i + 1, i + 2]]
-                tmp_pos = [data[j]['Data']['X'] for j in [i, i + 1, i + 2]]
+                tmp_time = [local_data[j]['Time'] for j in [i, i + 1, i + 2]]
+                tmp_pos = [local_data[j]['Data']['X'] for j in [i, i + 1, i + 2]]
                 tmp_flux = [flux_data[j]['Species Flux'] for j in [i, i + 1, i + 2]]
                 tmp_idx = 0
 
-            elif i == len(data) - 1:
-                tmp_time = [data[j]['Time'] for j in [i - 2, i - 1, i]]
-                tmp_pos = [data[j]['Data']['X'] for j in [i - 2, i - 1, i]]
+            elif i == len(local_data.keys()) - 1:
+                tmp_time = [local_data[j]['Time'] for j in [i - 2, i - 1, i]]
+                tmp_pos = [local_data[j]['Data']['X'] for j in [i - 2, i - 1, i]]
                 tmp_flux = [flux_data[j]['Species Flux'] for j in [i - 2, i - 1, i]]
                 tmp_idx = 2
 
@@ -661,7 +665,7 @@ def transport_budget_analysis(data, transport_species, output_path, script_confi
                 dfdt = general_griding(tmp_time, tmp_pos, tmp_flux, tmp_idx)
 
             # Store result
-            sto.result_id = i
+            sto.result_id = int(i)
             sto.result = {
                 'Time': tmp_time[tmp_idx],
                 'dfdt': dfdt
@@ -691,7 +695,8 @@ def transport_budget_analysis(data, transport_species, output_path, script_confi
 
     # Step 2:
     if rank == 0:
-        print(data.keys())
+        print('Data Keys:', data.keys(), flush=True)
+        print('dfdt Keys:', drhoYdt.keys(), flush=True)
         for i, key in enumerate(data.keys()):
             # Step 2.1:
             tmp_data = data[key]['Data']
@@ -704,16 +709,16 @@ def transport_budget_analysis(data, transport_species, output_path, script_confi
             R = tmp_data[f'W({transport_species})']
             # Step 2.6:
             if data_type == 'Pele':
-                total = (drhoYdt[i]['dfdt'] + C + D + R)
+                total = (drhoYdt[key]['dfdt'] + C + D + R)
             else:
-                total = (drhoYdt[i]['dfdt'] + C + D - R)
+                total = (drhoYdt[key]['dfdt'] + C + D - R)
 
             #
             plot_center = tmp_data['X'][np.argmax(tmp_data['Y(HO2)'])]
-            animation_frame_generation(tmp_data['X'], (drhoYdt[i]['dfdt'], C, D, R, total),
+            animation_frame_generation(tmp_data['X'], (drhoYdt[key]['dfdt'], C, D, R, total),
                                        ('drhoY/dt', 'C', 'D', 'R', 'Total'),
                                        os.path.join(output_path, f'Overall-Plot-{key}.png'),
-                                       split_axis=False, plot_center=plot_center, window_size=1e-4)
+                                       split_axis=False, plot_center=plot_center, window_size=5e-5)
             animation_frame_generation(tmp_data['X'], tmp_data['Temperature'],
                                        'Temperature',
                                        os.path.join(output_path, f'Overall-Temperature-Plot-{key}.png'),
@@ -732,7 +737,7 @@ def main():
     #
     script_config.Pele.Flag = True
     script_config.Pele.DataPath = '../2D-Pele-Test-Data'
-    script_config.Pele.Stride = 1
+    script_config.Pele.Stride = 2
 
     # Step 2: Define the input parameters
     transport_species = 'HO2'
