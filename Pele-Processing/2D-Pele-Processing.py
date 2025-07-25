@@ -62,18 +62,19 @@ class FieldConfig:
 class FlameConfig:
     Position: FieldConfig = field(default_factory=lambda: FieldConfig(Name='Flame Position', Flag=True))
     Velocity: FieldConfig = field(default_factory=lambda: FieldConfig(Name='Flame Velocity', Flag=True))
-    RelativeVelocity: FieldConfig = field(default_factory=lambda: FieldConfig(Name='Flame Relative Velocity', Flag=True))
+    RelativeVelocity: FieldConfig = field(default_factory=lambda: FieldConfig(Name='Flame Relative Velocity', Flag=True, Offset=10e-6))
     ThermodynamicState: FieldConfig = field(default_factory=lambda: FieldConfig(Name='Flame Thermodynamic State', Flag=True, Offset=10e-6))
     HeatReleaseRate: FieldConfig = field(default_factory=lambda: FieldConfig(Name='Heat Release Rate', Flag=True))
     FlameThickness: FieldConfig = field(default_factory=lambda: FieldConfig(Name='Flame Thickness', Flag=True))  # fixed typo here too
     SurfaceLength: FieldConfig = field(default_factory=lambda: FieldConfig(Name='Surface Length', Flag=True))
+    ConsumptionRate: FieldConfig = field(default_factory=lambda: FieldConfig(Name='Consumption Rate', Flag=True))
     ReynoldsNumber: FieldConfig = field(default_factory=lambda: FieldConfig(Name='Reynolds Number', Flag=True))
 
 
 @dataclass
 class BurnedGasConfig:
-    GasVelocity: FieldConfig = field(default_factory=lambda: FieldConfig(Name='Gas Velocity', Flag=True, Offset=10e-6))
-    ThermodynamicState: FieldConfig = field(default_factory=lambda: FieldConfig(Name='Flame Thermodynamic State', Flag=True, Offset=10e-6))
+    GasVelocity: FieldConfig = field(default_factory=lambda: FieldConfig(Name='Gas Velocity', Flag=True, Offset=-10e-6))
+    ThermodynamicState: FieldConfig = field(default_factory=lambda: FieldConfig(Name='Flame Thermodynamic State', Flag=True, Offset=-10e-6))
 
 
 @dataclass
@@ -110,7 +111,7 @@ class ScriptConfig:
 # Specialized Pele Functions
 ########################################################################################################################
 
-def flame_geometry(ds, output_dir, script_config):
+def flame_geometry(ds, output_dir, script_config, transport_species='H2'):
     ############################################################
     # Plotting Helper Functions
     ############################################################
@@ -504,6 +505,52 @@ def flame_geometry(ds, output_dir, script_config):
         return flame_thickness_val
 
     ############################################################
+    # Consumption Rate Processing Functions
+    ############################################################
+
+    def consumption_rate(ds, points, transport_species):
+
+        def bounding_box(points):
+            min_x = np.min(points[:, 0]) - 10e-4
+            max_x = np.max(points[:, 0]) + 10e-4
+            min_y = np.min(points[:, 1])
+            max_y = np.max(points[:, 1])
+            return min_x, max_x, min_y, max_y
+
+        # Step 1: Extract the bounding box from the points
+        box_pts = bounding_box(points)
+        # Step 2: Extract the left data
+        left_data = ds.ray((ds.all_data()['boxlib', 'x'][
+                                np.argmin(abs(ds.all_data()['boxlib', 'x'].to_value() - box_pts[0]))].to_value(),
+                            box_pts[2], 0.5), (ds.all_data()['boxlib', 'x'][np.argmin(
+            abs(ds.all_data()['boxlib', 'x'].to_value() - box_pts[0]))].to_value(), box_pts[3], 0.5))
+        ray_sort = np.argsort(left_data["boxlib", "y"].to_value())
+
+        y_arr = left_data["boxlib", "y"][ray_sort].to_value()
+        denisty = left_data["boxlib", "density"][ray_sort].to_value() / (1000 / (100 ** 3))
+        velocity = left_data["boxlib", "x_velocity"][ray_sort].to_value() / (100)
+        mass_frac = left_data["boxlib", f"Y({transport_species})"][ray_sort].to_value()
+        left_consumption_rate = np.trapz(denisty * velocity * mass_frac, y_arr)
+
+        # Step 3: Extract the right data
+        right_data = ds.ray((ds.all_data()['boxlib', 'x'][
+                                 np.argmin(abs(ds.all_data()['boxlib', 'x'].to_value() - box_pts[1]))].to_value(),
+                             box_pts[2], 0.5), (ds.all_data()['boxlib', 'x'][np.argmin(
+            abs(ds.all_data()['boxlib', 'x'].to_value() - box_pts[1]))].to_value(), box_pts[3], 0.5))
+        ray_sort = np.argsort(right_data["boxlib", "y"].to_value())
+
+        y_arr = right_data["boxlib", "y"][ray_sort].to_value()
+        denisty = right_data["boxlib", "density"][ray_sort].to_value() / (1000 / (100 ** 3))
+        velocity = right_data["boxlib", "x_velocity"][ray_sort].to_value() / (100)
+        mass_frac = right_data["boxlib", f"Y({transport_species})"][ray_sort].to_value()
+        right_consumption_rate = np.trapz(denisty * velocity * mass_frac, y_arr)
+
+        # Step 4: Calculate the average consumption rate
+        consumption_rate = right_consumption_rate - left_consumption_rate
+
+        return consumption_rate
+
+    ############################################################
     # Main Function
     ############################################################
     # Step 1: Load the data
@@ -538,6 +585,7 @@ def flame_geometry(ds, output_dir, script_config):
     # Compute requested metrics
     if script_config.Flame.SurfaceLength.Flag:
         tmp_dict['Surface Length'] = contour_length / 100
+
     if script_config.Flame.FlameThickness.Flag:
         if contour_length != 0:
             try:
@@ -549,8 +597,18 @@ def flame_geometry(ds, output_dir, script_config):
         else:
             tmp_dict['Flame Thickness'] = np.nan
 
-    return tmp_dict
+    # Compute flame position
+    if script_config.Flame.ConsumptionRate.Flag:
+        if contour_length != 0:
+            try:
+                tmp_dict['Consumption Rate'] = consumption_rate(ds, sorted_points, transport_species)
+            except Exception as e:
+                tmp_dict['Consumption Rate'] = np.nan
+                print(f"Error: Unable to extract consumption rate: {e}")
+        else:
+            tmp_dict['Consumption Rate'] = np.nan
 
+    return tmp_dict
 
 def single_file_processing(dataset, args):
 
@@ -576,7 +634,7 @@ def single_file_processing(dataset, args):
         rank_log(f"   ...Done")
 
         # Step 3: Extract and calculate the flame geometry parameters
-        if script_config.Flame.FlameThickness.Flag or script_config.Flame.SurfaceLength.Flag:
+        if script_config.Flame.FlameThickness.Flag or script_config.Flame.SurfaceLength.Flag or script_config.Flame.ConsumptionRate.Flag:
             rank_log(f"       Flame Geometry Extraction...")
             tmp_dict = flame_geometry(dataset, output_dir, script_config)
             rank_log(f"           ...Done")
@@ -626,6 +684,9 @@ def single_file_processing(dataset, args):
             # Surface Length
             if script_config.Flame.SurfaceLength.Flag:
                 result_dict['Flame']['Surface Length'] = tmp_dict['Surface Length']
+            # Consumption Rate
+            if script_config.Flame.ConsumptionRate.Flag:
+                result_dict['Flame']['Consumption Rate'] = tmp_dict['Consumption Rate']
 
         # Burned Gas Processing
         if script_config.Flame.Position.Flag and (
@@ -636,7 +697,7 @@ def single_file_processing(dataset, args):
             if script_config.BurnedGas.GasVelocity.Flag:
                 rank_log(f"       Burned Gas Velocity Extraction...")
                 tmp_idx = np.argmin(
-                    abs(data['X'] - (result_dict['Flame']['Position'] - script_config.BurnedGas.GasVelocity.Offset)))
+                    abs(data['X'] - (result_dict['Flame']['Position'] + script_config.BurnedGas.GasVelocity.Offset)))
                 result_dict['Burned Gas']['Gas Velocity'] = data['X Velocity'][tmp_idx]
                 rank_log(f"           ...Done")
             if script_config.BurnedGas.ThermodynamicState.Flag:
@@ -813,6 +874,15 @@ def pelec_processing(args):
         # Convert to NumPy array if needed
         result_arr = np.array(result_arr, dtype=object)
 
+        """
+        result_arr = np.empty(len(result_dict), dtype=object)
+        for i, (fn, vals) in enumerate(sorted(result_dict.items())):
+            # Find the index of the current key in data_dirs
+            if fn in pltname_list:
+                index = pltname_list.index(fn)
+                result_arr[index] = vals  # Store values in result_arr at the corresponding index
+        """
+
         rank_log(f"Global Result Variable Extraction...")
 
         # Step 5: Determine the wave velocities
@@ -859,7 +929,7 @@ def pelec_processing(args):
         parent_dir = ensure_long_path_prefix(os.path.join(output_dir, "Animation-Frames"))
         frame_dirs = [item for item in os.listdir(parent_dir) if os.path.isdir(os.path.join(parent_dir, item))]
         for frame_dir in frame_dirs:
-            filename = os.path.join(output_dir, f"{frame_dir}-Animation.mp4")
+            filename = os.path.join(output_dir, f"{frame_dir}-Animation.gif")
             generate_animation(os.path.join(parent_dir, frame_dir), filename)
 
         rank_log(f"   ...Done")
@@ -874,9 +944,7 @@ def pelec_processing(args):
 def main():
     # Step 1: Define the script parameters
     data_parent_dir = '../2D-Test-Data'
-    ddt_plt_dir = os.path.join(data_parent_dir, 'plt332330')
-    # ddt_parent_dir = '../../../Domain-Length-284cm/0.09cm-Complete-Domain/Planar-Kernel-Level-6-Part-3'
-    # ddt_plt_dir = os.path.join(data_parent_dir, 'ddt_plt')
+    ddt_plt_dir = '../2D-Test-Data/plt332330'
 
     # Step 2: Set the processing parameters
     script_config = ScriptConfig()
@@ -886,14 +954,14 @@ def main():
     script_config.Flame.RelativeVelocity.Flag = True
     script_config.Flame.RelativeVelocity.Offset = 10e-6
     script_config.Flame.ThermodynamicState.Flag = True
-    # script_config.Flame.ThermodynamicState.Offset = 10e-6
+    script_config.Flame.ThermodynamicState.Offset = 10e-6
     script_config.Flame.HeatReleaseRate.Flag = True
     script_config.Flame.SurfaceLength.Flag = True
+    script_config.Flame.ConsumptionRate.Flag = True
     script_config.Flame.FlameThickness.Flag = True
     # Burned Gas Parameters
     script_config.BurnedGas.GasVelocity.Flag = True
     script_config.BurnedGas.ThermodynamicState.Flag = True
-    # script_config.Flame.ThermodynamicState.Offset = 10e-6
     # Shock Parameters
     script_config.Shock.Position.Flag = True
     script_config.Shock.Velocity.Flag = True
@@ -928,7 +996,7 @@ def main():
     add_species_vars(input_params.species)
 
     # Step 2: Determine the domain parameters
-    row_idx = 0.0462731 + (8.7e-5 / 2)
+    row_idx = 0.0416719 + (8.7e-5 / 2)
     domain_info = domain_parameters(ddt_plt_dir, desired_y_location=row_idx)
 
     # Step 3: Log the domain information
@@ -940,7 +1008,7 @@ def main():
 
     # Step 4: Create the result directories
     output_dir = os.path.abspath(
-        os.path.join(f"Processed-MPI-Global-Test-Results-V{version}", f"y-{domain_info[1][0][1]:.3g}cm"))
+        os.path.join(f"Processed-MPI-Global-Part-2-Results-V{version}", f"y-{domain_info[1][0][1]:.3g}cm"))
     os.makedirs(output_dir, exist_ok=True)
 
     # Step 5: Process the data
