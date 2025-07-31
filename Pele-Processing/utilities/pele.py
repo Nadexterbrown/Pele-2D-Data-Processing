@@ -49,7 +49,7 @@ PELE_VAR_MAP = {
 
 
 def add_species_vars(species_list):
-    for species in species_list:
+    for species in input_params.species:
         PELE_VAR_MAP[f'Y({species})'] = {'Name': f'Y({species})', 'Units': ''}
         PELE_VAR_MAP[f'D({species})'] = {'Name': f'D({species})', 'Units': ''}
         PELE_VAR_MAP[f'W({species})'] = {'Name': f'rho_omega_{species}', 'Units': 'g / cm^3 / s'}
@@ -270,6 +270,66 @@ def data_ray_extraction(dataset, extract_location, direction='x', flux_calc=Fals
         return temp_data
 
 
+    def flux_calculation(data, field_list):
+
+        # Step 1:
+        gas = ct.Solution(input_params.mech)
+
+        # Step 3: Calculate the mole fraction spatial gradient
+        tmp_mole_frac_grad = {}
+        for species in input_params.species:
+            tmp_mole_frac_grad[f'X({species})'] = []
+
+        for species in input_params.species:
+            tmp_mole_frac_grad[f'X({species})'].append(np.gradient(data[f'X({species})'], data['X']))
+
+        # Step 2:
+        flux_dict = {'Mass Flux': [],
+                     'Diffusion Flux': [],
+                     'Momentum Flux': [],
+                     'Energy Flux': []}
+
+        # Step 3:
+        for idx in range(len(data['X'])):
+            # Step 1:
+            T = data['Temperature'][idx]
+            P = data['Pressure'][idx]
+
+            species_list = [var for var in input_params.species]
+            Y = {
+                species: data[f"Y({species})"][idx]  # Construct key dynamically
+                for species in species_list if f"Y({species})" in np.array(field_list)[:, 1]  # Ensure key exists
+            }
+
+            # Step 2: Modify the gas object
+            gas.TPY = T, P, Y
+
+            # Step 1: Save the conservative variables from the conservation equations
+            # Mass Flux
+            flux_dict['Mass Flux'].append(gas.density_mass * data['X Velocity'][idx])
+
+            # Species Flux
+            flux_dict[f'{transport_species} Flux'] = gas.density_mass * gas.Y[gas.species_index(transport_species)]
+
+            # Diffusion Flux (Mixture Averaged)
+            j_k_star = np.zeros(len(input_params.species))
+            for k, species in enumerate(input_params.species):
+                species_idx = gas.species_index(species)
+                j_k_star[k] = - gas.density_mass * (gas.molecular_weights[species_idx] / gas.mean_molecular_weight) * \
+                              data[f'D({transport_species})'][idx] * tmp_mole_frac_grad[f'X({species})'][idx]
+
+            flux_dict[f'{transport_species} Diffusion Flux'].append(
+                j_k_star[input_params.species.index(transport_species)] - data[f'Y({transport_species})'] * np.sum(j_k_star))
+
+            # Momentum FLux
+            flux_dict['Momentum Flux'].append(gas.density_mass * (data['X Velocity'][idx] ** 2))
+
+            # Energy Flux
+            flux_dict['Energy Flux'].append(gas.density_mass * gas.int_energy_mass)
+
+        return
+
+
     ###########################################
     # Main Function
     ###########################################
@@ -303,11 +363,6 @@ def data_ray_extraction(dataset, extract_location, direction='x', flux_calc=Fals
         merged_x = np.array(tmp_data['x'])
         merged_y = np.array(tmp_data[var_name])
 
-        # Skip unit conversion if variable is in missing_str
-        if var in missing_str:
-            merged_data[var] = merged_y
-            continue
-
         # Now apply the unit conversion for each variable in the merged data
         unit_expr = var_info.get('Units', '')
         if unit_expr:
@@ -316,291 +371,13 @@ def data_ray_extraction(dataset, extract_location, direction='x', flux_calc=Fals
         else:
             merged_data[var] = merged_y
 
+    # Step 5:
+    if flux_calc:
+        flux_data = flux_calculation(merged_data)
+        merged_data.update(flux_data)  # Add all computed fluxes to merged_data
+
     return merged_data
 
-"""
-Depreciated
-
-def data_extraction(dataset, extract_location, comm, logger, direction='x'):
-
-    ###########################################
-    # Internal Functions
-    ###########################################
-
-    def level_processing():
-        ###########################################
-        # Internal Functions
-        ###########################################
-
-        def grid_processing(grids):
-
-            ###########################################
-            # Internal Classes
-            ###########################################
-
-            # Slave class
-            class GridProcessor(Slave):
-                def __init__(self):
-                    super(GridProcessor, self).__init__()
-
-                def do_work(self, data):
-                    grid_idx = data
-                    try:
-                        grid = [grid for grid in dataset.index.grids if grid.Level == level][grid_idx]
-                    except:
-                        print('Failed Grid Index:', grid_idx)
-
-                    x = grid["boxlib", "x"].to_value().flatten()
-                    y = grid["boxlib", "y"].to_value().flatten()
-
-                    position_arr = y if direction == 'y' else x
-
-                    # Careful: check units before multiplying by 100
-                    target = extract_location * 100
-                    mask = np.isclose(position_arr, target, atol=2 * dx)  # Make atol bigger, 2x dx
-
-                    # Collect the nearby values
-                    if mask.any():
-                        temp_data = {var_info["Name"]: [] for var_info in PELE_VAR_MAP.values()}
-
-                        for var in PELE_VAR_MAP:
-                            var_name = PELE_VAR_MAP[var]["Name"]
-
-                            if var in missing_str:
-                                for i in np.where(mask)[0]:
-                                    temp_var = cantera_str_acquisition(grid, i, gas_missing, missing_str)
-                                    temp_data[var_name].append(temp_var[var])
-                            else:
-                                try:
-                                    temp_var = grid["boxlib", var_name].to_value().flatten()
-                                    for vi in temp_var[mask]:
-                                        temp_data[var_name].append(vi)
-                                except Exception as e:
-                                    print(f"Missing variable {var_name}: {e}")
-                                    continue
-
-                        # Return result
-                        return temp_data
-                    else:
-                        return None
-
-            # Master class
-            class GridManager(object):
-                def __init__(self, slaves):
-                    # when creating the Master we tell it what slaves it can handle
-                    self.master = Master(slaves)
-                    # WorkQueue is a convenient class that run slaves on a tasks queue
-                    self.work_queue = WorkQueue(self.master)
-
-                def terminate_slaves(self):
-                    # Call this to make all slaves exit their run loop
-
-                    self.master.terminate_slaves()
-
-                def run(self, tasks):
-
-                    # while we have work to do and not all slaves completed
-                    result_dict = {}
-                    in_flight = {}  # mapping from slave -> task
-                    while tasks or not self.master.done():
-                        # give work to do to each idle slave
-                        for slave in self.master.get_ready_slaves():
-                            if not tasks:
-                                break
-
-                            task = tasks.pop(0)  # get next task in the queue
-                            in_flight[slave] = task  # track which task was assigned to which slave
-                            self.master.run(slave, task)
-
-                        # reclaim slaves that have finished working
-                        # so that we can assign them more work
-
-                        for slave in self.master.get_completed_slaves():
-                            data = self.master.completed.pop(slave)  # No second call to get_completed_slaves()
-                            task = in_flight.pop(slave)  # retrieve the original task (grid_idx)
-
-                            result_dict[task] = data
-
-                        # sleep some time
-                        time.sleep(0.05)
-
-                        if not tasks and not self.master.get_ready_slaves() and self.master.done():
-                            print("No more tasks and all slaves have finished.", flush=True)
-                            break
-
-                    return result_dict
-
-            ###########################################
-            # Main Function
-            ###########################################
-
-            if rank == 0:
-                # Call the TaskManager to distribute work to slaves
-                manager = GridManager(slaves=range(1, size))
-                result_data = manager.run(grids)
-                manager.terminate_slaves()
-
-                # Merge all the partial dicts
-                final_data = {}
-                for data in result_data.values():
-                    if data is None:
-                        continue  # Skip grids that found no points
-                    for key, val in data.items():
-                        if key not in final_data:
-                            final_data[key] = []
-                        final_data[key].extend(val)
-
-                # Find the sorted indices of x
-                sorted_indices = np.argsort(final_data['x'])
-
-                # Apply the same sorting to all variables
-                for key in final_data.keys():
-                    final_data[key] = np.array(final_data[key])[sorted_indices]
-
-                return final_data
-
-            else:
-                # Slaves run the GridProcessor job (they process assigned tasks)
-                GridProcessor().run()
-                return None
-
-        ###########################################
-        # Main Function
-        ###########################################
-
-        # Initialize level_data to hold results for all levels
-        tmp_level_data = {}
-
-        # Step 5: Loop over levels and process grids
-        for level in range(0, max_level + 1):  # Adjust max_level to include level 0 to max_level
-            # Initialize a dictionary to store data for the current level
-            tmp_level_data[level] = {PELE_VAR_MAP[var]["Name"]: {} for var in PELE_VAR_MAP.keys()}
-
-            # Compute current level grid spaceing
-            dx = dx_min.to_value() * 2 ** (max_level - level)
-
-            # Get the grids for the current level
-            grid_idx = [i for i, grid in enumerate(dataset.index.grids) if grid.Level == level]
-            if rank == 0:
-                print(f'Number of Grids in Level {level}:', len(grid_idx), flush=True)
-            tmp_level_data[level] = grid_processing(list(np.arange(len(grid_idx))))
-            comm.Barrier()
-
-        if rank == 0:
-            filename = f"{dataset.basename}.png"
-            animation_frame_generation(tmp_level_data[max_level]['x'], tmp_level_data[level]['Temp'], 'Temp',
-                                       filename)
-
-        return tmp_level_data
-
-
-    ###########################################
-    # Main Function
-    ###########################################
-
-    global input_params
-
-    # Step 1: Collect current MPI rank and size
-    rank = comm.Get_rank()
-    size = comm.Get_size()
-
-    # Step 2: Load the data
-    max_level = dataset.index.max_level
-    dx_min = dataset.index.get_smallest_dx()
-
-    # Step 3: Initialize the missing variables
-    missing_str = {
-        key: raw_var["Name"]
-        for key, raw_var in PELE_VAR_MAP.items()
-        if raw_var["Name"] not in np.array(dataset.field_list)[:, 1] and key not in {"Grid", "X", "Y"}
-    }
-
-    if missing_str:
-        gas_missing = ct.Solution(input_params.mech)
-
-    # Step 4: Ensure PELE_VAR_MAP includes the species-specific mappings
-    add_species_vars(input_params.species)
-
-    tmp_data = level_processing()
-
-    # Gather the processed data on rank 0
-    comm.Barrier()
-
-    # Step 6: Now make the *rest* of the function conditional on being root
-    if not rank == 0:
-        return None
-
-    # Step 9: Merge the data from all levels into a single dataset
-    merged_data = {}
-
-    # Iterate over each variable in final_data
-    for var, var_info in PELE_VAR_MAP.items():
-        var_name = var_info["Name"]
-
-        # Initialize merged x and y arrays with data from max_level
-        merged_x = np.array(sorted(tmp_data[max_level]['x']))
-        merged_y = np.array([
-            tmp_data[max_level][var_name][np.argmin(np.abs(tmp_data[max_level]['x'] - x))]
-            for x in merged_x
-        ])
-
-        # Process lower levels
-        for level in range(max_level - 1, -1, -1):
-            dx = dx_min.to_value() * 2 ** (max_level - level)
-
-            x_next_level = np.array(tmp_data[level]['x'])
-            y_next_level = np.array(tmp_data[level][var_name])
-
-            new_x = []
-            new_y = []
-
-            # 1. Handle points BEFORE the first fine point
-            mask_before = x_next_level < merged_x[0]
-            for xb, yb in zip(x_next_level[mask_before], y_next_level[mask_before]):
-                new_x.append(xb)
-                new_y.append(yb)
-
-            # 2. Handle points BETWEEN fine points
-            for i in range(len(merged_x) - 1):
-                x_start = merged_x[i]
-                x_end = merged_x[i + 1]
-
-                # Always keep the existing fine-level point
-                new_x.append(x_start)
-                new_y.append(merged_y[i])
-
-                # Check gap
-                if (x_end - x_start) > 2 * dx:  # Tolerance
-                    mask_between = (x_next_level > x_start) & (x_next_level < x_end)
-                    for xb, yb in zip(x_next_level[mask_between], y_next_level[mask_between]):
-                        new_x.append(xb)
-                        new_y.append(yb)
-
-            # 3. Add last fine-level point
-            new_x.append(merged_x[-1])
-            new_y.append(merged_y[-1])
-
-            # 4. Handle points AFTER the last fine point
-            mask_after = x_next_level > merged_x[-1]
-            for xb, yb in zip(x_next_level[mask_after], y_next_level[mask_after]):
-                new_x.append(xb)
-                new_y.append(yb)
-
-            # Final sort (only x, preserve y pairing)
-            sort_idx = np.argsort(new_x)
-            merged_x = np.array(new_x)[sort_idx]
-            merged_y = np.array(new_y)[sort_idx]
-
-        # Now apply the unit conversion for each variable in the merged data
-        unit_expr = var_info.get('Units', '')
-        if unit_expr:
-            converted_y = [UnitConverter.convert(yi, var) for yi in merged_y]
-            merged_data[var] = np.array(converted_y)
-        else:
-            merged_data[var] = merged_y
-
-    return merged_data
-"""
 
 #################################################################
 # Wavefront Extraction
