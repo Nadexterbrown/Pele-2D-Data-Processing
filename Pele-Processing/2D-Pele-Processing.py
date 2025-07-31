@@ -23,7 +23,7 @@ yt.set_log_level(0)
 # Global Program Setting Variables
 ########################################################################################################################
 
-version = "1.0.0"
+version = "2.0.0"
 
 flame_temp = 2500.0  # Temperature for flame contour extraction
 
@@ -36,6 +36,7 @@ comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
 size = comm.Get_size()
 print(f"Rank {rank} of {size} is running.", flush=True)
+
 
 ########################################################################################################################
 # Script Configuration Classes
@@ -62,10 +63,13 @@ class FieldConfig:
 class FlameConfig:
     Position: FieldConfig = field(default_factory=lambda: FieldConfig(Name='Flame Position', Flag=True))
     Velocity: FieldConfig = field(default_factory=lambda: FieldConfig(Name='Flame Velocity', Flag=True))
-    RelativeVelocity: FieldConfig = field(default_factory=lambda: FieldConfig(Name='Flame Relative Velocity', Flag=True, Offset=10e-6))
-    ThermodynamicState: FieldConfig = field(default_factory=lambda: FieldConfig(Name='Flame Thermodynamic State', Flag=True, Offset=10e-6))
+    RelativeVelocity: FieldConfig = field(
+        default_factory=lambda: FieldConfig(Name='Flame Relative Velocity', Flag=True, Offset=10e-6))
+    ThermodynamicState: FieldConfig = field(
+        default_factory=lambda: FieldConfig(Name='Flame Thermodynamic State', Flag=True, Offset=10e-6))
     HeatReleaseRate: FieldConfig = field(default_factory=lambda: FieldConfig(Name='Heat Release Rate', Flag=True))
-    FlameThickness: FieldConfig = field(default_factory=lambda: FieldConfig(Name='Flame Thickness', Flag=True))  # fixed typo here too
+    FlameThickness: FieldConfig = field(
+        default_factory=lambda: FieldConfig(Name='Flame Thickness', Flag=True))  # fixed typo here too
     SurfaceLength: FieldConfig = field(default_factory=lambda: FieldConfig(Name='Surface Length', Flag=True))
     ConsumptionRate: FieldConfig = field(default_factory=lambda: FieldConfig(Name='Consumption Rate', Flag=True))
     ReynoldsNumber: FieldConfig = field(default_factory=lambda: FieldConfig(Name='Reynolds Number', Flag=True))
@@ -74,15 +78,18 @@ class FlameConfig:
 @dataclass
 class BurnedGasConfig:
     GasVelocity: FieldConfig = field(default_factory=lambda: FieldConfig(Name='Gas Velocity', Flag=True, Offset=-10e-6))
-    ThermodynamicState: FieldConfig = field(default_factory=lambda: FieldConfig(Name='Flame Thermodynamic State', Flag=True, Offset=-10e-6))
+    ThermodynamicState: FieldConfig = field(
+        default_factory=lambda: FieldConfig(Name='Flame Thermodynamic State', Flag=True, Offset=-10e-6))
 
 
 @dataclass
 class ShockConfig:
     Position: FieldConfig = field(default_factory=lambda: FieldConfig(Name='Shock Position', Flag=True))
     Velocity: FieldConfig = field(default_factory=lambda: FieldConfig(Name='Shock Velocity', Flag=True))
-    PreShockThermodynamicState: FieldConfig = field(default_factory=lambda: FieldConfig(Name='Pre-Shock Thermodynamic State', Flag=True, Offset=10e-6))
-    PostShockThermodynamicState: FieldConfig = field(default_factory=lambda: FieldConfig(Name='Post-Shock Thermodynamic State', Flag=True, Offset=-10e-6))
+    PreShockThermodynamicState: FieldConfig = field(
+        default_factory=lambda: FieldConfig(Name='Pre-Shock Thermodynamic State', Flag=True, Offset=10e-6))
+    PostShockThermodynamicState: FieldConfig = field(
+        default_factory=lambda: FieldConfig(Name='Post-Shock Thermodynamic State', Flag=True, Offset=-10e-6))
 
 
 @dataclass
@@ -133,7 +140,8 @@ def flame_geometry(ds, output_dir, script_config, transport_species='H2'):
         plt.title(ds.current_time.to_value())
         plt.grid(True, linestyle='--', alpha=0.5)
         plt.legend()
-        filename = ensure_long_path_prefix(os.path.join(output_dir, "Animation-Frames", f"Surface-Contour-Plt-Files", f"{ds.basename}.png"))
+        filename = ensure_long_path_prefix(
+            os.path.join(output_dir, "Animation-Frames", f"Surface-Contour-Plt-Files", f"{ds.basename}.png"))
         plt.savefig(filename, format='png')
         plt.close()
 
@@ -156,7 +164,8 @@ def flame_geometry(ds, output_dir, script_config, transport_species='H2'):
         plt.colorbar()
 
         plt.title(f'Flame Normal: {ds.current_time.to_value()}')
-        filename = ensure_long_path_prefix(os.path.join(output_dir, "Animation-Frames", f"Flame-Thickness-Plt-Files", f"{ds.basename}.png"))
+        filename = ensure_long_path_prefix(
+            os.path.join(output_dir, "Animation-Frames", f"Flame-Thickness-Plt-Files", f"{ds.basename}.png"))
         plt.savefig(filename, format='png')
         plt.close()
 
@@ -206,7 +215,6 @@ def flame_geometry(ds, output_dir, script_config, transport_species='H2'):
         paths = contour.get_paths()
         contour_points = np.vstack([path.vertices for path in paths])
         return contour_points
-
 
     def sort_by_nearest_neighbors(points):
         buffer = 0.0075 * ds.domain_right_edge.to_value()[1]
@@ -264,7 +272,6 @@ def flame_geometry(ds, output_dir, script_config, transport_species='H2'):
                     segment_start = i
 
         return points[order], segments, np.sum(segment_length)
-
 
     ############################################################
     # Flame Thickness Processing Functions
@@ -504,9 +511,9 @@ def flame_geometry(ds, output_dir, script_config, transport_species='H2'):
 
         return flame_thickness_val
 
-    ############################################################
-    # Consumption Rate Processing Functions
-    ############################################################
+        ############################################################
+        # Consumption Rate Processing Functions
+        ############################################################
 
     def consumption_rate(ds, points, transport_species):
 
@@ -515,40 +522,51 @@ def flame_geometry(ds, output_dir, script_config, transport_species='H2'):
             max_x = np.max(points[:, 0]) + 10e-4
             min_y = np.min(points[:, 1])
             max_y = np.max(points[:, 1])
-            return min_x, max_x, min_y, max_y
+            return (min_x, min_y, ds.domain_left_edge[2].to_value()), (max_x, max_y, ds.domain_right_edge[2].to_value())
 
         # Step 1: Extract the bounding box from the points
         box_pts = bounding_box(points)
-        # Step 2: Extract the left data
-        left_data = ds.ray((ds.all_data()['boxlib', 'x'][
-                                np.argmin(abs(ds.all_data()['boxlib', 'x'].to_value() - box_pts[0]))].to_value(),
-                            box_pts[2], 0.5), (ds.all_data()['boxlib', 'x'][np.argmin(
-            abs(ds.all_data()['boxlib', 'x'].to_value() - box_pts[0]))].to_value(), box_pts[3], 0.5))
-        ray_sort = np.argsort(left_data["boxlib", "y"].to_value())
+        # Step 2:
+        level = ds.index.max_level
+        # Define your region of interest
+        left_edge = ds.arr(box_pts[0], "cm")
+        right_edge = ds.arr(box_pts[1], "cm")
+        # Calculate dimensions at this level
+        dims = ((right_edge - left_edge) / ds.index.get_smallest_dx()).to('').astype("int")
+        dims[2] = 1  # Only one layer in z
+        # Load just the subregion from the covering grid
+        cg = ds.covering_grid(
+            level=level,
+            left_edge=left_edge,
+            dims=dims,
+            fields=[('boxlib', 'x'),
+                    ('boxlib', 'y'),
+                    ('boxlib', f'rho_{transport_species}'),
+                    ('boxlib', f'rho_omega_{transport_species}')]
+        )
 
-        y_arr = left_data["boxlib", "y"][ray_sort].to_value()
-        denisty = left_data["boxlib", "density"][ray_sort].to_value() / (1000 / (100 ** 3))
-        velocity = left_data["boxlib", "x_velocity"][ray_sort].to_value() / (100)
-        mass_frac = left_data["boxlib", f"Y({transport_species})"][ray_sort].to_value()
-        left_consumption_rate = np.trapz(denisty * velocity * mass_frac, y_arr)
+        # To save computational resources, extract each y value separately
+        # Get data dimensions without loading the whole array
+        num_rows = cg['boxlib', 'x'].shape[1]  # Number of rows in the y-direction
+        # Extract the grid spacing from the covering grid
+        dx = UnitConverter.convert(cg.dds[0].to_value(), 'X')
+        dy = UnitConverter.convert(cg.dds[1].to_value(), 'Y')
+        # Initialize accumulator for consumption rate
+        species_consumption_rate = 0.0
 
-        # Step 3: Extract the right data
-        right_data = ds.ray((ds.all_data()['boxlib', 'x'][
-                                 np.argmin(abs(ds.all_data()['boxlib', 'x'].to_value() - box_pts[1]))].to_value(),
-                             box_pts[2], 0.5), (ds.all_data()['boxlib', 'x'][np.argmin(
-            abs(ds.all_data()['boxlib', 'x'].to_value() - box_pts[1]))].to_value(), box_pts[3], 0.5))
-        ray_sort = np.argsort(right_data["boxlib", "y"].to_value())
+        # Loop over rows without allocating the whole 2D array
+        for i in range(num_rows):
+            row_data = UnitConverter.convert(cg['boxlib', f'rho_omega_{transport_species}'][:, i, 0].to_value(),
+                                             f'W({transport_species})')
+            species_consumption_rate += (row_data * dx * dy).sum()
 
-        y_arr = right_data["boxlib", "y"][ray_sort].to_value()
-        denisty = right_data["boxlib", "density"][ray_sort].to_value() / (1000 / (100 ** 3))
-        velocity = right_data["boxlib", "x_velocity"][ray_sort].to_value() / (100)
-        mass_frac = right_data["boxlib", f"Y({transport_species})"][ray_sort].to_value()
-        right_consumption_rate = np.trapz(denisty * velocity * mass_frac, y_arr)
-
-        # Step 4: Calculate the average consumption rate
-        consumption_rate = right_consumption_rate - left_consumption_rate
-
-        return consumption_rate
+        # Step 3: Extract the reactant density at the flame location
+        rho_Y_reactants = UnitConverter.convert(cg["boxlib", f"rho_{transport_species}"].to_value()[-1, 0, 0],
+                                                'Density')
+        # Step 4: Calculate the burning velocity
+        burning_velocity = species_consumption_rate / rho_Y_reactants / UnitConverter.convert(
+            ds.domain_right_edge.to_value()[1], 'Y')
+        return species_consumption_rate, burning_velocity
 
     ############################################################
     # Main Function
@@ -589,7 +607,9 @@ def flame_geometry(ds, output_dir, script_config, transport_species='H2'):
     if script_config.Flame.FlameThickness.Flag:
         if contour_length != 0:
             try:
-                tmp_dict['Flame Thickness'] = flame_thickness(sorted_points, script_config.DataExtraction.Location * 100, output_dir) / 100
+                tmp_dict['Flame Thickness'] = flame_thickness(sorted_points,
+                                                              script_config.DataExtraction.Location * 100,
+                                                              output_dir) / 100
 
             except Exception as e:
                 tmp_dict['Flame Thickness'] = np.nan
@@ -601,140 +621,227 @@ def flame_geometry(ds, output_dir, script_config, transport_species='H2'):
     if script_config.Flame.ConsumptionRate.Flag:
         if contour_length != 0:
             try:
-                tmp_dict['Consumption Rate'] = consumption_rate(ds, sorted_points, transport_species)
+                tmp_dict['Consumption Rate'], tmp_dict['Burning Velocity'] = consumption_rate(ds, sorted_points,
+                                                                                              transport_species)
             except Exception as e:
                 tmp_dict['Consumption Rate'] = np.nan
+                tmp_dict['Burning Velocity'] = np.nan
                 print(f"Error: Unable to extract consumption rate: {e}")
         else:
             tmp_dict['Consumption Rate'] = np.nan
+            tmp_dict['Burning Velocity'] = np.nan
 
     return tmp_dict
 
-def single_file_processing(dataset, args):
 
+def single_file_processing(dataset, args):
     ###############################################################################
     # Main Function
     ###############################################################################
+    # Step 1: Unpack the arguments
+    output_dir, script_config = args
+    pltFile_name = dataset.basename
+    extract_location = script_config.DataExtraction.Location + (dataset.index.get_smallest_dx().to_value() / 2)
+
+    ###########################################
+    # MPI Parallel Processing: Shared loading
+    ###########################################
+    # Step 2: Extract the data
+    rank_log(f"==== Processing {pltFile_name} ====")
+    rank_log(f"   Loading {pltFile_name}...")
     try:
-        # Step 1: Unpack the arguments
-        output_dir, script_config = args
-        pltFile_name = dataset.basename
-        extract_location = script_config.DataExtraction.Location + (dataset.index.get_smallest_dx().to_value() / 2)
-
-        ###########################################
-        # MPI Parallel Processing: Shared loading
-        ###########################################
-        # Step 2: Extract the data
-        rank_log(f"==== Processing {pltFile_name} ====")
-        rank_log(f"   Loading {pltFile_name}...")
-
         time = dataset.current_time.to_value()
         data = data_ray_extraction(dataset, extract_location)
-
         rank_log(f"   ...Done")
+    except Exception as e:
+        rank_log(f"ERROR IN {dataset.basename}: {e}")
+        rank_log(f"==== Finished {dataset.basename} ====")
+        rank_log(f"\n")
+        flush_log()
+        return None
 
-        # Step 3: Extract and calculate the flame geometry parameters
-        if script_config.Flame.FlameThickness.Flag or script_config.Flame.SurfaceLength.Flag or script_config.Flame.ConsumptionRate.Flag:
-            rank_log(f"       Flame Geometry Extraction...")
+    # Step 3: Extract and calculate the flame geometry parameters
+    if script_config.Flame.FlameThickness.Flag or script_config.Flame.SurfaceLength.Flag or script_config.Flame.ConsumptionRate.Flag:
+        rank_log(f"       Flame Geometry Extraction...")
+        try:
             tmp_dict = flame_geometry(dataset, output_dir, script_config)
             rank_log(f"           ...Done")
+        except Exception as e:
+            tmp_dict = {}
+            rank_log(f"ERROR IN {dataset.basename}: {e}")
+            rank_log(f"       Flame Geometry Extraction Failed")
 
-        ###########################################
-        # Serial Processing: Only root does heavy post-processing
-        ###########################################
-        # Step 3: Process the data
-        result_dict = {}
-        result_dict['Time'] = time
+    ###########################################
+    # Serial Processing: Only root does heavy post-processing
+    ###########################################
+    # Step 3: Process the data
+    result_dict = {}
+    result_dict['Time'] = time
 
-        # Flame Processing
+    # Flame Processing
+    if script_config.Flame.Position.Flag:
+        rank_log(f"   Processing Flame...")
+
+        result_dict['Flame'] = {}
+        # Position
         if script_config.Flame.Position.Flag:
-            rank_log(f"   Processing Flame...")
-
-            result_dict['Flame'] = {}
-            # Position
-            if script_config.Flame.Position.Flag:
-                rank_log(f"       Flame Position Extraction...")
-                result_dict['Flame']['Index'], result_dict['Flame']['Position'] = wave_tracking('Flame', pre_loaded_data=data)
-
+            rank_log(f"       Flame Position Extraction...")
+            try:
+                result_dict['Flame']['Index'], result_dict['Flame']['Position'] = wave_tracking('Flame',
+                                                                                                pre_loaded_data=data)
                 rank_log(f"           ...Done")
+            except Exception as e:
+                rank_log(f"ERROR IN {dataset.basename}: {e}")
+                result_dict['Flame']['Index'] = np.nan
+                result_dict['Flame']['Position'] = np.nan
 
-            # Gas Velocity
-            if script_config.Flame.RelativeVelocity.Flag:
-                rank_log(f"       Flame Gas Velocity Extraction...")
+        # Gas Velocity
+        if script_config.Flame.RelativeVelocity.Flag:
+            rank_log(f"       Flame Gas Velocity Extraction...")
+            try:
                 tmp_idx = np.argmin(
                     abs(data['X'] - (result_dict['Flame']['Position'] + script_config.Flame.RelativeVelocity.Offset)))
                 result_dict['Flame']['Gas Velocity'] = data['X Velocity'][tmp_idx]
                 rank_log(f"           ...Done")
+            except Exception as e:
+                rank_log(f"ERROR IN {dataset.basename}: {e}")
+                result_dict['Flame']['Gas Velocity'] = np.nan
 
-            # Thermodynamic State
-            if script_config.Flame.ThermodynamicState.Flag:
-                rank_log(f"       Flame Thermodynamic State Extraction...")
+        # Thermodynamic State
+        if script_config.Flame.ThermodynamicState.Flag:
+            rank_log(f"       Flame Thermodynamic State Extraction...")
+            try:
                 result_dict['Flame']['Thermodynamic'] = thermodynamic_state_extractor(data,
                                                                                       result_dict['Flame']['Position'],
                                                                                       script_config.Flame.ThermodynamicState.Offset)
                 rank_log(f"           ...Done")
-            # Heat Release Rate
-            if script_config.Flame.HeatReleaseRate.Flag:
-                rank_log(f"       Flame Heat Release Extraction...")
+            except Exception as e:
+                rank_log(f"ERROR IN {dataset.basename}: {e}")
+                result_dict['Flame']['Thermodynamic']['Temperature'] = np.nan
+                result_dict['Flame']['Thermodynamic']['Pressure'] = np.nan
+                result_dict['Flame']['Thermodynamic']['Density'] = np.nan
+                result_dict['Flame']['Thermodynamic']['Sound Speed'] = np.nan
+
+        # Heat Release Rate
+        if script_config.Flame.HeatReleaseRate.Flag:
+            rank_log(f"       Flame Heat Release Extraction...")
+            try:
                 result_dict['Flame']['HRR'] = data['Heat Release Rate'][result_dict['Flame']['Index']]
                 rank_log(f"           ...Done")
-            # Flame Thickness
-            if script_config.Flame.FlameThickness.Flag:
+            except Exception as e:
+                rank_log(f"ERROR IN {dataset.basename}: {e}")
+                result_dict['Flame']['HRR'] = np.nan
+
+        # Flame Thickness
+        if script_config.Flame.FlameThickness.Flag:
+            try:
                 result_dict['Flame']['Flame Thickness'] = tmp_dict['Flame Thickness']
-            # Surface Length
-            if script_config.Flame.SurfaceLength.Flag:
+            except Exception as e:
+                rank_log(f"ERROR IN {dataset.basename}: {e}")
+                result_dict['Flame']['Flame Thickness'] = np.nan
+        # Surface Length
+        if script_config.Flame.SurfaceLength.Flag:
+            try:
                 result_dict['Flame']['Surface Length'] = tmp_dict['Surface Length']
-            # Consumption Rate
-            if script_config.Flame.ConsumptionRate.Flag:
+            except Exception as e:
+                rank_log(f"ERROR IN {dataset.basename}: {e}")
+                result_dict['Flame']['Surface Length'] = np.nan
+        # Consumption Rate
+        if script_config.Flame.ConsumptionRate.Flag:
+            try:
+                rank_log(f"       Flame Consumption Rate Extraction...")
                 result_dict['Flame']['Consumption Rate'] = tmp_dict['Consumption Rate']
+                result_dict['Flame']['Burning Velocity'] = tmp_dict['Burning Velocity']
+                rank_log(f"           ...Done")
+            except Exception as e:
+                rank_log(f"ERROR IN {dataset.basename}: {e}")
+                result_dict['Flame']['Consumption Rate'] = np.nan
+                result_dict['Flame']['Burning Velocity'] = np.nan
 
-        # Burned Gas Processing
-        if script_config.Flame.Position.Flag and (
-                script_config.BurnedGas.GasVelocity.Flag or script_config.BurnedGas.ThermodynamicState.Flag):
-            rank_log(f"   Processing Burned Gas...")
+    # Burned Gas Processing
+    if script_config.Flame.Position.Flag and (
+            script_config.BurnedGas.GasVelocity.Flag or script_config.BurnedGas.ThermodynamicState.Flag):
+        rank_log(f"   Processing Burned Gas...")
 
-            result_dict['Burned Gas'] = {}
-            if script_config.BurnedGas.GasVelocity.Flag:
-                rank_log(f"       Burned Gas Velocity Extraction...")
+        result_dict['Burned Gas'] = {}
+        if script_config.BurnedGas.GasVelocity.Flag:
+            rank_log(f"       Burned Gas Velocity Extraction...")
+            try:
                 tmp_idx = np.argmin(
                     abs(data['X'] - (result_dict['Flame']['Position'] + script_config.BurnedGas.GasVelocity.Offset)))
                 result_dict['Burned Gas']['Gas Velocity'] = data['X Velocity'][tmp_idx]
                 rank_log(f"           ...Done")
-            if script_config.BurnedGas.ThermodynamicState.Flag:
-                rank_log(f"       Burned Gas Thermodynamic State Extraction...")
+            except Exception as e:
+                rank_log(f"ERROR IN {dataset.basename}: {e}")
+                result_dict['Burned Gas']['Gas Velocity'] = np.nan
+
+        if script_config.BurnedGas.ThermodynamicState.Flag:
+            rank_log(f"       Burned Gas Thermodynamic State Extraction...")
+            try:
                 result_dict['Burned Gas']['Thermodynamic'] = thermodynamic_state_extractor(data,
-                                                                                           result_dict['Flame'][ 'Position'],
+                                                                                           result_dict['Flame'][
+                                                                                               'Position'],
                                                                                            script_config.BurnedGas.ThermodynamicState.Offset)
                 rank_log(f"           ...Done")
+            except Exception as e:
+                rank_log(f"ERROR IN {dataset.basename}: {e}")
+                result_dict['Burned Gas']['Thermodynamic']['Temperature'] = np.nan
+                result_dict['Burned Gas']['Thermodynamic']['Pressure'] = np.nan
+                result_dict['Burned Gas']['Thermodynamic']['Density'] = np.nan
+                result_dict['Burned Gas']['Thermodynamic']['Sound Speed'] = np.nan
 
-        # Shock Processing
+    # Shock Processing
+    if script_config.Shock.Position.Flag:
+        rank_log(f"   Processing Shock...")
+
+        result_dict['Shock'] = {}
+        # Position
         if script_config.Shock.Position.Flag:
-            rank_log(f"   Processing Shock...")
-
-            result_dict['Shock'] = {}
-            # Position
-            if script_config.Shock.Position.Flag:
-                rank_log(f"       Shock Position Extraction...")
-                result_dict['Shock']['Index'], result_dict['Shock']['Position'] = wave_tracking('Shock', pre_loaded_data=data)
+            rank_log(f"       Shock Position Extraction...")
+            try:
+                result_dict['Shock']['Index'], result_dict['Shock']['Position'] = wave_tracking('Shock',
+                                                                                                pre_loaded_data=data)
                 rank_log(f"           ...Done")
+            except Exception as e:
+                rank_log(f"ERROR IN {dataset.basename}: {e}")
+                result_dict['Shock']['Index'] = np.nan
+                result_dict['Shock']['Position'] = np.nan
 
-            if script_config.Shock.PreShockThermodynamicState.Flag:
-                rank_log(f"       Pre-Shock Thermodynamic State Extraction...")
+        if script_config.Shock.PreShockThermodynamicState.Flag:
+            rank_log(f"       Pre-Shock Thermodynamic State Extraction...")
+            try:
                 result_dict['Shock']['PreShockThermodynamicState'] = thermodynamic_state_extractor(data,
-                                                                                                   result_dict['Shock']['Position'],
+                                                                                                   result_dict['Shock'][
+                                                                                                       'Position'],
                                                                                                    script_config.Shock.PreShockThermodynamicState.Offset)
                 rank_log(f"           ...Done")
+            except Exception as e:
+                rank_log(f"ERROR IN {dataset.basename}: {e}")
+                result_dict['Shock']['PreShockThermodynamicState']['Temperature'] = np.nan
+                result_dict['Shock']['PreShockThermodynamicState']['Pressure'] = np.nan
+                result_dict['Shock']['PreShockThermodynamicState']['Density'] = np.nan
+                result_dict['Shock']['PreShockThermodynamicState']['Sound Speed'] = np.nan
 
-            if script_config.Shock.PostShockThermodynamicState.Flag:
-                rank_log(f"       Pre-Shock Thermodynamic State Extraction...")
+        if script_config.Shock.PostShockThermodynamicState.Flag:
+            rank_log(f"       Pre-Shock Thermodynamic State Extraction...")
+            try:
                 result_dict['Shock']['PostShockThermodynamicState'] = thermodynamic_state_extractor(data,
-                                                                                                    result_dict['Shock']['Position'],
+                                                                                                    result_dict[
+                                                                                                        'Shock'][
+                                                                                                        'Position'],
                                                                                                     script_config.Shock.PostShockThermodynamicState.Offset)
                 rank_log(f"           ...Done")
+            except Exception as e:
+                rank_log(f"ERROR IN {dataset.basename}: {e}")
+                result_dict['Shock']['PostShockThermodynamicState']['Temperature'] = np.nan
+                result_dict['Shock']['PostShockThermodynamicState']['Pressure'] = np.nan
+                result_dict['Shock']['PostShockThermodynamicState']['Density'] = np.nan
+                result_dict['Shock']['PostShockThermodynamicState']['Sound Speed'] = np.nan
 
-        # Step 4: Create plot files
-        rank_log(f"   Creating Single Animation Frames...")
-        for field_info in fields(script_config.Animation):
+    # Step 4: Create plot files
+    rank_log(f"   Creating Single Animation Frames...")
+    for field_info in fields(script_config.Animation):
+        try:
             key = field_info.name
             val = getattr(script_config.Animation, key)
 
@@ -756,65 +863,65 @@ def single_file_processing(dataset, args):
                     animation_frame_generation(data['X'], data[val.Name], key, filename,
                                                plot_center=result_dict['Flame']['Position'],
                                                window_size=script_config.Animation.LocalWindowSize.Offset)
-        rank_log(f"       ...Done")
+            rank_log(f"       ...Done")
+        except Exception as e:
+            rank_log(f"ERROR IN {dataset.basename}: {e}")
+            rank_log(f"   Animation Frame Creation Failed for {key}")
 
         # Step 5: Collective plots
         rank_log(f"   Creating Collective Animation Frames...")
+        try:
+            collected_names = [
+                getattr(attr, 'Name')
+                for attr in (getattr(script_config.Animation, name) for name in dir(script_config.Animation))
+                if getattr(attr, 'Collective', False)
+            ]
 
-        collected_names = [
-            getattr(attr, 'Name')
-            for attr in (getattr(script_config.Animation, name) for name in dir(script_config.Animation))
-            if getattr(attr, 'Collective', False)
-        ]
+            if collected_names:
+                key = '-'.join(collected_names)
+                tmp_dir = ensure_long_path_prefix(os.path.join(output_dir, "Animation-Frames", f"{key}-Plt-Files"))
+                os.makedirs(tmp_dir, exist_ok=True)
 
-        if collected_names:
-            key = '-'.join(collected_names)
-            tmp_dir = ensure_long_path_prefix(os.path.join(output_dir, "Animation-Frames", f"{key}-Plt-Files"))
-            os.makedirs(tmp_dir, exist_ok=True)
+                collected_arr = []
+                for name in collected_names:
+                    collected_arr.append(data[name])
 
-            collected_arr = []
-            for name in collected_names:
-                collected_arr.append(data[name])
+                filename = os.path.join(tmp_dir, f"{pltFile_name}.png")
+                animation_frame_generation(
+                    data['X'],
+                    collected_arr,  # Note: val.Name must exist in pre_loaded_data
+                    collected_names,
+                    filename
+                )
+            rank_log(f"       ...Done")
+        except Exception as e:
+            rank_log(f"ERROR IN {dataset.basename}: {e}")
+            rank_log(f"   Collective Animation Frame Creation Failed")
 
-            filename = os.path.join(tmp_dir, f"{pltFile_name}.png")
-            animation_frame_generation(
-                data['X'],
-                collected_arr,  # Note: val.Name must exist in pre_loaded_data
-                collected_names,
-                filename
-            )
+    # Schlieren and Streamlines
+    if script_config.Animation.Schlieren.Flag:
+        rank_log(f"   Creating Schlieren Animation Frames...")
+        tmp_dir = ensure_long_path_prefix(os.path.join(output_dir, "Animation-Frames", f"Schlieren-Plt-Files"))
+        os.makedirs(tmp_dir, exist_ok=True)
+        filename = os.path.join(tmp_dir, f"{pltFile_name}.png")
+        # Generate Schlieren
+        schlieren(dataset, filename)
         rank_log(f"       ...Done")
 
-        # Schlieren and Streamlines
-        if script_config.Animation.Schlieren.Flag:
-            rank_log(f"   Creating Schlieren Animation Frames...")
-            tmp_dir = ensure_long_path_prefix(os.path.join(output_dir, "Animation-Frames", f"Schlieren-Plt-Files"))
-            os.makedirs(tmp_dir, exist_ok=True)
-            filename = os.path.join(tmp_dir, f"{pltFile_name}.png")
-            # Generate Schlieren
-            schlieren(dataset, filename)
-            rank_log(f"       ...Done")
+    if script_config.Animation.StreamLines.Flag:
+        rank_log(f"   Creating StreamLines Animation Frames...")
+        tmp_dir = ensure_long_path_prefix(
+            os.path.join(output_dir, "Animation-Frames", f"StreamLines-Plt-Files"))
+        os.makedirs(tmp_dir, exist_ok=True)
+        filename = os.path.join(tmp_dir, f"{pltFile_name}.png")
+        # Generate streamlines
+        streamline(dataset, filename)
+        rank_log(f"       ...Done")
 
-        if script_config.Animation.StreamLines.Flag:
-            rank_log(f"   Creating StreamLines Animation Frames...")
-            tmp_dir = ensure_long_path_prefix(
-                os.path.join(output_dir, "Animation-Frames", f"StreamLines-Plt-Files"))
-            os.makedirs(tmp_dir, exist_ok=True)
-            filename = os.path.join(tmp_dir, f"{pltFile_name}.png")
-            # Generate streamlines
-            streamline(dataset, filename)
-            rank_log(f"       ...Done")
-
-        rank_log(f"==== Finished {pltFile_name} ====")
-        rank_log(f"\n")
-        flush_log()
-        return result_dict
-    except Exception as e:
-        rank_log(f"ERROR IN {dataset.basename}: {e}")
-        rank_log(f"==== Finished {dataset.basename} ====")
-        rank_log(f"\n")
-        flush_log()
-        return None
+    rank_log(f"==== Finished {pltFile_name} ====")
+    rank_log(f"\n")
+    flush_log()
+    return result_dict
 
 
 def pelec_processing(args):
@@ -846,18 +953,6 @@ def pelec_processing(args):
         if tmp_result:
             sto.result_id = tmp_id
             sto.result = tmp_result
-
-
-    """
-    Deprecated
-     
-    # Step 4: Process each individual dataset
-    for i, current_dir in enumerate(data_dirs):
-        # Step 4.1: Load the data
-        data = yt.load(current_dir)
-        # Step 4.2: Process each file
-        result_arr[i] = single_file_processing(data, (output_dir, script_config))
-    """
 
     # Ensure all ranks have completed processing
     comm.Barrier()
@@ -906,7 +1001,8 @@ def pelec_processing(args):
                 if script_config.Flame.Velocity.Flag:
                     result_arr[i]['Flame']['Velocity'] = tmp_flame_velocity[i]
                 if script_config.Flame.RelativeVelocity.Flag:
-                    result_arr[i]['Flame']['Relative Velocity'] = tmp_flame_velocity[i] - result_arr[i]['Flame']['Gas Velocity']
+                    result_arr[i]['Flame']['Relative Velocity'] = tmp_flame_velocity[i] - result_arr[i]['Flame'][
+                        'Gas Velocity']
             rank_log(f"       ...Done")
 
         if script_config.Shock.Velocity.Flag:
@@ -944,7 +1040,7 @@ def pelec_processing(args):
 def main():
     # Step 1: Define the script parameters
     data_parent_dir = '../2D-Test-Data'
-    ddt_plt_dir = '../2D-Test-Data/plt332330'
+    ddt_plt_dir = os.path.join(data_parent_dir, 'plt332330')
 
     # Step 2: Set the processing parameters
     script_config = ScriptConfig()
@@ -952,9 +1048,9 @@ def main():
     script_config.Flame.Position.Flag = True
     script_config.Flame.Velocity.Flag = True
     script_config.Flame.RelativeVelocity.Flag = True
-    script_config.Flame.RelativeVelocity.Offset = 10e-6
+    script_config.Flame.RelativeVelocity.Offset = 0
     script_config.Flame.ThermodynamicState.Flag = True
-    script_config.Flame.ThermodynamicState.Offset = 10e-6
+    script_config.Flame.ThermodynamicState.Offset = 0
     script_config.Flame.HeatReleaseRate.Flag = True
     script_config.Flame.SurfaceLength.Flag = True
     script_config.Flame.ConsumptionRate.Flag = True
@@ -988,7 +1084,7 @@ def main():
     initialize_parameters(
         T=503.15,
         P=10.0 * 100000,
-        Phi=0.4,
+        Phi=1.0,
         Fuel='H2',
         mech='../Chemical-Mechanisms/Li-Dryer-H2-mechanism.yaml',
     )  # ✅ shared state
@@ -996,7 +1092,7 @@ def main():
     add_species_vars(input_params.species)
 
     # Step 2: Determine the domain parameters
-    row_idx = 0.0416719 + (8.7e-5 / 2)
+    row_idx = 0.0462731 + (8.7e-5 / 2)
     domain_info = domain_parameters(ddt_plt_dir, desired_y_location=row_idx)
 
     # Step 3: Log the domain information
@@ -1008,7 +1104,7 @@ def main():
 
     # Step 4: Create the result directories
     output_dir = os.path.abspath(
-        os.path.join(f"Processed-MPI-Global-Part-2-Results-V{version}", f"y-{domain_info[1][0][1]:.3g}cm"))
+        os.path.join(f"Processed-MPI-Global-Results-V{version}", f"y-{domain_info[1][0][1]:.3g}cm"))
     os.makedirs(output_dir, exist_ok=True)
 
     # Step 5: Process the data
@@ -1020,6 +1116,7 @@ def main():
 
     return
 
+
 if __name__ == "__main__":
     # Step 1: Initialize the script
     start_time = time.time()
@@ -1028,6 +1125,7 @@ if __name__ == "__main__":
     init_rank_logging(f'runlog-{datetime.now().strftime("%Y%m%d_%H%M%S")}.txt', overwrite=True)
 
     # Step 3: Run the main function
+    print('Starting Main Function...', flush=True)
     main()
 
     # Step 4: Finalize the logger
