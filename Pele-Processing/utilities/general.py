@@ -187,6 +187,9 @@ def write_output(data_dict, output_dir):
         'Heat Release Rate': 'kg m^2 / s^3 / m^3',
         'Cp': 'kg m^2 / s^2 / kg / K',
         'Cv': 'kg m^2 / s^2 / kg / K',
+        'Surface Length': 'm',
+        'Consumption Rate': 'kg / s',
+        'Burning Velocity': 'm / s',
     }
 
     FIELD_WIDTH = 65
@@ -384,6 +387,10 @@ def generate_animation(source_dir, output_dir):
 
     # Create and save the animation
     ani = animation.FuncAnimation(fig, update, frames=len(image_files), blit=True)
-    writer = animation.FFMpegWriter(fps=15, metadata=dict(artist='Me'), bitrate=1800)
-    ani.save(output_dir, writer=writer)
+    writer = animation.PillowWriter(fps=5)
+    # writer = animation.FFMpegWriter(fps=15, metadata=dict(artist='Me'), bitrate=1800)
+    try:
+        ani.save(output_dir, writer=writer)
+    except Exception as e:
+        print(f"Animation save failed: {e}")
     plt.close(fig)
